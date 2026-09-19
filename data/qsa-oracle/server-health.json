@@ -1,0 +1,105 @@
+{
+  "status": "ok",
+  "model": "qwen3.8-flash-next",
+  "endpoints": [
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/models",
+    "/v1/responses"
+  ],
+  "context": 262144,
+  "rope_scaling": null,
+  "busy": false,
+  "slots": 4,
+  "slot_ctx": 262144,
+  "kv_pool_positions": 262144,
+  "in_flight": 0,
+  "busy_for_s": 0,
+  "queued": 0,
+  "decode": "greedy at temperature 0 (the default); sampled at temperature > 0",
+  "drafters_available": [
+    "serial",
+    "mtp"
+  ],
+  "drafter_default": "mtp",
+  "shortlist_draft_head": false,
+  "drafter_weights_loaded": false,
+  "prompt_cache": {
+    "enabled": true,
+    "cap_mb": 110,
+    "mode": 2,
+    "snapshot_align": 0,
+    "bitwise_identical_to_cold": false
+  },
+  "tool_calls": {
+    "wire_format": "qwen-xml (<function=>/<parameter=>)",
+    "streaming": true,
+    "tool_choice": [
+      "auto",
+      "none",
+      "required",
+      "{type: function, function: {name}}"
+    ],
+    "forced_call_is_a_prefill": true,
+    "required_is_exact": "named tool_choice, or one tool",
+    "parallel_tool_calls": true,
+    "constrained_decoding": false,
+    "forced_call_disables_thinking": true,
+    "argument_types_need_schema": true
+  },
+  "supported": [
+    "reasoning_effort",
+    "enable_thinking",
+    "preserve_thinking",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "stop",
+    "max_tokens",
+    "max_completion_tokens",
+    "max_output_tokens",
+    "stream",
+    "stream_options"
+  ],
+  "token_budget_aliases": [
+    "max_tokens",
+    "max_completion_tokens",
+    "max_output_tokens"
+  ],
+  "max_tokens_default": 8192,
+  "error_format": "openai",
+  "accepted_but_ignored": [
+    "n"
+  ],
+  "sampling": {
+    "implemented": [
+      "temperature",
+      "top_p",
+      "top_k",
+      "min_p",
+      "seed",
+      "presence_penalty",
+      "frequency_penalty",
+      "logit_bias",
+      "logprobs"
+    ],
+    "decode": "temperature 0 (the default) is greedy: a forward pass and an argmax, byte-identical to serial greedy decode. temperature > 0 samples from the filtered target on the same drafter the request would otherwise get; with the MTP drafter the speculative accept/reject rule emits exactly the target distribution",
+    "filters": "top_k, top_p and min_p compose as an intersection (the HF/vLLM convention); top_p >= 1 and top_k = 0 disable a filter",
+    "seed": "reproduces a request on the same drafter; a sampled MTP run and a sampled serial run agree in distribution, not token for token",
+    "penalties": "presence and frequency count GENERATED tokens only; applied on both drafters",
+    "not_implemented": [
+      "top_logprobs",
+      "logprobs with stream=true",
+      "n > 1"
+    ]
+  },
+  "max_tokens_cap": 262144,
+  "max_tokens_over_cap": "400",
+  "reasoning_effort_values": [
+    "high",
+    "low",
+    "medium",
+    "minimal",
+    "xhigh"
+  ]
+}
