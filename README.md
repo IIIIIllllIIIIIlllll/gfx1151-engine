@@ -1,5 +1,7 @@
 # gfx1151-engine
 
+*English: [README_EN.md](README_EN.md)*
+
 在单张 AMD Strix Halo APU(gfx1151)上运行 177B MoE 模型的本地推理引擎,
 目标模型为 Qwen3.8-Flash-Next(qwen4_exp 架构)及其同结构微调。
 
@@ -86,6 +88,10 @@ PNG/JPEG(WebP 未接);prefill chunk 默认 8192;冷加载为整权重读盘
 ```bash
 bash build.sh test   # kernel 单测,不加载模型,预期 ALL PASS
 ```
+
+## 致谢
+
+本项目的实现方式借鉴了 peonist-ai 的 [halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server);`.hgn` 权重容器格式即 halogen 的 checkpoint 容器格式(见 [HGN-FORMAT.md](HGN-FORMAT.md))。感谢 halogen 作者的工作。
 
 ## 许可证
 

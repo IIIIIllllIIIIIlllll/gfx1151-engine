@@ -1,5 +1,7 @@
 # Windows 移植可行性分析（2026-09-19）
 
+*English: [PORTING-WINDOWS_EN.md](PORTING-WINDOWS_EN.md)*
+
 > **修订说明**：本文第三版。第一版的"两堵墙"结论基于公开资料推演；
 > 第二版基于本机（Windows + gfx1151，BIOS 划分 96 GiB 显存，128 GiB 内存）
 > 的**实测数据**。探针源码在 `tools/winprobe/`，可复跑。

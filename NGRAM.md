@@ -1,5 +1,7 @@
 # Ngram verify / GDN 候选优化验证（2026-09-15）
 
+*English: [NGRAM_EN.md](NGRAM_EN.md)*
+
 ## 2026-09-19 更新：分块 verify（修复 ngram 轮输出卡顿）
 
 **问题**：ngram 轮把 ≤64 token 草稿作为一次 65 行原子 verify（~350ms），

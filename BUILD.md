@@ -1,5 +1,7 @@
 # 编译与验证
 
+*English: [BUILD_EN.md](BUILD_EN.md)*
+
 ## 环境
 
 在 Linux / AMD ROCm 机器上编译。GPU 目标 `gfx1151`(AMD Strix Halo),

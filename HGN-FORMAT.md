@@ -1,6 +1,8 @@
 # .hgn 权重格式
 
-`.hgn` 是 halogen 推理引擎的 checkpoint 容器格式;本项目为加载该格式
+*English: [HGN-FORMAT_EN.md](HGN-FORMAT_EN.md)*
+
+`.hgn` 是 halogen 推理引擎([halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server))的 checkpoint 容器格式;本项目为加载该格式
 的权重文件(以及用 `tools/flashnext2hgn.py` 转换自有模型)实现了对该
 容器的读写,仅涉及文件格式层面的互操作。容器结构(magic、头部、张量
 表)沿用 halogen 的定义;量化布局以本仓实现为准,权威定义见

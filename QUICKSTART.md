@@ -1,5 +1,7 @@
 # 编译和启动
 
+*English: [QUICKSTART_EN.md](QUICKSTART_EN.md)*
+
 在 Linux / ROCm 机器上进入项目目录,执行:
 
 ```bash

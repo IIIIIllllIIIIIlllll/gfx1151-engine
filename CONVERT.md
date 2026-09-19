@@ -1,5 +1,7 @@
 # 转换自有模型(flashnext2hgn)
 
+*English: [CONVERT_EN.md](CONVERT_EN.md)*
+
 `tools/flashnext2hgn.py` 把 HuggingFace safetensors 格式的
 Qwen3.8-Flash-Next(qwen4_exp 架构)模型/微调版转换成本引擎的 `.hgn`
 权重。单文件脚本,只依赖 Python 3 + numpy(不需要 torch)。
