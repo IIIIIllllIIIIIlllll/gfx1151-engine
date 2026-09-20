@@ -32,7 +32,7 @@ namespace {
 #ifdef _WIN32
 int sock_close_fd(sock_t fd) { return closesocket((SOCKET)fd); }
 bool sock_intr() { return WSAGetLastError() == WSAEINTR; }
-bool sock_wouldblock() { return WSAGetLastError() == WSAEWOULDBLOCK; }
+[[maybe_unused]] bool sock_wouldblock() { return WSAGetLastError() == WSAEWOULDBLOCK; }
 std::string sock_errstr() { return sock_strerror(WSAGetLastError()); }
 ssize_t platform_send(sock_t fd, const void* p, size_t n) {
     return sock_send(fd, p, n);
@@ -43,7 +43,7 @@ ssize_t platform_recv(sock_t fd, void* p, size_t n) {
 #else
 int sock_close_fd(sock_t fd) { return ::close(fd); }
 bool sock_intr() { return errno == EINTR; }
-bool sock_wouldblock() { return errno == EAGAIN || errno == EWOULDBLOCK; }
+[[maybe_unused]] bool sock_wouldblock() { return errno == EAGAIN || errno == EWOULDBLOCK; }
 std::string sock_errstr() { return std::strerror(errno); }
 ssize_t platform_send(sock_t fd, const void* p, size_t n) {
     return ::send(fd, p, n, MSG_NOSIGNAL);

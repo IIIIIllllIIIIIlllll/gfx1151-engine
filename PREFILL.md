@@ -9,6 +9,15 @@ prefill 时请同步更新该注释与本文档。
 实测基线（README.md:23）：gfx1151 + 122 GiB 内存，prefill 约
 **600–800 tok/s**；prefill chunk 默认 8192（README.md:72）。
 
+2026-09-20 复测（start.sh 生产 flags，`amd_iommu=off`，详见 ~/ppbench/BASELINE.md）：
+8K 单 chunk ~963 tok/s，32K ~1086 tok/s。要点：`amd_iommu=off` 带来
++5%（BIOS 开关可能不生效，需内核 cmdline 确认 `iommu_groups` 为空）；
+chunk 16384→32768 对 32K prompt +7.4%（单 chunk 摊薄每 chunk 固定开销），
+65536 触发内存 PSI 看门狗不可行；生产 chunk 现为 **32768**
+（start.sh GDEC_PREFILL_CHUNK）。§3/§10 中 WMMA、bf16 KV、MoE Lt 当时为
+opt-in，现均已是 start.sh 生产默认；这些开关两两 A/B 均 ±1% 打平。
+`GDEC_MOE_ATOMIC`（scatter 免 pairs）实测 -16%，方向已否决。
+
 ## 1. 总体架构
 
 模型为 48 层混合架构：`layer % 4 == 3` 为全注意力 QSA 层（12 层），其余
@@ -184,20 +193,63 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
 | `GDEC_INDEX_OLDSEL=1` | top-512 回退 rocPRIM 排序版 |
 | `GDEC_MROPE_DUMP=<file>` | dump RoPE 表（调试用，会同步流） |
 
-## 10. PP 优化切入点（基于现状的观察）
+## 10. PP 优化切入点（2026-09-20 实测刷新）
 
-1. **WMMA 尚未默认启用**：`k_qsa_wmma` / `k_qsa_wmma6` 已写好但 opt-in，
-   默认 QSA prefill 是纯 fp32 FMA。评估其加速比与数值差是最直接的入口。
-2. **bf16 KV cache** 同为 opt-in（显存带宽减半），与 WMMA 路径耦合。
-3. **MoE hipBLASLt 路径**（`GDEC_MOE_LT`）已具备但默认关闭，理由是舍入
-   不同；大 chunk 下 per-expert GEMM 是否比融合 W4 kernel 更快值得实测。
-4. **大 batch GEMM 的 dequant→bf16 转换**：Q4C-P 大 batch 路径先 dequant
-   再喂 BLAS，权重被读两次（码流 + bf16）；融合 dequant 的 GEMM 或
-   Lt 的自定义 epilogue 是潜在方向。
-5. **观测面不足**：API 层只有总 `prefill_ms`，逐阶段计时需自行插桩；
-   优化前建议先加 per-stage 计时（各 kernel 已有明确边界，见 §2）。
-6. `k_index_scores_tiled` 的 K 循环起点对齐了 rocBLAS gfx1151 的已知
+已实测否决/打平：WMMA/bf16 KV/MoE Lt 两两 A/B 均 ±1%（现已全部为生产默认）；
+`GDEC_MOE_ATOMIC` scatter -16%；chunk≥65536 内存不可行；Lt heuristic 8 候选
+维护者已扫（index 4 最优，gdec.cpp:8990-8993 注释）；GDN window=8 触发
+illegal memory access（现存 bug，待查）。
+
+1. **MoE 是计算受限**（38.6 TFLOP/8K-chunk，v_dot2 管线 MFU ~40-55%），不是
+   纯带宽受限：fused W4 的 64-token tile 把热专家权重流 ~3 遍（~6.7GB/层），
+   但与 Lt 的"全专家 dequant + Tensile 小 GEMM"实际打平——两者撞同一天花板。
+   2026-09-20 已落地：untiled 路径补上了 packed bf16 x/hid（与 tiled packed
+   **bit-identical**，8043 token 对拍 0 分歧）+ `GDEC_MOE_PAIRS_BF16`
+   （bf16 pairs + 现成 `k_moe_reduce_pw_bf16`，同样 0 分歧）——**性能仍打平**
+   （959-967 同噪声带），进一步坐实计算受限结论。再往下必须 WMMA 化（大工程）。
+2. **dense GEMM 已在库天花板**：rocBLAS solution-index 全量扫描
+   （tools/gemm_sol_scan.cu，正确方向 N=out, K=in, P=tokens）显示库上限
+   ~35 TFLOPS（sol 1178 = Lt index 4 同款 Tensile kernel），引擎 in-context
+   已达 24-63 TFLOPS——**库调优无空间**，更快只能自写 GEMM 超 Tensile。
+3. **大 batch GEMM 的 dequant→bf16 转换**：Q4C-P 大 batch 路径每次调用重新
+   dequant（gdec.cpp:8925-8932，无常驻缓存）；流量占比不大（dense 权重小），
+   多 chunk 时被 chunk 增大摊薄。
+4. **观测面**：`GDEC_PHASE=1`（per-phase）+ `GDEC_PROF=1`（gemm/ple host 耗时）
+   已够用；kernel 级用 rocprofv3 --kernel-trace。
+5. `k_index_scores_tiled` 的 K 循环起点对齐了 rocBLAS gfx1151 的已知
    tile 行为（注释 gdec.cpp:898-899）——改 tile 参数时注意该依赖。
+6. GR：`k_gr_scatter_norm_b_hc_bf16` 的 y 被 4 branch 重读、Rhat 双读，
+   已近带宽屋顶，剩余收益 ~0.1-0.2s（8K）。
+
+## 11. 后续优化空间（2026-09-20 评估，按收益/可行性排序）
+
+1. **自写 dense GEMM 超 Tensile（已完成，Phase 3g）**：库天花板 ~35 TFLOPS
+   （tools/gemm_sol_scan.cu 实测），自写 WMMA kernel
+   （`k_gemm_wmma`，gdec.cpp:3926-4104，gwmma_sync/双缓冲/免 bank 冲突布局，
+   `__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32`）达到 37.4-37.9 TFLOPS，
+   8/8 形状全胜 sol 1178（大形状 +15-20%）。**实测 gfx1151 WMMA 发射峰值仅
+   ~55.4 TFLOPS**（tools/wmma_peak.cu 标定；rocm-smi sclk 读数是 DPM 假象
+   不可信），理论 119 不成立。已集成进 `Model::gemm()`（gdec.cpp:9184-9214），
+   env `GDEC_GEMM_WMMA` 门控（start.sh 已开）：(N,K)∈{(2560,6144)→d3/GM16,
+   (6144/10240/12288,2560)→d9/GM4} 且 P≥1024 时分流，非 bit-exact（K 累加
+   顺序不同，对拍 8049 token 仅生成末段分歧 4 个）。端到端：8K +2%、
+   32K +3%。健壮性驱动 tools/gemm_wmma_driver.cu（24/24 含 P=53/100/8199
+   非对齐尾包）；峰值/bank 冲突探针 tools/wmma_peak.cu、tools/lds_probe.cu。
+   剩余空间：store 侧 bank 冲突（残余 ~64% 冲突主因）、barrier 批处理
+   （需三缓冲 LDS，当前 62.5KB 放不下）、N=2560 形状 persistent+K 拆分。
+2. **MoE WMMA 化**：MoE ~2.9s/8K-chunk 撞 v_dot2 MFU 天花板（~40-55%），
+   WMMA 化理论可到 ~1.2-1.6s（+10-15% PP）。工程量大：LDS dequant→
+   fragment 布局重排、占用率重调（MOE_OCC.md 记录多次管线回退）、
+   累加顺序变化破坏 bit-exact。Phase 1 的 untiled+packed+bf16 pairs
+   基础设施已就位（bit-exact 验证过），是其前置。
+3. **GDN stream 窗口串行**：GDEC_GDN_STREAM 下 32 窗口/层严格串行
+   （intra→strip 关键路径），长 chunk 下更明显；窗口间流水线化或增大
+   窗口（注意 window=8 现触发 illegal memory access，**现存 bug 待查**）。
+4. **小 chunk 尾包固定开销**：32K prompt 尾部 53-token mini-chunk 花 0.92s
+   （实测 22:04 生产日志）；chunk 对齐或尾包与主 chunk 合并有 ~3% 空间。
+5. **GR 去重读**（§10.6）：~0.1-0.2s/8K，小改但收益薄。
+6. **PLE gather 与 GPU 计算的更深重叠**：ple_host 冷态 410-870ms 可见，
+   热态已被重叠掩盖；低优先级。
 
 ## 附：本文档的未复核项
 

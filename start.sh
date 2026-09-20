@@ -82,9 +82,12 @@ trap 'exit 129' HUP
 
 # Existing production options; no closed-source modules or experimental paths.
 export GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1
+# 自写 WMMA dense GEMM（Phase 3g）：8K +2%、32K +3%，对拍 8049 token 仅尾部分歧 4 个。
+export GDEC_GEMM_WMMA=1
 export GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1
 export GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 GDEC_NOWARMUP=1
-export GDEC_PREFILL_CHUNK=16384
+# 32768: 32K prompt 单 chunk 实测 +7.4%（1155 vs 1076 tok/s）；65536 超内存 PSI 上限。
+export GDEC_PREFILL_CHUNK=32768
 export GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1
 export GDEC_KVSNAP=1
 export GDEC_KVSNAP_MAX_GB=20
