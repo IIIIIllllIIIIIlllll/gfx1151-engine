@@ -29,7 +29,7 @@ a machine with 122 GiB of RAM can serve a 256K context.
   calibration data, and can be distributed for your own fine-tuned models
   (see CONVERT_EN.md).
 
-Measured (gfx1151, 122 GiB RAM): prefill about 1000–1100 tok/s, decode about
+Measured (gfx1151, 122 GiB RAM): prefill about 1100–1200 tok/s, decode about
 30–55 tok/s (depends on speculative hit rate).
 
 ## Requirements
