@@ -3,3 +3,4 @@ logs/
 models/
 *.tmp.*
 start_win.exe
+__pycache__/

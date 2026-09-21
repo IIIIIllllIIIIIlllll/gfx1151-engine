@@ -192,13 +192,14 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
 | `GDEC_MOE_FP32_IO=1` | MoE 激活回退 fp32 staging |
 | `GDEC_INDEX_OLDSEL=1` | top-512 回退 rocPRIM 排序版 |
 | `GDEC_MROPE_DUMP=<file>` | dump RoPE 表（调试用，会同步流） |
+| `GDEC_PREFILL_TAIL_SLACK=<n>` | 尾包合并上限（默认 Linux 1024 / Windows 0；0 禁用） |
+| `GDEC_GR_SCAT4=1` | GR scatter+norm 单 block/token 实验（实测 -0.8%，勿开） |
 
 ## 10. PP 优化切入点（2026-09-20 实测刷新）
 
 已实测否决/打平：WMMA/bf16 KV/MoE Lt 两两 A/B 均 ±1%（现已全部为生产默认）；
 `GDEC_MOE_ATOMIC` scatter -16%；chunk≥65536 内存不可行；Lt heuristic 8 候选
-维护者已扫（index 4 最优，gdec.cpp:8990-8993 注释）；GDN window=8 触发
-illegal memory access（现存 bug，待查）。
+维护者已扫（index 4 最优，gdec.cpp:8990-8993 注释）。
 
 1. **MoE 是计算受限**（38.6 TFLOP/8K-chunk，v_dot2 管线 MFU ~40-55%），不是
    纯带宽受限：fused W4 的 64-token tile 把热专家权重流 ~3 遍（~6.7GB/层），
@@ -206,7 +207,8 @@ illegal memory access（现存 bug，待查）。
    2026-09-20 已落地：untiled 路径补上了 packed bf16 x/hid（与 tiled packed
    **bit-identical**，8043 token 对拍 0 分歧）+ `GDEC_MOE_PAIRS_BF16`
    （bf16 pairs + 现成 `k_moe_reduce_pw_bf16`，同样 0 分歧）——**性能仍打平**
-   （959-967 同噪声带），进一步坐实计算受限结论。再往下必须 WMMA 化（大工程）。
+   （959-967 同噪声带），进一步坐实计算受限结论。WMMA 化两条路线
+   2026-09-21 均已实测否决（详见 §11.2）。
 2. **dense GEMM 已在库天花板**：rocBLAS solution-index 全量扫描
    （tools/gemm_sol_scan.cu，正确方向 N=out, K=in, P=tokens）显示库上限
    ~35 TFLOPS（sol 1178 = Lt index 4 同款 Tensile kernel），引擎 in-context
@@ -221,7 +223,7 @@ illegal memory access（现存 bug，待查）。
 6. GR：`k_gr_scatter_norm_b_hc_bf16` 的 y 被 4 branch 重读、Rhat 双读，
    已近带宽屋顶，剩余收益 ~0.1-0.2s（8K）。
 
-## 11. 后续优化空间（2026-09-20 评估，按收益/可行性排序）
+## 11. 后续优化空间（2026-09-21 刷新，按收益/可行性排序）
 
 1. **自写 dense GEMM 超 Tensile（已完成，Phase 3g）**：库天花板 ~35 TFLOPS
    （tools/gemm_sol_scan.cu 实测），自写 WMMA kernel
@@ -235,19 +237,61 @@ illegal memory access（现存 bug，待查）。
    顺序不同，对拍 8049 token 仅生成末段分歧 4 个）。端到端：8K +2%、
    32K +3%。健壮性驱动 tools/gemm_wmma_driver.cu（24/24 含 P=53/100/8199
    非对齐尾包）；峰值/bank 冲突探针 tools/wmma_peak.cu、tools/lds_probe.cu。
-   剩余空间：store 侧 bank 冲突（残余 ~64% 冲突主因）、barrier 批处理
-   （需三缓冲 LDS，当前 62.5KB 放不下）、N=2560 形状 persistent+K 拆分。
-2. **MoE WMMA 化**：MoE ~2.9s/8K-chunk 撞 v_dot2 MFU 天花板（~40-55%），
-   WMMA 化理论可到 ~1.2-1.6s（+10-15% PP）。工程量大：LDS dequant→
-   fragment 布局重排、占用率重调（MOE_OCC.md 记录多次管线回退）、
-   累加顺序变化破坏 bit-exact。Phase 1 的 untiled+packed+bf16 pairs
-   基础设施已就位（bit-exact 验证过），是其前置。
-3. **GDN stream 窗口串行**：GDEC_GDN_STREAM 下 32 窗口/层严格串行
-   （intra→strip 关键路径），长 chunk 下更明显；窗口间流水线化或增大
-   窗口（注意 window=8 现触发 illegal memory access，**现存 bug 待查**）。
-4. **小 chunk 尾包固定开销**：32K prompt 尾部 53-token mini-chunk 花 0.92s
-   （实测 22:04 生产日志）；chunk 对齐或尾包与主 chunk 合并有 ~3% 空间。
-5. **GR 去重读**（§10.6）：~0.1-0.2s/8K，小改但收益薄。
+   剩余空间：store 侧 bank 冲突已消除（(b,b+RPW/2) 行配对映射，
+   SQC_LDS_BANK_CONFLICT 39.8M→0/dispatch，driver 24/24）但**零收益**——
+   LDS 管 ~700 相位/K-step 远低于 wmma ~1664 clk，冲突被 compute 完全
+   掩盖；真正瓶颈是 staging 延迟 + barrier 串行（barrier 批处理需三缓冲
+   LDS，当前 62.5KB 放不下）、N=2560 形状 persistent+K 拆分。
+2. ~~**MoE WMMA 化**~~（2026-09-21 已实测否决）：两条主攻路线均失败，数据与
+   分析在 ~/ppbench/moe_wmma_notes.md：
+   - **融合 dequant+WMMA expert GEMM 原型**（tools/moe_wmma_proto.cu，up GEMM，
+     k_gemm_wmma d9 骨架 + 12 种 dequant 变体二分）：最优精确配置 DM15
+     （sector 批量加载 + cbp2 float2 字节对表 + 内联 RNE）达 26.6-28.0ms/层
+     ≈ 现 v_dot2 的 25-30ms → **持平，无集成价值**。≤15ms 目标物理不可达：
+     uniform ne=160 在 BM=128 下 padding 1.6×，15ms 需 57 issued TFLOPS >
+     WMMA 实测峰值 55.4；即使 dequant 零成本（fix0 下界实测）也只有 23.1ms。
+     根因：① RDNA3.5 WMMA 跑在 VALU，dequant 精确路径每元素 ~5 op（查表+
+     FMUL+RNE）与 wmma 直接争用同一执行单元；② expert 小批次 padding；
+     ③ scale/codes sector 级 DRAM 浪费（PMC：GL2C 命中仅 13%）。另发现
+     gfx1151 无 v_cvt_pk_bf16_f32、v_permlane16_b32 被强制 uniform 广播、
+     __shfl_sync lower 成 ds_bpermute 走 LDS——三条硬件捷径均不存在。
+     技术副产品：原型数值位等精确（maxrel 3e-4，与参考 bf16(cb*s) 单次
+     RNE 权重 bitwise 一致），若未来硬件变强可直接复用。down GEMM 未做
+     （同物理约束，预期同样只到 parity）。
+   - **MoE Lt deq/GEMM 双流重叠**（`GDEC_MOE_LT_OVL=1`，env 门控保留、默认
+     关、关闭时 bit-exact 全等 8051 token）：实测**负收益**（8K -10.4%、
+     32K -4.6%）。根因：双槽 52+26MB 超 32MB MALL 失去驻留优势、deq 与
+     GEMM 带宽争用、同一 VALU 争用、每层 ~512 次 event 开销。教训：
+     legacy 默认流必须用 hipStreamNonBlocking 侧流才能真重叠（blocking
+     版本 -16%）。
+   结论：MoE 在 gfx1151 上已无已知的"换执行单元"级收益路径；v_dot2 融合
+   路径维持为生产实现。Phase 1 untiled+packed+bf16 pairs 基础设施保留
+   （bit-exact 验证过），但性能打平未启用。
+3. ~~**GDN stream 窗口**~~（2026-09-21 已收口）：window=8 的 illegal memory
+   access 已修复——根因是 `d_gdn_split_ws` 分配把 stream 窗口硬编码为 4
+   chunk（15.05 MiB），而窗口循环用 `64*gdn_window_chunks`，8 chunk 时
+   ws 越界写（gdec.cpp:8207-8210 改为按 `gdn_window_chunks` 分配）。修复
+   后 window=8 与默认逐 token bit-exact（8055 token 0 分歧）。但 A/B 实测
+   window=2/8 均比默认 4 慢 ~1.5%（32K：w4 1080 vs w2/w8 各 ~1064），
+   **默认 4 确认为最优，勿再调**。窗口间流水化（intra(i+1) 与 strip(i)
+   双流重叠）经分析不值得做：intra（192 block×1024 thr）与 strip
+   （192×256）各自已饱和 40 CU（容量 ~81920 线程），重叠只能藏 launch
+   气泡，且有 LT_OVL 负收益的前车之鉴。
+4. ~~**小 chunk 尾包固定开销**~~（2026-09-21 已完成，Phase 3h）：尾
+   包并入前一个 chunk——`GDEC_PREFILL_TAIL_SLACK`（默认 Linux 1024 /
+   Windows 0，0 禁用），workspace 改按 `maxbatch_cap = maxbatch+slack`
+   分配（gdec.cpp:8063-8064、8170；mtp 三缓冲同步放大；arena 估算镜像）。
+   32821-token 实测：29.2s→28.8s（**+1.5%**，尾包 0.51s 全省）；对拍
+   32876 token 仅生成末段 1 个分歧（chunk 边界改变累加顺序，同
+   WMMA GEMM 容差级）。收益按 prompt 长度出现在刚超 chunk 边界的
+   情形；短尾越小相对收益越大。
+5. ~~**GR 去重读**~~（2026-09-21 已实测否决）：`k_gr_scatter_norm_b_hc_bf16_f4`
+   （单 block/token，y 进 LDS 只读一遍，串行 4 branch，env `GDEC_GR_SCAT4`
+   保留默认关）实测 8K **-0.8%**——原 4 block 并发时 y 的重复读本就命中
+   L2，DRAM 节省是纸面的，而 block 数 4P→P 还损失了并行度。Rhat 链
+   （scatter 写 → mix gemm 读 → combine 读 → 下层 inject gemm 读）无法
+   去重：combine 依赖两个 gemm 的输出，跨 gemm 融合是大改且收益上限
+   ~0.1s/8K。GR 维度关闭。
 6. **PLE gather 与 GPU 计算的更深重叠**：ple_host 冷态 410-870ms 可见，
    热态已被重叠掩盖；低优先级。
 

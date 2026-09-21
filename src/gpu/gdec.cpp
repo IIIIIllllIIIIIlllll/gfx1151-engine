@@ -30,11 +30,20 @@
 // (batched-GEMM pipeline; different rounding than the fused W4 kernels, so
 // it is opt-in). GDEC_MOE_LT_BF16=1 makes the expert
 // GEMM outputs bf16 as well. Both need GPU routing + deterministic mode.
+// GDEC_MOE_LT_OVL=1 (needs GDEC_MOE_LT) double-buffers the dequant scratch
+// and runs the next 4-expert group's dequant on a side stream overlapping
+// the current group's GEMMs; event-chained, bit-identical.
 // Phase 3g: self-written bf16 WMMA dense GEMM (k_gemm_wmma) for the four
 // prefill projection shapes at P >= 1024, opt-in via GDEC_GEMM_WMMA=1
 // (~37-38 vs ~32 TFLOPS hipBLASLt on N=6144..12288 K=2560; N=2560 K=6144
 // ~parity-to-+11%). Different K accumulation order than Tensile (not
 // bit-identical).
+// Phase 3h: tail-merge — a final prefill remainder of <= GDEC_PREFILL_TAIL_SLACK
+// (default 1024 on Linux, 0 elsewhere) tokens is absorbed into the previous
+// chunk instead of running as its own fixed-cost chunk; batch workspace is
+// allocated at maxbatch_cap = maxbatch + slack. GDEC_GDN_WINDOW_CHUNKS now
+// also sizes d_gdn_split_ws (was hardcoded 4; window>4 used to be an
+// illegal-memory-access bug).
 // M-RoPE (vision, stage 1b/1c): requests may carry image grid_thw triples
 // (CLI --mrope-grid t,h,w / serve GEN suffix MROPE k t h w ...); the host
 // expands them to per-token 3-row positions (reference get_rope_index
@@ -2856,6 +2865,59 @@ __global__ void k_gr_scatter_norm_b_hc_bf16(
   }
 }
 
+// One-block-per-token variant: y is staged in LDS once instead of being
+// re-read by each of the 4 branch blocks. Per-branch arithmetic (inject,
+// bf16 round-trip, 256-lane reduction tree, norm) is kept identical to
+// k_gr_scatter_norm_b_hc_bf16, so results are bit-exact.
+__global__ void k_gr_scatter_norm_b_hc_bf16_f4(
+    const float* __restrict__ w4, uint16_t* __restrict__ R,
+    const float* __restrict__ y, const float* __restrict__ w,
+    uint16_t* __restrict__ Rhat, int d, int branches, int P, float eps) {
+  int t = blockIdx.x;
+  if (t >= P) return;
+  int lane = threadIdx.x;
+  const float* yg = y + (size_t)t * d;
+  __shared__ float sm[256];
+  __shared__ float s_y[2560];
+  __shared__ float inject;
+  for (int c = lane; c < d; c += 256) s_y[c] = yg[c];
+  __syncthreads();
+  for (int b = 0; b < branches; b++) {
+    uint16_t* Rg = R + ((size_t)t * branches + b) * d;
+    const float* wg = w + (size_t)b * d;
+    uint16_t* og = Rhat + ((size_t)t * branches + b) * d;
+    if (lane == 0)
+      inject = 2.f / (1.f + expf(-w4[(size_t)t * branches + b] * 0.25f));
+    __syncthreads();
+    float values[10];
+    float ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < 10; j++) {
+      int c = lane + j * 256;
+      float rounded = 0.f;
+      if (c < d) {
+        uint16_t r16 = f2bf(bf2f(Rg[c]) + inject * s_y[c]);
+        Rg[c] = r16;
+        rounded = bf2f(r16);
+        ss += rounded * rounded;
+      }
+      values[j] = rounded;
+    }
+    sm[lane] = ss;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+      if (lane < off) sm[lane] += sm[lane + off];
+      __syncthreads();
+    }
+    float inv = rsqrtf(sm[0] / d + eps);
+#pragma unroll
+    for (int j = 0; j < 10; j++) {
+      int c = lane + j * 256;
+      if (c < d) og[c] = f2bf(values[j] * inv * (1.f + wg[c]));
+    }
+    __syncthreads();
+  }
+}
 // Fuse a hyper-connection residual update with the following grouped norm.
 // The model uses d=2560 and 1024-thread blocks, so each lane retains at most
 // three updated values across the reduction instead of reloading R.
@@ -4019,23 +4081,33 @@ __global__ void __launch_bounds__(NT)
     const int pl = wp0 + j * 16 + (lane & 15);
     boff[j] = ((pl >> 3) * BREG + (pl & 7) * LSA) * 2;
   }
-  // staging: thread idx -> row = idx/4, q = idx%4 (coalesced 64B row
-  // segments). Global rows clamp to P-1 / N-1 for the tail block (one-time
-  // setup cost, none in the K loop).
+  // staging: bank-phase-paired row mapping. A warp stages RPW=32/(KST/8)
+  // rows x (KST/8) 16B units; a ds_store_b128 retires in 8-lane phases, and
+  // with the LSA=80B row stride any two CONSECUTIVE rows in a phase always
+  // collide on one 4-bank group (the second row's 4 blocks always wrap onto
+  // byte offset 128 == bank 0). Pairing rows (b, b+RPW/2) per phase makes
+  // each phase cover all 32 banks exactly once (SQC_LDS_BANK_CONFLICT:
+  // 39.8M -> 0 per dispatch). Same warp-global address set, so global
+  // coalescing is unchanged; LDS layout and all load paths untouched.
+  constexpr int Q8 = KST / 8;
+  constexpr int RPW = 32 / Q8;
+  static_assert(RPW % 2 == 0 && KST % 8 == 0, "store mapping mismatch");
   const uint16_t* ga[AN];
   const uint16_t* gb[BN];
   uint32_t saoff[AN], sboff[BN];
 #pragma unroll
   for (int j = 0; j < AN; ++j) {
     const int idx = tid + j * NT;
-    const int row = idx / (KST / 8), q = idx % (KST / 8);
+    const int q = idx % Q8, b = (idx / Q8) % RPW;
+    const int row = (idx / (Q8 * RPW)) * RPW + (b & 1) * (RPW / 2) + (b / 2);
     ga[j] = X + (size_t)min(m0 + row, P - 1) * K + q * 8;
     saoff[j] = (row * LSA + q * 8) * 2;
   }
 #pragma unroll
   for (int j = 0; j < BN; ++j) {
     const int idx = tid + j * NT;
-    const int row = idx / (KST / 8), q = idx % (KST / 8);
+    const int q = idx % Q8, b = (idx / Q8) % RPW;
+    const int row = (idx / (Q8 * RPW)) * RPW + (b & 1) * (RPW / 2) + (b / 2);
     gb[j] = W + (size_t)min(n0 + row, N - 1) * K + q * 8;
     sboff[j] = ((row >> 3) * BREG + (row & 7) * LSA + q * 8) * 2;
   }
@@ -6206,6 +6278,19 @@ static int eff_maxbatch(int maxctx) {
 #endif
 }
 
+// 尾包合并 slack：prompt 切成 maxbatch chunk 后若最后只剩 ≤ slack 个
+// token，则并入前一个 chunk（该 chunk 最大 maxbatch+slack）。workspace
+// 按 maxbatch+slack 分配。0 禁用。Windows arena 有 95 GiB 硬顶，默认关。
+static int eff_tail_slack() {
+  if (const char* e = getenv("GDEC_PREFILL_TAIL_SLACK"))
+    return std::max(0, atoi(e));
+#ifdef _WIN32
+  return 0;
+#else
+  return 1024;
+#endif
+}
+
 // 镜像 GpuModel 构造函数的分配公式（含相同 env 分支），用于 arena 精确 sizing。
 // 每项 256B 对齐后求和；估少了一律有 dalloc_arena 的 hipMalloc 回退兜底。
 static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
@@ -6228,10 +6313,16 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
                          !getenv("GDEC_MOE_HOST_ROUTE") &&
                          !getenv("GDEC_MOE_ORDERED");
   const bool lt_cmp = getenv("GDEC_MOE_LT_CMP") != nullptr;
+  const bool lt_ovl = getenv("GDEC_MOE_LT_OVL") != nullptr;
   const bool gdn_split =
       !getenv("GDEC_GDN_NOSPLIT") && !getenv("GDEC_GDN_LOOP");
   const bool gdn_str = getenv("GDEC_GDN_STREAM") != nullptr;
-  const size_t mc = (size_t)maxctx, BP = (size_t)eff_maxbatch(maxctx);
+  const int gdn_window_chunks = [] {
+    const char* e = getenv("GDEC_GDN_WINDOW_CHUNKS");
+    return e ? std::max(1, atoi(e)) : 4;
+  }();
+  const size_t mc = (size_t)maxctx,
+               BP = (size_t)(eff_maxbatch(maxctx) + eff_tail_slack());
   const size_t ngdn = g_cfg.layers - g_cfg.layers / 4, nqsa = g_cfg.layers / 4;
   const size_t ib = (mc + 3) / 4, rb = (size_t)g_cfg.branches * g_cfg.d;
   add((size_t)64 << 20);  // decode 单行小缓冲合计（d_R..d_logits 等）
@@ -6243,7 +6334,8 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
       (qsa_dense ? 0 : nqsa * 4 * 128 * 4));  // d_ckpt
   add((size_t)48 * 2 * 64 * 128 * 4);       // d_gdn_ws
   if (gdn_split)
-    add((gdn_str ? std::min<size_t>(4, (BP + 63) / 64) : (BP + 63) / 64) * 48 *
+    add((gdn_str ? std::min<size_t>(gdn_window_chunks, (BP + 63) / 64)
+                 : (BP + 63) / 64) * 48 *
         (size_t)GDN_SPLIT_WS_FLOATS * 4);
   add((size_t)64 << 20);                    // d_wbf16
   add((size_t)64 << 20);                    // d_ltws
@@ -6286,8 +6378,8 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   add(((BP * g_cfg.topk + 63) / 64 + g_cfg.experts) * sizeof(MoeTile) + 4);  // moetiles
   if (moe_lt_ok) {
     add(BP * g_cfg.topk * g_cfg.d * 2);         // moexg
-    add((size_t)4 * 2 * g_cfg.moe_mid * g_cfg.d * 2);  // moewup
-    add((size_t)4 * g_cfg.d * g_cfg.moe_mid * 2);      // moewdn
+    add((size_t)4 * 2 * g_cfg.moe_mid * g_cfg.d * 2 * (lt_ovl ? 2 : 1));  // moewup
+    add((size_t)4 * g_cfg.d * g_cfg.moe_mid * 2 * (lt_ovl ? 2 : 1));      // moewdn
     if (lt_cmp) {
       add(BP * g_cfg.topk * g_cfg.moe_mid * 2);  // hidb2
       add(BP * g_cfg.topk * g_cfg.d * 4);        // pairs2
@@ -7784,7 +7876,9 @@ struct GpuModel {
   const Checkpoint& ckpt;
   bool ple_on = true;
   int maxctx;
-  int maxbatch;  // prefill chunk size: batch buffers are allocated at this
+  int maxbatch;  // prefill chunk size: batch buffers are allocated at
+                 // maxbatch_cap (maxbatch + tail-merge slack)
+  int maxbatch_cap;
   int pos = 0;
   NgramMod ngram;
   // Adaptive ngram verify chunk rows, shared by both chain loops and kept
@@ -7922,8 +8016,8 @@ struct GpuModel {
   // GDEC_MOE_LT buffers (allocated only when enabled): gathered bf16 pair rows
   // and per-group dequant scratch.
   __hip_bfloat16* d_moexg = nullptr;   // [BP*topk, d]
-  __hip_bfloat16* d_moewup = nullptr;  // [MOE_LT_GRP, 2*moe_mid, d]
-  __hip_bfloat16* d_moewdn = nullptr;  // [MOE_LT_GRP, d, moe_mid]
+  __hip_bfloat16* d_moewup = nullptr;  // [MOE_LT_GRP(x2 if OVL), 2*moe_mid, d]
+  __hip_bfloat16* d_moewdn = nullptr;  // [MOE_LT_GRP(x2 if OVL), d, moe_mid]
   uint16_t* d_hidb2 = nullptr;  // GDEC_MOE_LT_CMP: fused-reference packed hid
   float* d_pairs2 = nullptr;    // GDEC_MOE_LT_CMP: fused-reference weighted pairs
   int* d_cmpi = nullptr;        // GDEC_MOE_LT_CMP: [max|diff|, max|ref|] ordered int
@@ -8036,6 +8130,7 @@ struct GpuModel {
     // KV reuse, so a 256K context costs chunk-sized workspace (~4.5 GB at
     // 8192) instead of ~541 KB/token of context.
     maxbatch = eff_maxbatch(maxctx);
+    maxbatch_cap = std::min(maxctx, maxbatch + eff_tail_slack());
     int rb = g_cfg.branches * g_cfg.d;
     DALLOC(&d_R, rb * 4);
     DALLOC(&d_Rhat, rb * 4);
@@ -8141,7 +8236,7 @@ struct GpuModel {
 
     // ---- prefill batch buffers (Phase 3a), allocated once at maxctx ----
     {
-      size_t BP = (size_t)maxbatch;
+      size_t BP = (size_t)maxbatch_cap;
       DALLOC(&d_Rb, BP * 10240 * 4);
       DALLOC(&d_Rhatb, BP * 10240 * 4);
       DALLOC(&d_xb, BP * 2560 * 4);
@@ -8187,10 +8282,11 @@ struct GpuModel {
       }
       if (moe_lt && g_cfg.topk == 10 && moe_deterministic && !moe_host_route && !moe_ordered) {
         // 4-expert dequant groups: scratch stays MALL-resident between dequant
-        // and its GEMMs (measured in tools/moe_lt_bench.cu).
+        // and its GEMMs (measured in tools/moe_lt_bench.cu). GDEC_MOE_LT_OVL
+        // doubles it for the A/B slot rotation of the overlap pipeline.
         DALLOC(&d_moexg, (size_t)BP * g_cfg.topk * g_cfg.d * 2);
-        DALLOC(&d_moewup, (size_t)4 * 2 * g_cfg.moe_mid * g_cfg.d * 2);
-        DALLOC(&d_moewdn, (size_t)4 * g_cfg.d * g_cfg.moe_mid * 2);
+        DALLOC(&d_moewup, (size_t)4 * 2 * g_cfg.moe_mid * g_cfg.d * 2 * (moe_lt_ovl ? 2 : 1));
+        DALLOC(&d_moewdn, (size_t)4 * g_cfg.d * g_cfg.moe_mid * 2 * (moe_lt_ovl ? 2 : 1));
         if (moe_lt_cmp) {
           DALLOC(&d_hidb2, (size_t)BP * g_cfg.topk * g_cfg.moe_mid * 2);
           DALLOC(&d_pairs2, (size_t)BP * g_cfg.topk * g_cfg.d * 4);
@@ -8199,9 +8295,9 @@ struct GpuModel {
       }
       DALLOC(&d_convb, BP * 10240 * 4);
       DALLOC(&d_gdn_ws, (size_t)48 * 2 * 64 * 128 * 4);
-      if (!gdn_nosplit && !gdn_loop)  // streaming caps the workspace at 15.05 MiB
+      if (!gdn_nosplit && !gdn_loop)  // streaming caps the workspace at window chunks (15.05 MiB @4)
         DALLOC(&d_gdn_split_ws,
-                     (size_t)(gdn_stream ? std::min<size_t>(4, (BP + 63) / 64)
+                     (size_t)(gdn_stream ? std::min<size_t>(gdn_window_chunks, (BP + 63) / 64)
                                          : (BP + 63) / 64) * 48 * GDN_SPLIT_WS_FLOATS * 4);
       DALLOC(&d_keysb, BP * 10240 * 4);
       DALLOC(&d_plevb, BP * 2560 * 4);
@@ -8333,9 +8429,9 @@ struct GpuModel {
           DALLOC(&d_mkcb, (size_t)maxctx * 512 * 2);
           DALLOC(&d_mvcb, (size_t)maxctx * 512 * 2);
         }
-        DALLOC(&d_mRb, (size_t)maxbatch * 10240 * 4);
-        DALLOC(&d_mRhatb, (size_t)maxbatch * 10240 * 4);
-        DALLOC(&d_mtap, (size_t)maxbatch * 10240 * 4);
+        DALLOC(&d_mRb, (size_t)maxbatch_cap * 10240 * 4);
+        DALLOC(&d_mRhatb, (size_t)maxbatch_cap * 10240 * 4);
+        DALLOC(&d_mtap, (size_t)maxbatch_cap * 10240 * 4);
         {
           int ngdn = g_cfg.layers - g_cfg.layers / 4;
           DALLOC(&d_mring_ckpt, 512 * 4);
@@ -9008,6 +9104,7 @@ struct GpuModel {
   bool pp_moe_out = getenv("GDEC_PP_MOE_OUT") != nullptr;
   bool moe_lt_bf16 = getenv("GDEC_MOE_LT_BF16") != nullptr;  // bf16 GEMM outputs (LT path)
   bool moe_lt_cmp = getenv("GDEC_MOE_LT_CMP") != nullptr;  // debug: in-run fused reference diff
+  bool moe_lt_ovl = getenv("GDEC_MOE_LT_OVL") != nullptr;  // overlap next group's dequant with current GEMMs (LT path)
   // LT loses below ~4K tokens (512 tiny per-expert launches + the d_eoff sync
   // cost more than the GEMM wins; measured 2026-09-10: +0.7s @2K, wash @8K).
   int moe_lt_min = getenv("GDEC_MOE_LT_MIN") ? atoi(getenv("GDEC_MOE_LT_MIN")) : 4096;
@@ -9020,6 +9117,7 @@ struct GpuModel {
     return e ? std::max(1, atoi(e)) : 4;
   }();
   bool gdn_wave = getenv("GDEC_GDN_WAVE") != nullptr;  // column-local triangular solve
+  bool gr_scat4 = getenv("GDEC_GR_SCAT4") != nullptr;  // one-block-per-token GR scatter+norm
   bool gdn_ut5 = getenv("GDEC_GDN_UT5") != nullptr;  // blocked triangular inverse
   bool ple_loop = getenv("GDEC_PLE_LOOP") != nullptr;  // prefill PLE fallback
   bool prof = getenv("GDEC_PROF") != nullptr;  // host-side phase timing
@@ -9413,9 +9511,14 @@ struct GpuModel {
          gr_bf16 ? d_Rhatbf16 : nullptr);
     float* hw = ensure_hcnorm(read_prefix);
     if (gr_bf16)
-      k_gr_scatter_norm_b_hc_bf16<<<4 * P, 256, 0, g_str>>>(
-          d_w4b, (uint16_t*)d_Rb, d_yb, hw, d_Rhatbf16, g_cfg.d,
-          g_cfg.branches, P, g_cfg.norm_eps);
+      if (gr_scat4 && g_cfg.d <= 2560)
+        k_gr_scatter_norm_b_hc_bf16_f4<<<P, 256, 0, g_str>>>(
+            d_w4b, (uint16_t*)d_Rb, d_yb, hw, d_Rhatbf16, g_cfg.d,
+            g_cfg.branches, P, g_cfg.norm_eps);
+      else
+        k_gr_scatter_norm_b_hc_bf16<<<4 * P, 256, 0, g_str>>>(
+            d_w4b, (uint16_t*)d_Rb, d_yb, hw, d_Rhatbf16, g_cfg.d,
+            g_cfg.branches, P, g_cfg.norm_eps);
     else if (prefill_fused)
       k_gr_scatter_norm_b<true><<<4 * P, 1024, 0, g_str>>>(
           d_w4b, d_Rb, d_yb, hw, d_Rhatb, g_cfg.d, g_cfg.branches, P,
@@ -9879,20 +9982,76 @@ struct GpuModel {
         bool b16 = moe_lt_bf16;
         __hip_bfloat16* guv16 = (__hip_bfloat16*)d_guvb;
         // up phase: group dequant -> per-expert GEMM -> segment silu
-        for (int e0 = 0; e0 < E; e0 += 4) {
-          int g = std::min(4, E - e0);
+        // GDEC_MOE_LT_OVL pipeline: scratch is double-buffered (slots gi&1);
+        // group gi+1's dequant runs on ovl_str while g_str runs group gi's
+        // GEMMs. ovl_deq[b] = deq into slot b done; ovl_gemm[b] = GEMMs that
+        // read slot b done. deq(gi+1) waits on the group gi-1 GEMMs (the
+        // previous reader of its slot). g_str never touches slot b before
+        // waiting ovl_deq[b], and by loop end has waited on every ovl_str
+        // deq, so the next phase/layer (whose ovl_str work chains behind
+        // these deqs and g_str's later GEMM event records) cannot race the
+        // slots either. Prefill only runs outside graph capture.
+        static hipStream_t ovl_str = nullptr;
+        static hipEvent_t ovl_deq[2] = {nullptr, nullptr};
+        static hipEvent_t ovl_gemm[2] = {nullptr, nullptr};
+        if (moe_lt_ovl && !ovl_str) {
+          // Non-blocking: g_str is the legacy default stream outside graph
+          // capture, and a blocking side stream would implicitly serialize
+          // with it (measured: -16% at 8K, no overlap at all).
+          CK(hipStreamCreateWithFlags(&ovl_str, hipStreamNonBlocking));
+          for (int i = 0; i < 2; i++) {
+            CK(hipEventCreateWithFlags(&ovl_deq[i], hipEventDisableTiming));
+            CK(hipEventCreateWithFlags(&ovl_gemm[i], hipEventDisableTiming));
+          }
+        }
+        const int ngrp = (E + 3) / 4;
+        auto deq_up = [&](int gi, hipStream_t st) {
+          int e0 = gi * 4, g = std::min(4, E - e0);
           int64_t total = (int64_t)g * 2 * mid * (dd / 32);
-          k_moe_deq_bf16<<<(unsigned)((total + 255) / 256), 256, 0, g_str>>>(
+          k_moe_deq_bf16<<<(unsigned)((total + 255) / 256), 256, 0, st>>>(
               gu.data + 64 + (size_t)e0 * 2 * mid * (dd / 2),
               gu.data + 64 + gu.rows * gu.cols / 2 +
                   (size_t)e0 * 2 * mid * gu.scale_stride,
-              (const float*)gu.data, d_moewup, g * 2 * mid, dd, gu.scale_stride);
+              (const float*)gu.data,
+              d_moewup + (size_t)(moe_lt_ovl ? (gi & 1) : 0) * 4 * 2 * mid * dd,
+              g * 2 * mid, dd, gu.scale_stride);
+        };
+        auto deq_dn = [&](int gi, hipStream_t st) {
+          int e0 = gi * 4, g = std::min(4, E - e0);
+          int64_t total = (int64_t)g * dd * (mid / 32);
+          k_moe_deq_bf16<<<(unsigned)((total + 255) / 256), 256, 0, st>>>(
+              dn.data + 64 + (size_t)e0 * dd * (mid / 2),
+              dn.data + 64 + dn.rows * dn.cols / 2 +
+                  (size_t)e0 * dd * dn.scale_stride,
+              (const float*)dn.data,
+              d_moewdn + (size_t)(moe_lt_ovl ? (gi & 1) : 0) * 4 * dd * mid,
+              g * dd, mid, dn.scale_stride);
+        };
+        if (moe_lt_ovl) {
+          deq_up(0, ovl_str);
+          CK(hipEventRecord(ovl_deq[0], ovl_str));
+        }
+        for (int gi = 0; gi < ngrp; gi++) {
+          int e0 = gi * 4, g = std::min(4, E - e0);
+          __hip_bfloat16* wup =
+              d_moewup + (size_t)(moe_lt_ovl ? (gi & 1) : 0) * 4 * 2 * mid * dd;
+          if (moe_lt_ovl) {
+            if (gi + 1 < ngrp) {
+              if (gi >= 1)
+                CK(hipStreamWaitEvent(ovl_str, ovl_gemm[(gi + 1) & 1], 0));
+              deq_up(gi + 1, ovl_str);
+              CK(hipEventRecord(ovl_deq[(gi + 1) & 1], ovl_str));
+            }
+            CK(hipStreamWaitEvent(g_str, ovl_deq[gi & 1], 0));
+          } else {
+            deq_up(gi, g_str);
+          }
           for (int e = e0; e < e0 + g; e++) {
             int n0 = hoff[e], m = hoff[e + 1] - n0;
             if (!m) continue;
             void* cup = b16 ? (void*)(guv16 + (size_t)n0 * 2 * mid)
                             : (void*)(d_guvb + (size_t)n0 * 2 * mid);
-            gemm_bf16(d_moewup + (size_t)(e - e0) * 2 * mid * dd,
+            gemm_bf16(wup + (size_t)(e - e0) * 2 * mid * dd,
                       d_moexg + (size_t)n0 * dd, cup, 2 * mid, dd, m, b16);
             int64_t seg = (int64_t)m * mid;
             if (b16)
@@ -9904,6 +10063,7 @@ struct GpuModel {
                   d_guvb + (size_t)n0 * 2 * mid,
                   (__hip_bfloat16*)d_hidb + (size_t)n0 * mid, mid, m);
           }
+          if (moe_lt_ovl) CK(hipEventRecord(ovl_gemm[gi & 1], g_str));
         }
         if (moe_lt_cmp && l == 0) {
           // Reference: fused packed up on identical inputs -> d_hidb2.
@@ -9928,23 +10088,35 @@ struct GpuModel {
           fprintf(stderr, "moe_lt cmp up-hid: max|d|=%g max|ref|=%g\n", fd, fr);
         }
         // down phase: d_guvb is dead after silu; pair outputs alias it.
-        for (int e0 = 0; e0 < E; e0 += 4) {
-          int g = std::min(4, E - e0);
-          int64_t total = (int64_t)g * dd * (mid / 32);
-          k_moe_deq_bf16<<<(unsigned)((total + 255) / 256), 256, 0, g_str>>>(
-              dn.data + 64 + (size_t)e0 * dd * (mid / 2),
-              dn.data + 64 + dn.rows * dn.cols / 2 +
-                  (size_t)e0 * dd * dn.scale_stride,
-              (const float*)dn.data, d_moewdn, g * dd, mid, dn.scale_stride);
+        if (moe_lt_ovl) {
+          deq_dn(0, ovl_str);
+          CK(hipEventRecord(ovl_deq[0], ovl_str));
+        }
+        for (int gi = 0; gi < ngrp; gi++) {
+          int e0 = gi * 4, g = std::min(4, E - e0);
+          __hip_bfloat16* wdn =
+              d_moewdn + (size_t)(moe_lt_ovl ? (gi & 1) : 0) * 4 * dd * mid;
+          if (moe_lt_ovl) {
+            if (gi + 1 < ngrp) {
+              if (gi >= 1)
+                CK(hipStreamWaitEvent(ovl_str, ovl_gemm[(gi + 1) & 1], 0));
+              deq_dn(gi + 1, ovl_str);
+              CK(hipEventRecord(ovl_deq[(gi + 1) & 1], ovl_str));
+            }
+            CK(hipStreamWaitEvent(g_str, ovl_deq[gi & 1], 0));
+          } else {
+            deq_dn(gi, g_str);
+          }
           for (int e = e0; e < e0 + g; e++) {
             int n0 = hoff[e], m = hoff[e + 1] - n0;
             if (!m) continue;
             void* cdn = b16 ? (void*)(guv16 + (size_t)n0 * dd)
                             : (void*)(d_guvb + (size_t)n0 * dd);
-            gemm_bf16(d_moewdn + (size_t)(e - e0) * dd * mid,
+            gemm_bf16(wdn + (size_t)(e - e0) * dd * mid,
                       (const __hip_bfloat16*)d_hidb + (size_t)n0 * mid, cdn, dd,
                       mid, m, b16);
           }
+          if (moe_lt_ovl) CK(hipEventRecord(ovl_gemm[gi & 1], g_str));
         }
         if (moe_lt_cmp && l == 0 && b16) {
           // Reference: fused packed down on LT's hid -> weighted fp32 pairs.
@@ -10282,8 +10454,12 @@ struct GpuModel {
                     bool quiet = false) {
     int N = (int)tokens.size();
     int id = -1;
-    for (int off = 0; off < N; off += maxbatch) {
-      int n = std::min(maxbatch, N - off);
+    for (int off = 0; off < N;) {
+      int rem = N - off;
+      int n = std::min(maxbatch, rem);
+      // Absorb a small tail into this chunk instead of running a tiny final
+      // chunk whose per-chunk fixed cost (~0.9 s) dwarfs its token count.
+      if (rem > maxbatch && rem <= maxbatch_cap) n = rem;
       id = prefill_chunk(
           std::vector<int>(tokens.begin() + off, tokens.begin() + off + n),
           base + off, final, quiet);
@@ -10299,6 +10475,7 @@ struct GpuModel {
           mtp_ingest_b(d_mtap, shifted, count, c0);
         }
       }
+      off += n;
     }
     return id;
   }
@@ -10306,9 +10483,9 @@ struct GpuModel {
   int prefill_chunk(const std::vector<int>& tokens, int base = 0, bool final = true,
                     bool quiet = false) {
     int P = (int)tokens.size();
-    if (P < 1 || base + P > maxctx || base < 0 || P > maxbatch) {
+    if (P < 1 || base + P > maxctx || base < 0 || P > maxbatch_cap) {
       fprintf(stderr, "prefill_chunk: base=%d P=%d out of range "
-              "(maxctx=%d maxbatch=%d)\n", base, P, maxctx, maxbatch);
+              "(maxctx=%d maxbatch_cap=%d)\n", base, P, maxctx, maxbatch_cap);
       exit(1);
     }
     static const bool phase_prof = getenv("GDEC_PHASE") != nullptr;
@@ -10537,9 +10714,9 @@ struct GpuModel {
       // Taps are stored at chunk-local rows (0..P) regardless of the absolute
       // base; prefill_batch ingests each chunk right after it completes, so
       // prompts longer than maxbatch work.
-      if (P > maxbatch) {
-        fprintf(stderr, "mtp tap capture: unsupported (P=%d maxbatch=%d)\n", P,
-                maxbatch);
+      if (P > maxbatch_cap) {
+        fprintf(stderr, "mtp tap capture: unsupported (P=%d maxbatch_cap=%d)\n", P,
+                maxbatch_cap);
         exit(1);
       }
       if (gr_bf16) {  // d_Rb rows are bf16; d_mtap stays fp32 for ingest

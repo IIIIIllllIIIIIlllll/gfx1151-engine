@@ -146,23 +146,32 @@ __global__ void __launch_bounds__(NT)
     const int pl = wp0 + j * 16 + (lane & 15);
     boff[j] = ((pl >> 3) * BREG + (pl & 7) * LSA) * 2;
   }
-  // staging: thread idx -> row = idx/4, q = idx%4 (coalesced 64B row segments).
-  // (The probe shows this and every other simple store mapping costs some
-  // bank conflicts on stores; they are a small share of LDS traffic.)
+  // staging: bank-phase-paired row mapping. A warp stages RPW=32/(KST/8)
+  // rows x (KST/8) 16B units; a ds_store_b128 retires in 8-lane phases, and
+  // with the LSA=80B row stride any two CONSECUTIVE rows in a phase always
+  // collide on one 4-bank group (the second row's 4 blocks always include
+  // byte offset 128). Pairing rows (b, b+RPW/2) per phase instead makes each
+  // phase cover all 32 banks exactly once. Same warp-global address set, so
+  // global coalescing is unchanged; LDS layout and all load paths untouched.
+  constexpr int Q8 = KST / 8;
+  constexpr int RPW = 32 / Q8;
+  static_assert(RPW % 2 == 0 && KST % 8 == 0, "store mapping mismatch");
   const uint16_t* ga[AN];
   const uint16_t* gb[BN];
   uint32_t saoff[AN], sboff[BN];
 #pragma unroll
   for (int j = 0; j < AN; ++j) {
     const int idx = tid + j * NT;
-    const int row = idx / (KST / 8), q = idx % (KST / 8);
+    const int q = idx % Q8, b = (idx / Q8) % RPW;
+    const int row = (idx / (Q8 * RPW)) * RPW + (b & 1) * (RPW / 2) + (b / 2);
     ga[j] = X + (size_t)(m0 + row) * K + q * 8;
     saoff[j] = (row * LSA + q * 8) * 2;
   }
 #pragma unroll
   for (int j = 0; j < BN; ++j) {
     const int idx = tid + j * NT;
-    const int row = idx / (KST / 8), q = idx % (KST / 8);
+    const int q = idx % Q8, b = (idx / Q8) % RPW;
+    const int row = (idx / (Q8 * RPW)) * RPW + (b & 1) * (RPW / 2) + (b / 2);
     gb[j] = W + (size_t)(n0 + row) * K + q * 8;
     sboff[j] = ((row >> 3) * BREG + (row & 7) * LSA + q * 8) * 2;
   }
