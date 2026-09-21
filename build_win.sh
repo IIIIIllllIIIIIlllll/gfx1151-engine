@@ -80,7 +80,7 @@ case "$TARGET" in
     "$CXX" -O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS -Isrc/api -I"$TR/include" \
       src/api/http.cpp src/api/engine_client.cpp src/api/tokenizer.cpp \
       src/api/chat_template.cpp src/api/json_py.cpp src/api/toolparse.cpp \
-      src/api/vision.cpp src/api/main.cpp -lws2_32 -o build/gdec-api-win.exe
+      src/api/vision.cpp src/api/reqstat.cpp src/api/main.cpp -lws2_32 -o build/gdec-api-win.exe
     ;;
   launcher)
     # 免脚本启动器：原生 Win32，双击即用（不需要 Git Bash / PowerShell）。

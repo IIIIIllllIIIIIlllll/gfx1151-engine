@@ -36,6 +36,7 @@
 #include "engine_client.h"
 #include "http.h"
 #include "json_py.h"
+#include "reqstat.h"
 #include "tokenizer.h"
 #include "toolparse.h"
 #include "vision.h"
@@ -392,6 +393,32 @@ GenOutcome run_generation(GenSpec& spec,
         fprintf(stderr, "REQ %lld mtp rounds=%d commit=%d proposed=%d acc=%.1f%%\n", req_id,
                 out.rounds, out.commit, out.proposed,
                 out.proposed ? 100.0 * (out.commit - out.rounds) / out.proposed : 0.0);
+    {
+        auto us = [](double ms) -> uint32_t {
+            double v = ms * 1000.0;
+            return v >= 4294967295.0 ? 4294967295u : (uint32_t)(v > 0.0 ? v : 0.0);
+        };
+        reqstat::Entry e{};
+        e.ts_ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::system_clock::now().time_since_epoch())
+                      .count();
+        e.req_seq = (uint64_t)req_id;
+        e.n_prompt = (uint32_t)std::min<long long>(out.n_prompt, UINT32_MAX);
+        e.n_cached = (uint32_t)out.n_cached;
+        e.n_gen = (uint32_t)std::min<long long>(out.n_gen, UINT32_MAX);
+        e.proposed = (uint32_t)out.proposed;
+        e.commit = (uint32_t)out.commit;
+        e.rounds = (uint32_t)out.rounds;
+        e.prefill_us = us(out.prefill_ms);
+        e.decode_us = us(out.decode_ms);
+        e.ttft_us = us(out.ttft_ms);
+        const uint32_t finish = out.client_gone || r.reason == "cancel" ? 3u
+                                : out.reason == "length"               ? 2u
+                                                                       : 1u;
+        e.flags = finish | ((uint32_t)(r.drafter & 0xF) << 4) |
+                  (!p.patches.empty() ? 0x100u : 0u);
+        reqstat::record(e);
+    }
     return out;
 }
 

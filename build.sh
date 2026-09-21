@@ -78,7 +78,7 @@ build_api() {
   compile build/gdec-api 8 120 "$CXX" "${API_FLAGS[@]}" \
     src/api/http.cpp src/api/engine_client.cpp src/api/tokenizer.cpp \
     src/api/chat_template.cpp src/api/json_py.cpp src/api/toolparse.cpp \
-    src/api/vision.cpp src/api/main.cpp -lpng -ljpeg -lwebp -lpthread || return 1
+    src/api/vision.cpp src/api/reqstat.cpp src/api/main.cpp -lpng -ljpeg -lwebp -lpthread || return 1
   compile build/tok_cli 8 120 "$CXX" "${API_FLAGS[@]}" \
     src/api/tokenizer.cpp src/api/tok_cli.cpp || return 1
   compile build/tpl_cli 8 120 "$CXX" "${API_FLAGS[@]}" \
