@@ -288,6 +288,10 @@ std::string build_gen_request(const GenParams& p) {
     if (!p.patches.empty()) s += " VIMG " + std::to_string(p.patches.size());
     if (p.snap >= 0) s += " SNAP " + std::to_string(p.snap);
     if (p.snap2 >= 0) s += " SNAP2 " + std::to_string(p.snap2);
+    if (!p.snaps.empty()) {
+        s += " SNAPS " + std::to_string(p.snaps.size());
+        for (long long c : p.snaps) s += " " + std::to_string(c);
+    }
     s += "\n";
     return s;
 }

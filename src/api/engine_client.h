@@ -43,6 +43,7 @@ struct GenParams {
     std::vector<std::vector<float>> patches;      // VIMG: one (P*1536) fp32 per grid
     long long snap = -1;                 // -1 = omit
     long long snap2 = -1;
+    std::vector<long long> snaps;        // SNAPS <n> c1..cn, empty = omit
 };
 
 struct GenResult {

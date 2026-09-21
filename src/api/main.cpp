@@ -4,11 +4,12 @@
 // schemas and project-owned black-box conformance fixtures. The tokenizer and
 // chat template are verified by tools/tok_ab.py and tools/template_ab.py.
 //
-// Known gap (see the handover addendum):
-//   * conv-substitution / SNAP2 hints are not sent. KV reuse still works for
-//     ordinary multi-turn traffic, because a re-rendered history is a strict
-//     prefix of the next prompt, which is exactly what the engine's `cont`
-//     prefix check wants.
+// KV reuse: text-only chat/responses requests send SNAPS hints (semantic
+// message-boundary token cuts, see compute_snap_cuts); the engine keeps RAM
+// checkpoints (rckpt) at those cuts, so edit-and-resend and multi-turn
+// retokenization wobble hit the cache instead of re-prefilling. Vision
+// requests and raw completions send no hints — the engine's `cont` strict-
+// prefix reuse and the SSD kvsnap tier still apply.
 #include <atomic>
 #include <algorithm>
 #include <array>
@@ -231,6 +232,7 @@ struct GenSpec {
     std::vector<std::string> stop;
     std::vector<std::array<int, 3>> mrope_grids;
     std::vector<std::vector<float>> patches;
+    std::vector<long long> snaps;  // SNAPS hints: semantic boundary token cuts
 };
 
 struct GenOutcome {
@@ -285,6 +287,7 @@ GenOutcome run_generation(GenSpec& spec,
     p.logprobs = spec.logprobs;
     p.mrope_grids = spec.mrope_grids;
     p.patches = std::move(spec.patches);
+    p.snaps = spec.snaps;
 
     GenOutcome out;
     out.served_max_tokens = p.max_tokens;
@@ -1118,6 +1121,56 @@ class ThinkSplitter {
     bool split_ = false, content_started_ = false;
 };
 
+// Semantic boundary hints (SNAPS): token positions where a future
+// re-rendered prompt is likely to share a prefix with this one — the end of
+// every earlier message and the end of the last message's content (just
+// before its closing tag). The engine keeps cheap RAM checkpoints at these
+// cuts, which is what makes edit-and-resend and multi-turn retokenization
+// wobble hit the cache instead of re-prefilling. A cut is only sent when its
+// character boundary is an exact token start in the final encoding, so every
+// hint is a real token boundary of this prompt.
+std::vector<long long> compute_snap_cuts(const json& messages,
+                                         chat_template::Options opts,
+                                         const std::string& text,
+                                         size_t n_ids) {
+    std::vector<size_t> cut_chars;
+    opts.add_generation_prompt = nullptr;  // prefix renders stop at message ends
+    for (size_t k = 1; k < messages.size(); k++) {
+        json prefix = json::array();
+        for (size_t i = 0; i < k; i++) prefix.push_back(messages[i]);
+        chat_template::RenderResult pr =
+            chat_template::render_chat_template(&prefix, opts);
+        // Only exact char prefixes of the full render are stable boundaries
+        // (tool-role rendering depends on the NEXT message, so not every
+        // message end qualifies).
+        if (pr.ok && pr.text.size() < text.size() &&
+            text.compare(0, pr.text.size(), pr.text) == 0)
+            cut_chars.push_back(pr.text.size());
+    }
+    // End of the last message's content = just before its closing <|im_end|>.
+    chat_template::RenderResult ng =
+        chat_template::render_chat_template(&messages, opts);
+    if (ng.ok && ng.text.size() <= text.size() &&
+        text.compare(0, ng.text.size(), ng.text) == 0) {
+        const size_t tail = ng.text.rfind("<|im_end|>");
+        if (tail != std::string::npos) cut_chars.push_back(tail);
+    }
+    std::sort(cut_chars.begin(), cut_chars.end());
+    cut_chars.erase(std::unique(cut_chars.begin(), cut_chars.end()),
+                    cut_chars.end());
+    std::vector<long long> cuts;
+    if (cut_chars.empty()) return cuts;
+    const std::vector<gdec::TokenSpan> spans = g_tok.encode_with_offsets(text);
+    size_t ti = 0;
+    for (size_t cc : cut_chars) {
+        while (ti < spans.size() && spans[ti].start < cc) ti++;
+        if (ti < spans.size() && spans[ti].start == cc && ti > 0 && ti < n_ids)
+            cuts.push_back((long long)ti);
+    }
+    if (cuts.size() > 8) cuts.erase(cuts.begin(), cuts.end() - 8);
+    return cuts;
+}
+
 // POST /v1/chat/completions
 void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
     const json body = parse_body(q);
@@ -1163,6 +1216,10 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
         spec.patches.push_back(std::move(frame.patches));
     }
     if (spec.ids.empty()) http::fail(400, kEngineRejected);
+    // Text-only: offsets across image pads are not meaningful, so vision
+    // requests go without hints (plain `cont` reuse still applies).
+    if (frames.empty())
+        spec.snaps = compute_snap_cuts(messages, opts, rr.text, spec.ids.size());
     apply_sampling(body, &spec);
 
     const bool stream = bool_field(body, "stream", false) && st != nullptr;
@@ -1345,6 +1402,10 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
         spec.patches.push_back(std::move(frame.patches));
     }
     if (spec.ids.empty()) http::fail(400, kEngineRejected);
+    // Text-only: offsets across image pads are not meaningful, so vision
+    // requests go without hints (plain `cont` reuse still applies).
+    if (frames.empty())
+        spec.snaps = compute_snap_cuts(messages, opts, rr.text, spec.ids.size());
     apply_sampling(body, &spec);
 
     const std::string id = make_id("resp_");

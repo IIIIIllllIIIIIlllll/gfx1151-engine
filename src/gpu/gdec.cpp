@@ -93,6 +93,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -133,6 +134,7 @@
 #include "parts/30_host_util.inc"
 #include "parts/31_vision.inc"
 #include "parts/40_model.inc"
+#include "parts/49_rckpt.inc"
 #include "parts/50_serve.inc"
 #include "parts/51_host_cfg.inc"
 #include "parts/52_main.inc"

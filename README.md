@@ -16,7 +16,8 @@
 - **独立 8-bit MTP 草稿权重** sidecar,接受率高于内置 4-bit 草稿头。
 - **视觉**:支持图像输入(OpenAI `image_url`),KV 复用跨轮生效。
 - **OpenAI 兼容 API**:流式、工具调用、`/v1/chat/completions`。
-- **256K 上下文**,KV 快照跨重启恢复。
+- **256K 上下文**,两级 prompt 缓存:消息边界的内存检查点(编辑重发秒回)
+  + KV 快照跨重启恢复。
 - **模型转换工具**:HF safetensors → `.hgn`,量化无需校准数据,
   可分发给自己的微调模型使用(见 CONVERT.md)。
 

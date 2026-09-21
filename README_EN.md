@@ -24,7 +24,9 @@ a machine with 122 GiB of RAM can serve a 256K context.
   across turns.
 - **OpenAI-compatible API**: streaming, tool calling,
   `/v1/chat/completions`.
-- **256K context**, with KV snapshots recovered across restarts.
+- **256K context**, with two-tier prompt caching: in-RAM checkpoints at
+  message boundaries (edit-and-resend replies instantly) plus KV snapshots
+  recovered across restarts.
 - **Model conversion tool**: HF safetensors → `.hgn`; quantization needs no
   calibration data, and can be distributed for your own fine-tuned models
   (see CONVERT_EN.md).

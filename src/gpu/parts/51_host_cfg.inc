@@ -24,11 +24,20 @@ static bool wr(int fd, const void* data, size_t n) {
   return true;
 }
 
-// D2H into staging, then append to fd.
+// D2H into staging, then append to fd. Phase timings accumulate for the
+// slow-save diagnostic in kvsnap::save (cold-start page-in can stall writes).
+static double g_t_d2h = 0, g_t_wr = 0;
 static bool d2h_wr(int fd, const void* dptr, void* staging, size_t n) {
+  auto a = std::chrono::steady_clock::now();
   if (hipMemcpy(staging, dptr, n, hipMemcpyDeviceToHost) != hipSuccess)
     return false;
-  return wr(fd, staging, n);
+  auto b = std::chrono::steady_clock::now();
+  const bool ok = wr(fd, staging, n);
+  g_t_d2h += std::chrono::duration<double>(b - a).count();
+  g_t_wr += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - b)
+                .count();
+  return ok;
 }
 
 static bool h2d_rd(const void* src, void* dptr, size_t n) {
@@ -97,7 +106,17 @@ static void save(GpuModel& m, const std::vector<int>& toks, const Cfg& cfg) {
                ik_b = (size_t)nqsa * ik_blocks(ntok) * 128 * 4,
                kvl_b = (size_t)ntok * 512 * kvb;
   size_t stage_b = std::max({s_b, ik_b, kvl_b});
-  void* st = malloc(stage_b);
+  // Persistent staging: a fresh 100+MB malloc per save is mmap/munmap churn,
+  // and the first-touch page faults can stall for seconds (observed up to
+  // 148s D2H) when the system is under memory pressure. Grow-only, so the
+  // steady state faults nothing.
+  static void* st = nullptr;
+  static size_t st_b = 0;
+  if (st_b < stage_b) {
+    free(st);
+    st = malloc(stage_b);
+    st_b = st ? stage_b : 0;
+  }
   if (!st) return;
   // one blob file per device state region; any short write aborts the save
   auto blob = [&](const char* fn, const void* dptr, size_t n) {
@@ -108,6 +127,8 @@ static void save(GpuModel& m, const std::vector<int>& toks, const Cfg& cfg) {
     return ok;
   };
   bool ok = true;
+  g_t_d2h = g_t_wr = 0;
+  const auto sv0 = std::chrono::steady_clock::now();
   {  // meta
     std::ofstream f(tmp + "/meta");
     f << (m.mrope_active_ ? "KVS2 " : "KVS1 ") << ntok << " " << nqsa << " "
@@ -145,7 +166,6 @@ static void save(GpuModel& m, const std::vector<int>& toks, const Cfg& cfg) {
     fs::rename(tmp, dst, ec);  // atomic publish
     ok = !ec;
   }
-  free(st);
   if (!ok) {
     fs::remove_all(tmp, ec);
     fprintf(stderr, "kvsnap: save of %d tokens failed (non-fatal)\n", ntok);
@@ -154,6 +174,13 @@ static void save(GpuModel& m, const std::vector<int>& toks, const Cfg& cfg) {
   Sizes mine{ntok, nqsa, ngdn, m.maxctx, kvb, m.index_blocks, 0};
   fprintf(stderr, "kvsnap: saved %d tokens (%.1f MB) -> %s\n", ntok,
           state_bytes(mine) / 1048576.0, name);
+  const double sv = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - sv0)
+                        .count();
+  if (sv > 1.0)
+    fprintf(stderr,
+            "%s kvsnap: slow save %.1fs (d2h %.1fs, write %.1fs, other %.1fs)\n",
+            log_ts(), sv, g_t_d2h, g_t_wr, sv - g_t_d2h - g_t_wr);
   // LRU eviction over the cap: oldest directory mtime first, never the one
   // just written. Sizes derive from each snapshot's meta (no du(1) needed).
   struct Ent {
@@ -374,7 +401,10 @@ struct GenReq {
   bool logprobs = false;
   // SNAP / SNAP2: frontend-hinted prefix lengths worth an SSD snapshot (the
   // next turn repeats them verbatim; see serve_api.py render_prompt).
+  // SNAPS: same idea as a counted list (semantic message boundaries); the
+  // engine keeps cheap RAM checkpoints (rckpt) at these cuts.
   size_t snap = 0, snap2 = 0;
+  std::vector<size_t> snaps;
   // MROPE <k> <t> <h> <w> ...: per-image grid triples, expanded in-engine
   // (stage 1: fresh prefill + serial decode only; cont/spec are rejected).
   std::vector<std::array<int, 3>> mrope_grids;
@@ -635,6 +665,14 @@ static GenReq parse_gen(std::istringstream& ss) {
       long long v;
       if (!(ss >> v) || v < 0) { g.reject = true; return g; }
       (tok == "SNAP" ? g.snap : g.snap2) = (size_t)v;
+    } else if (tok == "SNAPS") {
+      long long n;
+      if (!(ss >> n) || n < 0 || n > 64) { g.reject = true; return g; }
+      for (long long i = 0; i < n; i++) {
+        long long v;
+        if (!(ss >> v) || v < 0) { g.reject = true; return g; }
+        g.snaps.push_back((size_t)v);
+      }
     } else if (isdigit(tok[0]) || tok[0] == '-') {
       int v = atoi(tok.c_str());
       if (v < 0 || v > 4) g.reject = true;
@@ -844,6 +882,29 @@ static int run(GpuModel& m, int port) {
           cont = false;
           n_cached = 0;
         }
+        if (!cont && rckpt::enabled()) {
+          // RAM checkpoint tier (llama.cpp-style PARTIAL_ONLY): only GDN
+          // state is stored; validity requires the checkpoint tokens to be a
+          // prefix of the live token stream (m.chist), which guarantees the
+          // QSA KV/indexer prefix is still intact. MTP KV for the restored
+          // prefix is NOT guaranteed -> disable speculation for this turn.
+          const bool is_mrope = !g.mrope_grids.empty();
+          const uint64_t req_ih = is_mrope ? fnv1a_patches(vpatches) : 0;
+          auto r0 = std::chrono::steady_clock::now();
+          int ci = rckpt::match(g.ids, m.chist, is_mrope,
+                                is_mrope ? &g.mrope_grids : nullptr, req_ih);
+          if (ci >= 0 && rckpt::restore(m, ci, &hist)) {
+            mcp = hist.size();
+            cont = true;
+            n_cached = (int)mcp;
+            mtp_live = false;
+            double rs = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - r0)
+                            .count();
+            fprintf(stderr, "%s rckpt: restored %zu tokens in %.2fs\n",
+                    log_ts(), mcp, rs);
+          }
+        }
         if (!cont && !kvs.dir.empty()) {
           size_t sn = 0;
           // M-RoPE requests: placeholder ids are pixel-agnostic, so a
@@ -962,17 +1023,25 @@ static int run(GpuModel& m, int port) {
               m.mtp_ingest_b(m.d_R, bt, 1, (int)mcp - 1);
             }
           }
-          // Frontend-hinted snapshot points (SNAP/SNAP2) that fall inside the
-          // uncached range: pause the prefill there, snapshot, resume. The
-          // next turn re-renders history as TEXT whose ids match the prompt
-          // only up to these boundaries (the assistant opener and generated
-          // text retokenize differently), so they are the cuts that hit.
+          // Frontend-hinted snapshot points (SNAPS/SNAP/SNAP2) that fall
+          // inside the uncached range: pause the prefill there, checkpoint,
+          // resume. The next turn re-renders history as TEXT whose ids match
+          // the prompt only up to these boundaries (the assistant opener and
+          // generated text retokenize differently), so they are the cuts
+          // that hit. Checkpoints go to the RAM tier (rckpt): the SSD tier
+          // only takes the prompt-end and request-end states to bound disk
+          // churn.
           std::vector<size_t> cuts;
-          if (!kvs.dir.empty())  // M-RoPE states snapshot fine (KVS2 meta)
+          if (!kvs.dir.empty() || rckpt::enabled()) {
+            for (size_t c : g.snaps)
+              if (c > mcp && c < g.ids.size() && c >= kvs.min_tokens)
+                cuts.push_back(c);
             for (size_t c : {g.snap2, g.snap})
               if (c > mcp && c < g.ids.size() && c >= kvs.min_tokens)
                 cuts.push_back(c);
+          }
           std::sort(cuts.begin(), cuts.end());
+          cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
           if (!cont) hist.clear();
           size_t done_upto = cont ? mcp : 0;
           // Arm the 1s prefill progress reporter for the prompt ingest only
@@ -990,7 +1059,7 @@ static int run(GpuModel& m, int port) {
             std::vector<int> seg(g.ids.begin() + done_upto, g.ids.begin() + c);
             cur = m.prefill_batch(seg, (int)done_upto);
             hist.assign(g.ids.begin(), g.ids.begin() + c);
-            kvsnap::save(m, hist, kvs);
+            rckpt::save(m, hist);
             done_upto = c;
           }
           std::vector<int> seg(g.ids.begin() + done_upto, g.ids.end());
@@ -1027,6 +1096,7 @@ static int run(GpuModel& m, int port) {
         // ids can never restore this state.
         if (!kvs.dir.empty() && hist.size() >= kvs.min_tokens)
           kvsnap::save(m, hist, kvs);
+        rckpt::save(m, hist);  // prompt-end RAM checkpoint (cheap, deduped)
         auto d0 = std::chrono::steady_clock::now();
         int ngen = 0;
         bool cancel = false, dead = false;
