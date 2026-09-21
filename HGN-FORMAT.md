@@ -50,7 +50,11 @@
 一次完整部署由若干独立 `.hgn` 文件组成,引擎按需叠加加载:
 
 - `<name>.hgn` — 主权重(48 层主干 + q4cp 精度的 MTP 兜底草稿头)
-- `<name>.overlay.hgn` — 覆盖层(可选;q8g64 等更高精度的替换张量)
+- `<name>.overlay.hgn` — 覆盖层(可选;q8g64 等更高精度的替换张量,
+  逐名覆盖主权重)。`tools/flashnext2hgn.py` 默认生成:723 个稠密线性
+  层(不含 embed_tokens / MoE 专家 / mtp.*),其中 12 个全注意力层
+  o_proj 为 q8g64,其余为 scale 经 MSE 优化的 q4cp;`--overlay-speed`
+  另生成全 q4cp 的 `<name>.overlay-speed.hgn`
 - `<name>-mtp.hgn` — 独立 8-bit MTP 草稿权重 sidecar(可选;作为引擎
   第二个位置参数传入,替代内置 4-bit 草稿头,接受率更高)
 - `<name>-vision.hgn` — 视觉塔(可选;`--vision-tower` 加载)

@@ -46,7 +46,7 @@
 A full deployment consists of several independent `.hgn` files, which the engine stacks and loads as needed:
 
 - `<name>.hgn` — main weights (48-layer backbone + an MTP fallback draft head in q4cp precision)
-- `<name>.overlay.hgn` — overlay (optional; replacement tensors in higher precision such as q8g64)
+- `<name>.overlay.hgn` — overlay (optional; replacement tensors in higher precision such as q8g64, overriding the main weights by name). `tools/flashnext2hgn.py` emits it by default: the 723 dense linear layers (excluding embed_tokens / MoE experts / mtp.*), with the 12 full-attention o_proj in q8g64 and the rest in q4cp with MSE-optimized scales; `--overlay-speed` additionally writes an all-q4cp `<name>.overlay-speed.hgn`
 - `<name>-mtp.hgn` — standalone 8-bit MTP draft weights sidecar (optional; passed as the engine's second positional argument, replacing the built-in 4-bit draft head for a higher acceptance rate)
 - `<name>-vision.hgn` — vision tower (optional; loaded with `--vision-tower`)
 
