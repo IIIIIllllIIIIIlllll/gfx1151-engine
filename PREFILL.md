@@ -194,6 +194,9 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
 | `GDEC_MROPE_DUMP=<file>` | dump RoPE 表（调试用，会同步流） |
 | `GDEC_PREFILL_TAIL_SLACK=<n>` | 尾包合并上限（默认 Linux 1024 / Windows 0；0 禁用） |
 | `GDEC_GR_SCAT4=1` | GR scatter+norm 单 block/token 实验（实测 -0.8%，勿开） |
+| `GDEC_GDN_PIPE=1` | GDN intra/strip 双流窗口流水实验（实测 -1%，勿开） |
+| `GDEC_GDN_PIPE2=1` | GDN intra fp16 驻留+WMMA+64-chunk 循环（kernel 2.81×，8K +1.7%；被 FUSED 取代） |
+| `GDEC_GDN_FUSED=1` | GDN intra+strip 融合持久化 kernel（start.sh 已开：kernel 3.34×，8K +5.7%、32K +4.4%，ids 0 分歧） |
 
 ## 10. PP 优化切入点（2026-09-20 实测刷新）
 
@@ -240,8 +243,28 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
    剩余空间：store 侧 bank 冲突已消除（(b,b+RPW/2) 行配对映射，
    SQC_LDS_BANK_CONFLICT 39.8M→0/dispatch，driver 24/24）但**零收益**——
    LDS 管 ~700 相位/K-step 远低于 wmma ~1664 clk，冲突被 compute 完全
-   掩盖；真正瓶颈是 staging 延迟 + barrier 串行（barrier 批处理需三缓冲
-   LDS，当前 62.5KB 放不下）、N=2560 形状 persistent+K 拆分。
+   掩盖。三缓冲/预取加深 2026-09-21 实测否决（tools/wmma_gemm_proto.cu
+   d9p2/t0/t1/t2，证据与 MEASURED VERDICT 注释留在 proto）：KST 32→16
+   结构成本 -34%（barrier 频率翻倍）；预取加深本身 +8% 有效，但每组
+   预取寄存器都把 256-VGPR 封顶的 d9 推过悬崖进 scratch（d9p2 spill
+   160B -32%、t2 三缓冲 spill 320B 仅 5-7 TF）。真正瓶颈是**每步
+   barrier + LDS store→load 可见性往返的固定开销**，且 gfx1151 无
+   global→LDS async copy——load 必经寄存器，没有免费的预取深度可买。
+   再往前只能动 acc/tile 结构（更小 warp tile 换寄存器余量，未试）；
+   N=2560 形状 persistent+K 拆分（未试）。
+   **窄形状扩展（2026-09-21，Phase 3g 续）**：rocprofv3 + `GDEC_GEMM_DBG`
+   全量形状打点（gdec.cpp:9988 的 P≤8 限制已去掉）发现 63 TF（26%）
+   dense GEMM 走 Lt 且有效仅 ~17 TFLOPS。kernel `num_n` 改 ceil(N/BP)
+   支持 N 尾包（硬要求放宽为仅 K%32==0，旧形状零影响），分流新增
+   d9/gm2 三形状：(10240,320) 1.73×、(512,2560) 1.85-2.0×、(2560,640)
+   1.24×；留 Lt 两形状带数据：(320,10240) 0.94×（BP 三头堵：N 尾
+   62.5% 利用 / X 重读 1.7GB / BP=320 被 LDS 73KB+寄存器双杀）、
+   (640,2560) 1.08×（Lt 自身已 32.6）。driver 54/54；ids ndiff=1 仅
+   固有噪声位 8048。**重大 harness 修正：`GDEC_GEMM_WMMA` 此前从未
+   出现在 ppbench run.sh——914→1043/1177 的全部基线实际是全 Lt，
+   start.sh 生产一直有**。flag 开 vs 关：8K 1083/1043（+3.8%）、
+   32K **1243/1177（+5.5%）**，gemm_host 32K 1112→535ms。run.sh 已
+   补 GDEC_GEMM_WMMA=1 + GDEC_GDN_FUSED=1 对齐生产。
 2. ~~**MoE WMMA 化**~~（2026-09-21 已实测否决）：两条主攻路线均失败，数据与
    分析在 ~/ppbench/moe_wmma_notes.md：
    - **融合 dequant+WMMA expert GEMM 原型**（tools/moe_wmma_proto.cu，up GEMM，
@@ -273,11 +296,75 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
    ws 越界写（gdec.cpp:8207-8210 改为按 `gdn_window_chunks` 分配）。修复
    后 window=8 与默认逐 token bit-exact（8055 token 0 分歧）。但 A/B 实测
    window=2/8 均比默认 4 慢 ~1.5%（32K：w4 1080 vs w2/w8 各 ~1064），
-   **默认 4 确认为最优，勿再调**。窗口间流水化（intra(i+1) 与 strip(i)
-   双流重叠）经分析不值得做：intra（192 block×1024 thr）与 strip
-   （192×256）各自已饱和 40 CU（容量 ~81920 线程），重叠只能藏 launch
-   气泡，且有 LT_OVL 负收益的前车之鉴。
-4. ~~**小 chunk 尾包固定开销**~~（2026-09-21 已完成，Phase 3h）：尾
+   **默认 4 确认为最优，勿再调**。窗口间流水化也已实现并实测否决
+   （`GDEC_GDN_PIPE=1`，intra 留 g_str、strip 走 NonBlocking 侧流、ws
+   双槽奇偶轮换 + 事件链，调度对数值中性——ids 分歧与 base-vs-base
+   噪声地板同位置同量级）：8K -0.9%、32K -1.1%、pipe+win8 -1.5%。
+   负收益根因与 LT_OVL 同物理：intra 已填满 40 CU，strip 并发只是争用
+   CU 拉长 intra，另有 ~256 事件/层与 ws 双槽 30MB 逼近 32MB MALL 的
+   驻留损失。**此 GPU 没有空闲执行资源可供重叠**——三条双流实验
+   （LT_OVL、GR_SCAT4、GDN_PIPE）全部同向否决。
+4. ~~**GDN fp16 WMMA 化**~~（2026-09-21 已实测否决，第 1 步终止未集成）：
+   对 k_gdn_intra 做相位剖析 + 墙钟消融（tools/gdn_wmma_proto.cu，逐字复刻
+   全相位、grid 128×48、NT=1024、63.2KB LDS，fp32 版 20.2ms/iter 与生产
+   ~20ms/层精确吻合）。四变体中位墙钟：fp32 完整 20.2ms / fp16 WMMA
+   （相位 1/3/4 矩阵化）21.4ms（**1.06× 变慢**）/ 挖掉全部矩阵计算 19.9ms
+   ——**矩阵数学只占墙钟 ~2%，WMMA 加速的对象不存在**。真正瓶颈：63KB
+   LDS → 1 block/WGP，~30 个 barrier 把 ~12 轮 staging 全局加载串成延迟
+   链，等效带宽仅 ~55GB/s（DRAM 地板 ~3.7ms/层 vs 当前 20ms/层）。参考
+   引擎的 fp16 WMMA（k_dnc_scan3x）有效的前提是它的 kernel 不是延迟绑。
+   附带发现：GDEC_PHASE_PROF 的 clock64 相位计数有正毛刺（相位和 >
+   TOTAL），只有墙钟可信。**staging 重构已完成**（2026-09-21，
+   tools/gdn_pipe_proto.cu）：胜者是 fp16 驻留 + WMMA + 每块 64-chunk
+   循环的 E 变体 @ ncpb=64——21.94→7.82ms/iter（**kernel 级 2.81×**，
+   107 GB/s；收益来源是块间去同步而非块内预取，纯寄存器预取变体实测
+   无收益）。已集成为 `k_gdn_intra_p2`（gdec.cpp ~5915-6230，ut5 solve
+   逐字保留、ws 布局不变），env `GDEC_GDN_PIPE2` 门控默认关。ids 对拍
+   过噪声地板（8054 token 仅 3 分歧 @8047/8050/8052，与基线自身
+   run-to-run 噪声同签名——近 tie logit 被原子加翻转）。端到端 8K
+   +1.7%、32K 持平：window=4 下 64-chunk 循环展不开，窗口开大则
+   intra↔strip 的 ws 交接冲出 L2/MALL（w64=252MB）吃掉收益。**维持
+   opt-in 不转正**（收益小且非 bit-exact，待融合 kernel 形态明朗）。
+5. ~~**strip fp16 ws 降字节**~~（2026-09-21 已实测否决，proto 未集成）：
+   tools/gdn_strip_proto.cu 四变体：fp16 ws（字节 -23%）最优 V4（uint4
+   16B 读）仅 -8~10% 墙钟且等效带宽反降至 84-88 GB/s——strip 在
+   103 GB/s 处不是 DRAM 字节绑，瓶颈是串行 chunk 扫描延迟链（3
+   barrier/chunk，nullc 骨架 7.9ms vs 地板 4.94）+ ~2.9ms 计算 +
+   4 strip × j 全维收缩的 L2 结构性冗余（raw ~3.1GB/iter）。降冗余
+   几何路线同死：4→2 strip（SW=64）慢 53%（LDS 48KB→1 block/WGP、
+   寄存器爆），4 strip 已最优。e2e 折算仅 ~0.5%，不抵复杂度。
+   **融合路线随后完成**——见下条。
+5b. **GDN intra+strip 融合持久化 kernel**（2026-09-21 已完成并转正，
+   Phase 3c）：`k_gdn_fused`（gdec.cpp:6434，block-per-head 48 blocks、
+   1024 线程、一次 launch 全 P，env `GDEC_GDN_FUSED`，start.sh 已开，
+   与 PIPE2 互斥 fused 优先）。ws 全程不落 DRAM，S 驻留寄存器 WMMA
+   C-fragment（每 warp 2 个 16×16 fp32，fp16 转置副本经 LDS 复用），
+   三个标量 S 收缩（k·S/q·S/S3，rocprofv3 定位占 80% 时间、VALU 发射
+   率仅 19%）全部 WMMA 化；LDS 57,344B、192 VGPR 无 spill。迭代路径
+   v1 spill 0.32× → v2 消 spill → v3 部分 WMMA → v4 全 WMMA：
+   proto 30.3→**9.1ms/层（3.34×，P=8192 达地板 86%）**，P=32832 同
+   3.31×。数值 fro-rel 0.040%（S 0.047%），ids 对拍 8054 token **0
+   分歧**；端到端 8K 971→**1026.7（+5.7%）**、32K 1111→**1160.3
+   （+4.4%）**，默认路径回归在漂移带内。fused 时 d_gdn_split_ws 分配
+   已跳过（gdec.cpp:7079/:9061 `!gdn_fused`，8K 省 505 MiB、32K 省
+   2.02 GiB，ids 双路径 0 分歧验证）。波次形态后续（2026-09-21）：
+   实测占用单位为 **20 WGP**（非 40 CU，VGPR 192×1024 恰好占满
+   196,608/WGP → 1 块/WGP），真实形态 48 块/20 槽 = 3 波（20+20+8）；
+   劈块回收全部纸面否决——dc-split 后全关联的 attn/solve（P0 大半
+   +P1+P2+P4 = 1.78ms ≈ 单块 59%）必须重复，96 块=5 波 12.0ms
+   （0.76×）、56/64 块 1.04-1.07×，越劈越亏；3-head/块共享 k·kᵀ
+   ~1.17× 但 S×3=48 寄存器必 spill。位级一致微优化 fused2（P0
+   float4 staging + P4 并入 P3a 复用 q A-frag + S3 双缓冲）已集成进
+   k_gdn_fused 本体（2026-09-21，无新 env，ids token 0 分歧；8K
+   1038.9→**1043.4**、32K ~**1177.6**）；P2 向量化/S3 大 staging/P1
+   窗口预取/P0 warp 分工/q 双读均被数据否决。最后的结构性形态
+   chunk 对半流水（k_fused3：96 块、后半块先 intra 存 ws 再 spin 等
+   前半块的 S）proto 实测否决：spin 本身 ~0.02ms 免费，但 ws DRAM
+   往返+重 stage 使后半块 +28%，9.211ms vs fused2 8.633（**0.941×
+   倒退**）→ **GDN 维度关闭**（已否决形态全清单见
+   ~/ppbench/BASELINE.md "Phase 3d 续"）。
+   proto：tools/gdn_fused_proto.cu。
+6. ~~**小 chunk 尾包固定开销**~~（2026-09-21 已完成，Phase 3h）：尾
    包并入前一个 chunk——`GDEC_PREFILL_TAIL_SLACK`（默认 Linux 1024 /
    Windows 0，0 禁用），workspace 改按 `maxbatch_cap = maxbatch+slack`
    分配（gdec.cpp:8063-8064、8170；mtp 三缓冲同步放大；arena 估算镜像）。
@@ -285,14 +372,14 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
    32876 token 仅生成末段 1 个分歧（chunk 边界改变累加顺序，同
    WMMA GEMM 容差级）。收益按 prompt 长度出现在刚超 chunk 边界的
    情形；短尾越小相对收益越大。
-5. ~~**GR 去重读**~~（2026-09-21 已实测否决）：`k_gr_scatter_norm_b_hc_bf16_f4`
+7. ~~**GR 去重读**~~（2026-09-21 已实测否决）：`k_gr_scatter_norm_b_hc_bf16_f4`
    （单 block/token，y 进 LDS 只读一遍，串行 4 branch，env `GDEC_GR_SCAT4`
    保留默认关）实测 8K **-0.8%**——原 4 block 并发时 y 的重复读本就命中
    L2，DRAM 节省是纸面的，而 block 数 4P→P 还损失了并行度。Rhat 链
    （scatter 写 → mix gemm 读 → combine 读 → 下层 inject gemm 读）无法
    去重：combine 依赖两个 gemm 的输出，跨 gemm 融合是大改且收益上限
    ~0.1s/8K。GR 维度关闭。
-6. **PLE gather 与 GPU 计算的更深重叠**：ple_host 冷态 410-870ms 可见，
+8. **PLE gather 与 GPU 计算的更深重叠**：ple_host 冷态 410-870ms 可见，
    热态已被重叠掩盖；低优先级。
 
 ## 附：本文档的未复核项

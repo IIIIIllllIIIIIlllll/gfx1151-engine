@@ -147,31 +147,39 @@ __global__ void __launch_bounds__(NT)
     boff[j] = ((pl >> 3) * BREG + (pl & 7) * LSA) * 2;
   }
   // staging: bank-phase-paired row mapping. A warp stages RPW=32/(KST/8)
-  // rows x (KST/8) 16B units; a ds_store_b128 retires in 8-lane phases, and
-  // with the LSA=80B row stride any two CONSECUTIVE rows in a phase always
-  // collide on one 4-bank group (the second row's 4 blocks always include
-  // byte offset 128). Pairing rows (b, b+RPW/2) per phase instead makes each
-  // phase cover all 32 banks exactly once. Same warp-global address set, so
-  // global coalescing is unchanged; LDS layout and all load paths untouched.
+  // rows x (KST/8) 16B units; a ds_store_b128 retires in 8-lane phases and
+  // each phase must cover all 32 banks exactly once. Q8==4 (KST=32, 80B row
+  // stride): phase = 2 rows, pair (b, b+RPW/2). Q8==2 (KST=16, 48B stride):
+  // phase = 4 rows and the pair offset must step 16 bank-groups (r*12 mod 32
+  // has period 8), giving phase row sets {0,4,2,6} / {1,5,3,7}. Same
+  // warp-global address set, so global coalescing is unchanged; LDS layout
+  // and all load paths untouched.
   constexpr int Q8 = KST / 8;
   constexpr int RPW = 32 / Q8;
-  static_assert(RPW % 2 == 0 && KST % 8 == 0, "store mapping mismatch");
+  static_assert(Q8 == 2 || Q8 == 4, "store mapping supports KST 16/32");
+  auto stage_row = [&](int idx, int& q) {
+    q = idx % Q8;
+    const int b = (idx / Q8) % RPW;
+    const int g = (idx / (Q8 * RPW)) * RPW;
+    if (Q8 == 4) return g + (b & 1) * (RPW / 2) + (b / 2);
+    return g + (b & 8) + ((b >> 2) & 1) + (b & 1) * 4 + (b & 2);
+  };
   const uint16_t* ga[AN];
   const uint16_t* gb[BN];
   uint32_t saoff[AN], sboff[BN];
 #pragma unroll
   for (int j = 0; j < AN; ++j) {
+    int q;
     const int idx = tid + j * NT;
-    const int q = idx % Q8, b = (idx / Q8) % RPW;
-    const int row = (idx / (Q8 * RPW)) * RPW + (b & 1) * (RPW / 2) + (b / 2);
+    const int row = stage_row(idx, q);
     ga[j] = X + (size_t)(m0 + row) * K + q * 8;
     saoff[j] = (row * LSA + q * 8) * 2;
   }
 #pragma unroll
   for (int j = 0; j < BN; ++j) {
+    int q;
     const int idx = tid + j * NT;
-    const int q = idx % Q8, b = (idx / Q8) % RPW;
-    const int row = (idx / (Q8 * RPW)) * RPW + (b & 1) * (RPW / 2) + (b / 2);
+    const int row = stage_row(idx, q);
     gb[j] = W + (size_t)(n0 + row) * K + q * 8;
     sboff[j] = ((row >> 3) * BREG + (row & 7) * LSA + q * 8) * 2;
   }
@@ -236,6 +244,134 @@ __global__ void __launch_bounds__(NT)
 #endif
       lds_sync();
     }
+  }
+
+  const int rh = (lane >> 4) * 8, cl = lane & 15;
+#pragma unroll
+  for (int i = 0; i < WM; ++i)
+#pragma unroll
+    for (int j = 0; j < WP; ++j)
+#pragma unroll
+      for (int e = 0; e < 8; ++e)
+        Y[(size_t)(m0 + wm0 + i * 16 + rh + e) * N + n0 + wp0 + j * 16 + cl] =
+            acc[i][j][e];
+}
+
+// Triple-buffer variant: As/Bs x3, per-step barrier, register rotation.
+// Step ks: issue LOAD for kstep ks+2 into the free register set, COMPUTE
+// buf[ks%3] (stored at step ks-1), STORE buf[(ks+1)%3] from the register
+// set loaded at step ks-1 — stores never consume loads issued in the same
+// step (DRAM latency gets ~1.5-2 steps of cover) and the store target was
+// last read two steps ago. Rotating buffer indices are tracked as counters
+// (no per-step integer modulo).
+// MEASURED VERDICT (2026-09-21, 8 shapes vs d9 KST=32 PFD=1): DEAD ON
+// gfx1151. The second staging register set pushes the kernel to 256 VGPR +
+// 320B/lane scratch spill -> 5-7 TFLOPS; its 2-buffer sibling t1 (48B spill)
+// reaches ~27, and spill-free KST=16 t0 only ~25 — the KST=16 barrier-rate
+// doubling alone costs ~34% vs d9's ~38. Kept for documentation; do not
+// resurrect without a register budget plan.
+template <int BM, int BP, int MW, int PW, int WM, int WP, int KST, int NT>
+__global__ void __launch_bounds__(NT)
+    k_wmma_gemm3(const uint16_t* __restrict__ X, const uint16_t* __restrict__ W,
+                 float* __restrict__ Y, int P, int K, int N, int gm) {
+  constexpr int LSA = KST + 8;
+  constexpr int BREG = 8 * LSA + 8;
+  constexpr int NW = NT / 32;
+  constexpr int AN = BM * (KST / 8) / NT;
+  constexpr int BN = BP * (KST / 8) / NT;
+  static_assert(MW * PW == NW, "warp grid mismatch");
+  static_assert(BM == MW * WM * 16 && BP == PW * WP * 16, "tile mismatch");
+  static_assert(BM * (KST / 8) % NT == 0 && BP * (KST / 8) % NT == 0,
+                "staging mismatch");
+  __shared__ uint16_t As[3][BM * LSA];
+  __shared__ uint16_t Bs[3][(BP / 8) * BREG];
+
+  const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+  const int num_m = P / BM, num_n = N / BP;
+  const int bid = blockIdx.x;
+  const int per_group = gm * num_n;
+  const int gid = bid / per_group, rem = bid % per_group;
+  const int first_m = gid * gm;
+  const int gs = min(gm, num_m - first_m);
+  const int bm = first_m + rem % gs;
+  const int bn = rem / gs;
+  const int m0 = bm * BM, n0 = bn * BP;
+
+  const int wm0 = (w / PW) * (WM * 16);
+  const int wp0 = (w % PW) * (WP * 16);
+  const int base_ = lane >> 1;
+  const int qrowA = (lane & 1) ? ((lane & 16) ? base_ : ((base_ + 4) & 7))
+                               : ((lane & 16) ? 8 + ((base_ + 4) & 7) : base_);
+  const int ksteps = K / KST;
+
+  qw_floatx8 acc[WM][WP];
+#pragma unroll
+  for (int i = 0; i < WM; ++i)
+#pragma unroll
+    for (int j = 0; j < WP; ++j)
+#pragma unroll
+      for (int e = 0; e < 8; ++e) acc[i][j][e] = 0.f;
+
+  uint32_t aoff[WM], boff[WP];
+#pragma unroll
+  for (int i = 0; i < WM; ++i)
+    aoff[i] = ((wm0 + i * 16 + qrowA) * LSA) * 2;
+#pragma unroll
+  for (int j = 0; j < WP; ++j) {
+    const int pl = wp0 + j * 16 + (lane & 15);
+    boff[j] = ((pl >> 3) * BREG + (pl & 7) * LSA) * 2;
+  }
+  constexpr int Q8 = KST / 8;
+  constexpr int RPW = 32 / Q8;
+  static_assert(Q8 == 2 || Q8 == 4, "store mapping supports KST 16/32");
+  auto stage_row = [&](int idx, int& q) {
+    q = idx % Q8;
+    const int b = (idx / Q8) % RPW;
+    const int g = (idx / (Q8 * RPW)) * RPW;
+    if (Q8 == 4) return g + (b & 1) * (RPW / 2) + (b / 2);
+    return g + (b & 8) + ((b >> 2) & 1) + (b & 1) * 4 + (b & 2);
+  };
+  const uint16_t* ga[AN];
+  const uint16_t* gb[BN];
+  uint32_t saoff[AN], sboff[BN];
+#pragma unroll
+  for (int j = 0; j < AN; ++j) {
+    int q;
+    const int idx = tid + j * NT;
+    const int row = stage_row(idx, q);
+    ga[j] = X + (size_t)(m0 + row) * K + q * 8;
+    saoff[j] = (row * LSA + q * 8) * 2;
+  }
+#pragma unroll
+  for (int j = 0; j < BN; ++j) {
+    int q;
+    const int idx = tid + j * NT;
+    const int row = stage_row(idx, q);
+    gb[j] = W + (size_t)(n0 + row) * K + q * 8;
+    sboff[j] = ((row >> 3) * BREG + (row & 7) * LSA + q * 8) * 2;
+  }
+
+  uint4 ra0[AN], rb0[BN], ra1[AN], rb1[BN];
+  STAGE_LOAD_SET(ra0, rb0, 0);
+  STAGE_STORE_SET(0, ra0, rb0);
+  STAGE_LOAD_SET(ra1, rb1, min(1, ksteps - 1));
+  lds_sync();
+
+  int bc = 0, bn1 = 1;  // compute buffer, store buffer
+#pragma unroll 1
+  for (int ks = 0; ks < ksteps; ++ks) {
+    if (ks & 1) {
+      STAGE_LOAD_SET(ra1, rb1, min(ks + 2, ksteps - 1));
+      COMPUTE_STEP(bc);
+      STAGE_STORE_SET(bn1, ra0, rb0);
+    } else {
+      STAGE_LOAD_SET(ra0, rb0, min(ks + 2, ksteps - 1));
+      COMPUTE_STEP(bc);
+      STAGE_STORE_SET(bn1, ra1, rb1);
+    }
+    lds_sync();
+    bc = bc == 2 ? 0 : bc + 1;
+    bn1 = bn1 == 2 ? 0 : bn1 + 1;
   }
 
   const int rh = (lane >> 4) * 8, cl = lane & 15;
@@ -344,11 +480,29 @@ void launch_cfg(const uint16_t* W, const uint16_t* X, float* Y, int N, int K,
       <<<grid, NT, 0, st>>>(X, W, Y, P, K, N, gm);
 }
 
+template <int BM, int BP, int MW, int PW, int WM, int WP, int KST, int NT>
+void launch3(const uint16_t* W, const uint16_t* X, float* Y, int N, int K,
+             int P, int gm, hipStream_t st) {
+  const int grid = (P / BM) * (N / BP);
+  k_wmma_gemm3<BM, BP, MW, PW, WM, WP, KST, NT>
+      <<<grid, NT, 0, st>>>(X, W, Y, P, K, N, gm);
+}
+
 static const KCfg kCfgs[] = {
     {"d9 256t 128x256 w2x4 f4x4 k32", 128, 256,
      launch_cfg<128, 256, 2, 4, 4, 4, 32, 256, 1>},
+    {"d9p2 256t 128x256 k32 pfd2", 128, 256,
+     launch_cfg<128, 256, 2, 4, 4, 4, 32, 256, 2>},
+    {"t0 256t 128x256 k16 2buf", 128, 256,
+     launch_cfg<128, 256, 2, 4, 4, 4, 16, 256, 1>},
+    {"t1 256t 128x256 k16 2buf pfd2", 128, 256,
+     launch_cfg<128, 256, 2, 4, 4, 4, 16, 256, 2>},
+    {"t2 256t 128x256 k16 3buf", 128, 256,
+     launch3<128, 256, 2, 4, 4, 4, 16, 256>},
     {"d3 512t 128x256 w2x8 f4x2 k32", 128, 256,
      launch_cfg<128, 256, 2, 8, 4, 2, 32, 512, 1>},
+    {"d3p2 512t 128x256 k32 pfd2", 128, 256,
+     launch_cfg<128, 256, 2, 8, 4, 2, 32, 512, 2>},
     {"d0 256t 128x128 w4x2 f2x4 k32", 128, 128,
      launch_cfg<128, 128, 4, 2, 2, 4, 32, 256, 1>},
     {"e0 dir 128x128 w4x2 f2x4", 128, 128,

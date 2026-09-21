@@ -23,10 +23,12 @@
 //     only the lgkmcnt/vscnt drains are needed.
 //   - Grouped-M CTA swizzle (gm) for L2 reuse.
 // P tail: staging rows clamp to row P-1 (duplicate compute, discarded) and
-// the epilogue is predicated, so any P works. Hard requirements (host-
-// checked, like the MoE kernels below): N % BP == 0, K % KST == 0 — no
-// runtime guards in the unrolled loops (they defeat unrolling and spill the
-// accumulators to scratch).
+// the epilogue is predicated, so any P works. N tail: W staging rows clamp to
+// row N-1 the same way and the epilogue is already n < N predicated, so any N
+// works (the last BP tile just wastes some compute). Hard requirement (host-
+// checked, like the MoE kernels below): K % KST == 0 — no runtime guards in
+// the unrolled loops (they defeat unrolling and spill the accumulators to
+// scratch).
 // Measured on gfx1151 (proto, median of 20, vs hipBLASLt ~23-32 TFLOPS):
 // N=2560 K=6144 ~24.5 TFLOPS (d3 cfg 512t w2x8 f4x2, gm=16);
 // N=6144/10240/12288 K=2560 ~37.4-37.9 TFLOPS (d9 cfg 256t w2x4 f4x4, gm=4).
@@ -56,7 +58,7 @@ __global__ void __launch_bounds__(NT)
 
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
   // grouped swizzle for L2/MALL reuse (group along token blocks)
-  const int num_m = (P + BM - 1) / BM, num_n = N / BP;
+  const int num_m = (P + BM - 1) / BM, num_n = (N + BP - 1) / BP;
   const int bid = blockIdx.x;
   const int per_group = gm * num_n;
   const int gid = bid / per_group, rem = bid % per_group;

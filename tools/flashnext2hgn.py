@@ -7,21 +7,13 @@ Self-contained: stdlib + numpy only (no torch, no safetensors).
 Usage:
   flashnext2hgn.py MODEL_DIR --out OUTDIR [--name NAME]
                  [--skip-vision] [--skip-ple] [--skip-mtp-sidecar]
-                 [--skip-overlay] [--overlay-speed] [--only-overlay]
-                 [--jobs N]
   flashnext2hgn.py --quant-selftest
 
 Outputs (into OUTDIR):
-  <name>.hgn            base checkpoint (q4cp linears, bf16 norms, fp8 PLE table)
-  <name>.overlay.hgn    quality overlay: the 723 dense (non-expert, non-mtp,
-                        non-embedding) linears re-quantized — the 12 full-
-                        attention o_proj in q8g64, the rest q4cp with
-                        per-group MSE-optimized scales. Pass as positional
-                        arg after the base file (before the MTP sidecar).
-  <name>.overlay-speed.hgn  with --overlay-speed: same 723 tensors, all q4cp
-  <name>-mtp.hgn        MTP sidecar (q8g64 linears; optional at engine launch)
-  <name>-vision.hgn     vision tower (all bf16; optional --vision-tower arg)
-  tokenizer/            tokenizer files copied from MODEL_DIR
+  <name>.hgn          base checkpoint (q4cp linears, bf16 norms, fp8 PLE table)
+  <name>-mtp.hgn      MTP sidecar (q8g64 linears; optional at engine launch)
+  <name>-vision.hgn   vision tower (all bf16; optional --vision-tower arg)
+  tokenizer/          tokenizer files copied from MODEL_DIR
 
 Only this exact architecture shape is supported (the engine hardcodes it):
 48 layers (GDN + every-4th QSA), hidden 2560, 512 experts, 24 heads,
@@ -45,13 +37,11 @@ import argparse
 import json
 import math
 import mmap
-import multiprocessing as mp
 import os
 import shutil
 import struct
 import sys
 import time
-import zlib
 
 import numpy as np
 
@@ -87,9 +77,7 @@ class STFile:
         dt, shape, buf = self.raw(name)
         if dt == "BF16":
             u = np.frombuffer(buf, dtype=np.uint16)
-            a = u.astype(np.uint32)
-            a <<= 16  # in-place: halves the peak vs `(u.astype(u32) << 16)`
-            return a.view(np.float32).reshape(shape)
+            return (u.astype(np.uint32) << 16).view(np.float32).reshape(shape)
         if dt == "F16":
             return np.frombuffer(buf, dtype=np.float16).astype(np.float32).reshape(shape)
         if dt == "F32":
@@ -186,80 +174,6 @@ def quant_q4cp(w, rng):
     return blob
 
 
-# per-group scale search ratios for the overlay quantizer (includes 1.0)
-Q4CP_OPT_RATIOS = np.arange(0.75, 1.251, 0.025).astype(np.float32)
-
-
-def _q4cp_scale_search(g, cb, am):
-    """g: (n, 32) f32 groups; cb: (16,) codebook; am: (n,) group absmax
-    (zeros already replaced by 1). Returns per-group scale (n,) minimizing
-    weight-space MSE over Q4CP_OPT_RATIOS * am."""
-    best_mse = None
-    best_s = None
-    for r in Q4CP_OPT_RATIOS:
-        s = am * r
-        x = g / s[:, None]
-        j = np.searchsorted(cb, x)
-        j = np.clip(j, 1, 15)
-        nib = np.where(x - cb[j - 1] <= cb[j] - x, j - 1, j)
-        err = cb[nib] * s[:, None] - g
-        mse = (err * err).mean(axis=1)
-        if best_mse is None:
-            best_mse, best_s = mse, s
-        else:
-            m = mse < best_mse
-            best_mse = np.where(m, mse, best_mse)
-            best_s = np.where(m, s, best_s)
-    return best_s
-
-
-def quant_q4cp_opt(w, rng):
-    """Overlay variant of quant_q4cp: same blob layout and same absmax-fit
-    Lloyd codebook, but per-group scales come from an MSE grid search
-    (Q4CP_OPT_RATIOS x group absmax) instead of the raw absmax. Data-free;
-    never worse than absmax RTN in weight MSE — ratio 1.0 is in the grid
-    and the codebook is unchanged. (Refitting the codebook on rescaled
-    samples was tried and reverted: plain Lloyd minimizes x-space error,
-    ignoring the s^2 weighting of the weight-space objective, so the
-    alternation diverges.)"""
-    R, C = w.shape
-    assert C % 32 == 0
-    G = C // 32
-    blob_size, stride = q4cp_size(R, C)
-    n_rows = min(R, max(1, (1 << 21) // C))
-    ridx = rng.choice(R, size=n_rows, replace=False) if n_rows < R else np.arange(R)
-    sub = w[ridx].reshape(-1, 32)
-    am = np.abs(sub).max(axis=1, keepdims=True)
-    xn = (sub / np.where(am == 0, 1.0, am)).ravel()
-    cb = lloyd_codebook_normalized(xn[:: max(1, xn.size // (1 << 21))])
-    rows_chunk = max(1, (1 << 24) // C)  # ~64MB f32 per chunk
-    s_opt = np.empty((R, G), np.float32)
-    for r0 in range(0, R, rows_chunk):
-        r1 = min(R, r0 + rows_chunk)
-        g = w[r0:r1].reshape(-1, 32)
-        a = np.abs(g).max(axis=1)
-        a = np.where(a == 0, 1.0, a)
-        s_opt[r0:r1] = _q4cp_scale_search(g, cb, a).reshape(r1 - r0, G)
-    codes = np.empty((R, C // 2), np.uint8)
-    scales = np.zeros((R, stride), np.uint8)
-    for r0 in range(0, R, rows_chunk):
-        r1 = min(R, r0 + rows_chunk)
-        g = w[r0:r1].reshape(-1, 32)
-        s16 = s_opt[r0:r1].astype(np.float16)
-        sf = s16.astype(np.float32).reshape(-1)
-        sf = np.where(sf == 0, 1.0, sf)
-        x = g / sf[:, None]
-        j = np.searchsorted(cb, x)
-        j = np.clip(j, 1, 15)
-        nib = np.where(x - cb[j - 1] <= cb[j] - x, j - 1, j).astype(np.uint8)
-        nib = nib.reshape(r1 - r0, C)
-        codes[r0:r1] = nib[:, 0::2] | (nib[:, 1::2] << 4)
-        scales[r0:r1, : G * 2] = s16.view(np.uint8).reshape(r1 - r0, G * 2)
-    blob = cb.astype("<f4").tobytes() + codes.tobytes() + scales.tobytes()
-    assert len(blob) == blob_size
-    return blob
-
-
 def q8g64_size(rows, cols):
     return rows * (cols + cols // 64 * 4)
 
@@ -311,74 +225,6 @@ def fp8_encode(x, scale):
     j = np.clip(j, 1, len(E4M3_MAGS) - 1)
     code = np.where(mag - E4M3_MAGS[j - 1] <= E4M3_MAGS[j] - mag, j - 1, j)
     return (code | (q < 0).astype(np.uint8) << 7).astype(np.uint8)
-
-
-# ----------------------------------------------------------------------------
-# parallel quantization (per-tensor tasks; results are deterministic and
-# independent of the worker count because each tensor gets its own rng seed)
-# ----------------------------------------------------------------------------
-
-_WORKER_STS = {}
-
-
-def _tensor_seed(name):
-    return (0x5EED ^ zlib.crc32(name.encode())) & 0xFFFFFFFF
-
-
-def _quant_task(job):
-    """Runs in a pool worker. job = (st_path, src_name, shape, kind, name);
-    returns the quantized blob bytes."""
-    st_path, src, shape, kind, name = job
-    st = _WORKER_STS.get(st_path)
-    if st is None:
-        st = _WORKER_STS[st_path] = STFile(st_path)
-    w = st.f32(src).reshape(-1, shape[-1])
-    rng = np.random.default_rng(_tensor_seed(name))
-    if kind == "q4cp":
-        return quant_q4cp(w, rng)
-    if kind == "q4cp_opt":
-        return quant_q4cp_opt(w, rng)
-    if kind == "q8g64":
-        return quant_q8g64(w)
-    if kind == "q8+q4":
-        return quant_q8g64(w), quant_q4cp_opt(w, rng)
-    raise ValueError(kind)
-
-
-def _phys_mem_gb():
-    """Total physical RAM in GiB (0 if it cannot be determined)."""
-    try:
-        if os.name == "nt":
-            import ctypes
-
-            class MEMSTATUSEX(ctypes.Structure):
-                _fields_ = [("dwLength", ctypes.c_ulong),
-                            ("dwMemoryLoad", ctypes.c_ulong),
-                            ("ullTotalPhys", ctypes.c_ulonglong),
-                            ("ullAvailPhys", ctypes.c_ulonglong),
-                            ("ullTotalPageFile", ctypes.c_ulonglong),
-                            ("ullAvailPageFile", ctypes.c_ulonglong),
-                            ("ullTotalVirtual", ctypes.c_ulonglong),
-                            ("ullAvailVirtual", ctypes.c_ulonglong),
-                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-
-            m = MEMSTATUSEX()
-            m.dwLength = ctypes.sizeof(MEMSTATUSEX)
-            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
-            return m.ullTotalPhys / 2**30
-        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
-    except Exception:
-        return 0.0
-
-
-def parallel_quant(job_list, jobs):
-    """Yields blobs in job order. Serial when jobs <= 1."""
-    if jobs <= 1 or len(job_list) < 2:
-        for j in job_list:
-            yield _quant_task(j)
-        return
-    with mp.Pool(min(jobs, len(job_list))) as pool:
-        yield from pool.imap(_quant_task, job_list, chunksize=1)
 
 
 # ----------------------------------------------------------------------------
@@ -491,27 +337,6 @@ def base_dtype(mapped):
     return DT_Q4CP
 
 
-def is_qsa_o_proj(mapped):
-    return mapped.endswith("self_attn.o_proj.weight")
-
-
-def overlay_names(base_src):
-    """Dense q4cp linears that the overlay re-quantizes: every base q4cp
-    tensor except the token embedding, the fused MoE experts and mtp.*.
-    Matches the official overlay file set exactly (723 tensors)."""
-    names = sorted(m for m in base_src
-                   if base_dtype(m) == DT_Q4CP
-                   and m != "embed_tokens.weight"
-                   and not m.startswith("mtp.")
-                   and ".experts." not in m)
-    if len(names) != 723:
-        raise SystemExit(f"overlay tensor set: expected 723, got {len(names)}")
-    n_o = sum(is_qsa_o_proj(m) for m in names)
-    if n_o != 12:
-        raise SystemExit(f"overlay o_proj set: expected 12, got {n_o}")
-    return names
-
-
 # ----------------------------------------------------------------------------
 # hgn writer
 # ----------------------------------------------------------------------------
@@ -586,8 +411,7 @@ def human(n):
     return f"{n / 2**30:.2f} GiB"
 
 
-def write_start_script(outdir, name, has_mtp, has_vision, engine_dir,
-                       has_overlay=False):
+def write_start_script(outdir, name, has_mtp, has_vision, engine_dir):
     """Emit a self-contained start.sh next to the converted model."""
     def pick(*cands):
         for c in cands:
@@ -639,8 +463,6 @@ export GDEC_SPEC_GAMMA="$GAMMA"
 
 engine_cmd=("$ENGINE" "$HERE/{name}.hgn")
 """
-    if has_overlay:
-        script += f'engine_cmd+=("$HERE/{name}.overlay.hgn")\n'
     if has_mtp:
         script += f'engine_cmd+=("$HERE/{name}-mtp.hgn")\n'
     script += 'engine_cmd+=(--serve --port "$ENGINE_PORT" --maxctx "$MAXCTX")\n'
@@ -692,8 +514,7 @@ wait -n "$engine_pid" "$api_pid"
 
 
 def convert(model_dir, outdir, name, skip_vision, skip_ple, skip_mtp_sidecar,
-            skip_overlay=False, overlay_speed=False, only_overlay=False,
-            dry_run=False, engine_dir=None, jobs=1):
+            dry_run=False, engine_dir=None):
     t_start = time.time()
     cfg = json.load(open(os.path.join(model_dir, "config.json")))
     check_config(cfg)
@@ -728,26 +549,13 @@ def convert(model_dir, outdir, name, skip_vision, skip_ple, skip_mtp_sidecar,
         print("WARNING: no PLE ngram shards found; base will lack the PLE "
               "table (engine falls back to ple=off)")
 
-    ov_names = overlay_names(base_src)
+    rng = np.random.default_rng(0x5EED)
 
     # ---- base file ----
     base_path = os.path.join(outdir, f"{name}.hgn")
     w = HgnWriter(base_path, name)
     order = sorted(base_src.keys())  # stable; loader is order-independent
-    # Write/plan order: q4cp tensors whose f32 expansion is huge (fused
-    # experts, embeddings — several GiB each) first, quantized by a
-    # memory-bounded worker pool; then the small q4cp tensors on the full
-    # pool; then the bf16/i64 passthrough entries. The loader is
-    # order-independent, only plan/write consistency matters.
-    BIG_F32 = 1 << 30  # bytes of the float32 expansion
-    q4_all = [m for m in order if base_dtype(m) == DT_Q4CP]
-    q4_big = [m for m in q4_all
-              if int(np.prod(base_src[m][2])) * 4 >= BIG_F32]
-    q4_small = [m for m in q4_all
-                if int(np.prod(base_src[m][2])) * 4 < BIG_F32]
-    passthru = [m for m in order if base_dtype(m) != DT_Q4CP]
-    write_order = q4_big + q4_small + passthru
-    for m in write_order:
+    for m in order:
         _, _, shape, _ = base_src[m]
         dt = base_dtype(m)
         if dt == DT_Q4CP:
@@ -775,122 +583,36 @@ def convert(model_dir, outdir, name, skip_vision, skip_ple, skip_mtp_sidecar,
                   f"{dict(hist)}, bytes { {k: human(v) for k, v in sz.items()} }")
         n_q8 = sum(1 for m in MTP_Q8 if m in mtp_src)
         print(f"  mtp sidecar: {n_q8} q8g64 tensors planned")
-        n_o = sum(is_qsa_o_proj(m) for m in ov_names)
-        ov_q4 = sum(q4cp_size(int(np.prod(base_src[m][2])) // base_src[m][2][-1],
-                              base_src[m][2][-1])[0]
-                    for m in ov_names if not is_qsa_o_proj(m))
-        ov_q8 = sum(q8g64_size(int(np.prod(base_src[m][2])) // base_src[m][2][-1],
-                               base_src[m][2][-1])
-                    for m in ov_names if is_qsa_o_proj(m))
-        print(f"  overlay: {len(ov_names)} tensors "
-              f"({len(ov_names) - n_o} q4cp {human(ov_q4)} + "
-              f"{n_o} q8g64 o_proj {human(ov_q8)})")
         print(f"  vision: {len(vis_src)} tensors (bf16)")
         return
-    if not only_overlay:
-        w.begin()
-        total_bytes = sum(e[3] for e in w.entries)
-        done_bytes = 0
-        mem_gb = _phys_mem_gb()
-        # a big-tensor worker peaks at ~3.7 GiB (3.2 GiB f32 + quant
-        # temporaries); budget 6 GiB each to leave room for the parent
-        big_pool = (max(1, min(jobs, int(mem_gb // 6))) if mem_gb
-                    else max(1, jobs // 4))
-        t_q = time.time()
-        for tag, names, pj in (("base-big", q4_big, big_pool),
-                               ("base", q4_small, jobs)):
-            blobs = parallel_quant(
-                [(base_src[m][0].path, base_src[m][3], base_src[m][2],
-                  "q4cp", m) for m in names], pj)
-            for i, m in enumerate(names):
-                _, _, shape, _ = base_src[m]
-                blob = next(blobs)
-                w.write(blob)
-                done_bytes += len(blob)
-                print(f"  {tag} [{i + 1}/{len(names)}] {m} {shape} "
-                      f"{human(len(blob))} "
-                      f"({100 * done_bytes / total_bytes:.0f}%)", flush=True)
-                del blob
-        for i, m in enumerate(passthru):
-            st, sdt, shape, src = base_src[m]
-            dt = base_dtype(m)
+    w.begin()
+    total_bytes = sum(e[3] for e in w.entries)
+    done_bytes = 0
+    for i, m in enumerate(order):
+        st, sdt, shape, src = base_src[m]
+        dt = base_dtype(m)
+        t0 = time.time()
+        if dt == DT_BF16 or dt == DT_I64:
             want = "BF16" if dt == DT_BF16 else "I64"
             if sdt != want:
                 raise SystemExit(f"{m}: expected {want} source, got {sdt}")
             blob = bytes(st.raw(src)[2])
-            w.write(blob)
-            done_bytes += len(blob)
-            print(f"  base [{i + 1}/{len(passthru)}] {m} {shape} dt{dt} "
-                  f"{human(len(blob))} "
-                  f"({100 * done_bytes / total_bytes:.0f}%)", flush=True)
-            del blob
-        print(f"  base quantization took {time.time() - t_q:.0f}s "
-              f"(jobs={jobs}, big-pool={big_pool})", flush=True)
-        if ple_shards:
-            write_ple(w, ple_shards)
-        w.finish()
-        print(f"wrote {base_path} ({human(os.path.getsize(base_path))})",
-              flush=True)
-    else:
-        print("base file skipped (--only-overlay)")
-
-    # ---- overlay (quality, optional speed twin) ----
-    if not skip_overlay:
-        ov_path = os.path.join(outdir, f"{name}.overlay.hgn")
-        wo = HgnWriter(ov_path, name)
-        wos = None
-        if overlay_speed:
-            wos = HgnWriter(os.path.join(outdir, f"{name}.overlay-speed.hgn"),
-                            name)
-        for m in ov_names:
-            _, _, shape, _ = base_src[m]
-            cols = shape[-1]
-            rows = int(np.prod(shape)) // cols
-            if is_qsa_o_proj(m):
-                wo.plan(m, DT_Q8G64, shape, q8g64_size(rows, cols))
-            else:
-                wo.plan(m, DT_Q4CP, shape, q4cp_size(rows, cols)[0])
-            if wos:
-                wos.plan(m, DT_Q4CP, shape, q4cp_size(rows, cols)[0])
-        wo.begin()
-        if wos:
-            wos.begin()
-        ovl_jobs = []
-        for m in ov_names:
-            st, _, shape, src = base_src[m]
-            if is_qsa_o_proj(m):
-                kind = "q8+q4" if wos else "q8g64"
-            else:
-                kind = "q4cp_opt"
-            ovl_jobs.append((st.path, src, shape, kind, m))
-        t_q = time.time()
-        results = parallel_quant(ovl_jobs, jobs)
-        for i, (m, res) in enumerate(zip(ov_names, results)):
-            if is_qsa_o_proj(m):
-                if wos:
-                    b8, b4 = res
-                    wo.write(b8)
-                    wos.write(b4)
-                else:
-                    wo.write(res)
-            else:
-                wo.write(res)
-                if wos:
-                    wos.write(res)
-            if (i + 1) % 24 == 0 or i + 1 == len(ov_names):
-                print(f"  overlay [{i + 1}/{len(ov_names)}] "
-                      f"({time.time() - t_q:.0f}s)", flush=True)
-            del res
-        wo.finish()
-        print(f"wrote {ov_path} ({human(os.path.getsize(ov_path))})",
-              flush=True)
-        if wos:
-            wos.finish()
-            print(f"wrote {wos.path} ({human(os.path.getsize(wos.path))})",
-                  flush=True)
+        else:
+            blob = quant_q4cp(st.f32(src).reshape(-1, shape[-1]), rng)
+        w.write(blob)
+        done_bytes += len(blob)
+        el = time.time() - t0
+        print(f"  base [{i + 1}/{len(order)}] {m} {shape} dt{dt} "
+              f"{human(len(blob))} in {el:.1f}s "
+              f"({100 * done_bytes / total_bytes:.0f}%)", flush=True)
+        del blob
+    if ple_shards:
+        write_ple(w, ple_shards)
+    w.finish()
+    print(f"wrote {base_path} ({human(os.path.getsize(base_path))})", flush=True)
 
     # ---- MTP sidecar ----
-    if mtp_src and not skip_mtp_sidecar and not only_overlay:
+    if mtp_src and not skip_mtp_sidecar:
         side_path = os.path.join(outdir, f"{name}-mtp.hgn")
         ws = HgnWriter(side_path, name + "-mtp")
         for m in sorted(MTP_Q8):
@@ -917,7 +639,7 @@ def convert(model_dir, outdir, name, skip_vision, skip_ple, skip_mtp_sidecar,
               "q4cp mtp.* fallback")
 
     # ---- vision ----
-    if vis_src and not skip_vision and not only_overlay:
+    if vis_src and not skip_vision:
         vis_path = os.path.join(outdir, f"{name}-vision.hgn")
         wv = HgnWriter(vis_path, name + "-vision")
         for m in sorted(vis_src.keys()):
@@ -953,16 +675,9 @@ def convert(model_dir, outdir, name, skip_vision, skip_ple, skip_mtp_sidecar,
     if engine_dir is None:
         engine_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   os.pardir, "build")
-    if only_overlay:
-        # base/mtp/vision were not (re)written; detect what the outdir has
-        has_mtp = os.path.exists(os.path.join(outdir, f"{name}-mtp.hgn"))
-        has_vision = os.path.exists(os.path.join(outdir, f"{name}-vision.hgn"))
-    else:
-        has_mtp = bool(mtp_src) and not skip_mtp_sidecar
-        has_vision = bool(vis_src) and not skip_vision
-    sp = write_start_script(outdir, name, has_mtp, has_vision, engine_dir,
-                            has_overlay=(not skip_overlay) or os.path.exists(
-                                os.path.join(outdir, f"{name}.overlay.hgn")))
+    sp = write_start_script(outdir, name,
+                            bool(mtp_src) and not skip_mtp_sidecar,
+                            bool(vis_src) and not skip_vision, engine_dir)
     print(f"\ndone in {el / 60:.1f} min. Start the service with:")
     print(f"  bash {sp}")
 
@@ -1054,8 +769,6 @@ def quant_selftest():
                   f"mean={err.mean():.5f} (of absmax)")
 
         report("q4cp", dequant_q4cp(quant_q4cp(w, rng), 512, 2560))
-        report("q4cp_opt",
-               dequant_q4cp(quant_q4cp_opt(w, rng), 512, 2560))
         report("q8g64", dequant_q8g64(quant_q8g64(w), 512, 2560))
         scale = np.float32(amax / 448.0)
         c = fp8_encode(w, scale)
@@ -1073,15 +786,6 @@ def main():
     ap.add_argument("--skip-vision", action="store_true")
     ap.add_argument("--skip-ple", action="store_true")
     ap.add_argument("--skip-mtp-sidecar", action="store_true")
-    ap.add_argument("--skip-overlay", action="store_true",
-                    help="do not write <name>.overlay.hgn")
-    ap.add_argument("--overlay-speed", action="store_true",
-                    help="also write <name>.overlay-speed.hgn (all q4cp)")
-    ap.add_argument("--only-overlay", action="store_true",
-                    help="skip base/mtp/vision and only (re)build the overlay")
-    ap.add_argument("--jobs", type=int, default=os.cpu_count() or 1,
-                    help="quantization worker processes (default: all cores; "
-                         "results are identical for any jobs count)")
     ap.add_argument("--quant-selftest", action="store_true")
     ap.add_argument("--dry-run", action="store_true",
                     help="validate mapping and print the plan; write nothing")
@@ -1105,16 +809,13 @@ def main():
             a.out, name,
             os.path.exists(os.path.join(a.out, f"{name}-mtp.hgn")),
             os.path.exists(os.path.join(a.out, f"{name}-vision.hgn")),
-            engine_dir,
-            has_overlay=os.path.exists(
-                os.path.join(a.out, f"{name}.overlay.hgn")))
+            engine_dir)
         print(f"wrote {sp} — run: bash {sp}")
         return
     if not a.dry_run:
         os.makedirs(a.out, exist_ok=True)
     convert(a.model_dir, a.out, name, a.skip_vision, a.skip_ple,
-            a.skip_mtp_sidecar, a.skip_overlay, a.overlay_speed,
-            a.only_overlay, a.dry_run, a.engine_bin, a.jobs)
+            a.skip_mtp_sidecar, a.dry_run, a.engine_bin)
 
 
 if __name__ == "__main__":

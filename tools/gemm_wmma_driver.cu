@@ -58,7 +58,9 @@ static void fill_bf16(uint16_t* p, size_t n, uint32_t seed) {
 }
 
 int main() {
-  const int NK[4][2] = {{2560, 6144}, {6144, 2560}, {10240, 2560}, {12288, 2560}};
+  const int NK[9][2] = {{2560, 6144}, {6144, 2560}, {10240, 2560},
+                        {12288, 2560}, {10240, 320}, {512, 2560},
+                        {2560, 640}, {320, 10240}, {640, 2560}};
   const int Ps[] = {53, 100, 1024, 8192, 8199, 32768};
   rocblas_handle h;
   rocblas_create_handle(&h);
@@ -69,6 +71,10 @@ int main() {
   for (auto& nk : NK) {
     const int N = nk[0], K = nk[1];
     const bool d3 = (N == 2560 && K == 6144);
+    const bool narrow = (N == 10240 && K == 320) || (N == 512 && K == 2560) ||
+                        (N == 2560 && K == 640) || (N == 320 && K == 10240) ||
+                        (N == 640 && K == 2560);
+    const int gm = d3 ? 16 : (narrow ? 2 : 4);
     for (int P : Ps) {
       std::vector<uint16_t> hA((size_t)N * K), hB((size_t)P * K);
       fill_bf16(hA.data(), hA.size(), 0xA5A5u + N + P);
@@ -95,13 +101,13 @@ int main() {
       }
       CK(hipStreamSynchronize(st));
       {
-        const unsigned grid = (unsigned)(((P + 127) / 128) * (N / 256));
+        const unsigned grid = (unsigned)(((P + 127) / 128) * ((N + 255) / 256));
         if (d3)
           k_gemm_wmma<128, 256, 2, 8, 4, 2, 32, 512>
-              <<<grid, 512, 0, st>>>(B, A, C, P, K, N, 16);
+              <<<grid, 512, 0, st>>>(B, A, C, P, K, N, gm);
         else
           k_gemm_wmma<128, 256, 2, 4, 4, 4, 32, 256>
-              <<<grid, 256, 0, st>>>(B, A, C, P, K, N, 4);
+              <<<grid, 256, 0, st>>>(B, A, C, P, K, N, gm);
         if (hipStreamSynchronize(st) != hipSuccess) {
           printf("N=%d K=%d P=%d kernel LAUNCH/RUN FAIL\n", N, K, P);
           (void)hipGetLastError();
@@ -119,8 +125,8 @@ int main() {
           maxabs = std::max(maxabs, d);
           maxrel = std::max(maxrel, d / std::max(1.0, (double)fabs(vR[i])));
         }
-        printf("N=%-5d K=%-5d P=%-5d (%s) maxabs %.3e maxrel %.3e %s\n", N, K,
-               P, d3 ? "d3" : "d9", maxabs, maxrel,
+        printf("N=%-5d K=%-5d P=%-5d (%s gm%d) maxabs %.3e maxrel %.3e %s\n", N,
+               K, P, d3 ? "d3" : "d9", gm, maxabs, maxrel,
                maxrel < 1e-2 ? "OK" : "BAD");
         if (maxrel >= 1e-2) ++nbad;
       }
