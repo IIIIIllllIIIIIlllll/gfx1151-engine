@@ -1,8 +1,8 @@
 // Robustness driver for the k_gemm_wmma kernel integrated in gdec.cpp.
 // The kernel body is #included verbatim from a .inc sed-extracted from
-// src/gpu/gdec.cpp between the [gemm-wmma-begin/end] markers — same source,
-// not a copy. Regenerate after touching the kernel:
-//   sed -n '/\[gemm-wmma-begin\]/,/\[gemm-wmma-end\]/p' src/gpu/gdec.cpp > tools/gemm_wmma_kernel.inc
+// src/gpu/parts/22_kernels_prefill.inc between the [gemm-wmma-begin/end] markers
+// — same source, not a copy. Regenerate after touching the kernel:
+//   sed -n '/\[gemm-wmma-begin\]/,/\[gemm-wmma-end\]/p' src/gpu/parts/22_kernels_prefill.inc > tools/gemm_wmma_kernel.inc
 // The qw_* helpers below are the identical one-liners from gdec.cpp:3423-3432
 // (outside the markers).
 // Build: hipcc -O2 -o build/gemm_wmma_driver tools/gemm_wmma_driver.cu -lrocblas

@@ -228,6 +228,13 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
 
 ## 11. 后续优化空间（2026-09-21 刷新，按收益/可行性排序）
 
+> **2026-09-21 包含式拆分**：gdec.cpp 已拆为 `src/gpu/parts/*.inc`（15 个，
+> 主文件只留头注释 + includes + include 清单；单 TU/构建/预处理 token 流
+> 不变，交错 A/B 性能打平，ids token 全同）。本文及 tools/ 注释里的
+> gdec.cpp 行号自此漂移，**以符号名 + parts 文件名为准**（如 k_gdn_fused
+> 在 parts/25_kernels_gdn.inc，Model::gemm 在 parts/40_model.inc，
+> k_gemm_wmma 标记段在 parts/22_kernels_prefill.inc）。
+
 1. **自写 dense GEMM 超 Tensile（已完成，Phase 3g）**：库天花板 ~35 TFLOPS
    （tools/gemm_sol_scan.cu 实测），自写 WMMA kernel
    （`k_gemm_wmma`，gdec.cpp:3926-4104，gwmma_sync/双缓冲/免 bank 冲突布局，

@@ -332,6 +332,7 @@ int main(int argc, char** argv) {
     const int api_port = cfg_int("API_PORT", 8731, 1, 65535);
     const int max_context = cfg_int("MAX_CONTEXT", 262144, 1024, 1 << 20);
     const int mtp_gamma = cfg_int("MTP_GAMMA", 3, 1, 8);
+    const int kvsnap_max_gb = cfg_int("KVSNAP_MAX_GB", 20, 1, 1 << 16);
     const int start_timeout = env_int("START_TIMEOUT", 1800, 30, 86400);
 
     if (engine_port == api_port) fail("ENGINE_PORT 与 API_PORT 必须不同");
@@ -371,7 +372,8 @@ int main(int argc, char** argv) {
         "GDEC_KVSNAP",
     };
     for (const char* f : flags) SetEnvironmentVariableA(f, "1");
-    SetEnvironmentVariableA("GDEC_KVSNAP_MAX_GB", "20");
+    SetEnvironmentVariableA("GDEC_KVSNAP_MAX_GB",
+                            std::to_string(kvsnap_max_gb).c_str());
     SetEnvironmentVariableA("GDEC_SPEC_GAMMA", std::to_string(mtp_gamma).c_str());
 
     CreateDirectoryA("logs", nullptr);

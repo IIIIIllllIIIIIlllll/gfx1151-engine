@@ -70,7 +70,10 @@ bash build_win.sh launcher  # 免脚本启动器 start_win.exe
 机器即用,**无需安装 ROCm/TheRock**;仅需 AMD 显卡驱动,并在 BIOS 为 GPU
 划分足够显存(256K 上下文需 96 GiB)。差异:图片解码经 stb_image 支持
 PNG/JPEG(WebP 未接);prefill chunk 默认 8192;冷加载为整权重读盘
-(分钟级,进度见控制台/日志)。编译细节见 [BUILD.md](BUILD.md)。
+(分钟级,进度见控制台/日志);启动器未开 `GDEC_GEMM_WMMA` 与
+`GDEC_GDN_FUSED`(Linux start.sh 已转正的自写 WMMA GEMM 与 GDN 融合
+kernel,合计约 8-10% PP,TheRock 下未验证——故 Windows 端 prefill 走
+hipBLASLt + 旧 GDN 路径)。编译细节见 [BUILD.md](BUILD.md)。
 
 ## 文档
 

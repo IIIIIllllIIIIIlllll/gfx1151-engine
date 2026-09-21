@@ -11,7 +11,7 @@ case "${1:-}" in
   *) fail '用法：bash start.sh [--check]' ;;
 esac
 source "$ROOT/service.conf"
-for key in ENGINE_PORT API_PORT MAX_CONTEXT MTP_GAMMA MEMORY_CAP_GB MIN_AVAILABLE_GB START_TIMEOUT STALL_TIMEOUT; do
+for key in ENGINE_PORT API_PORT MAX_CONTEXT MTP_GAMMA MEMORY_CAP_GB MIN_AVAILABLE_GB START_TIMEOUT STALL_TIMEOUT KVSNAP_MAX_GB; do
   value="${!key}"
   [[ "$value" =~ ^[1-9][0-9]*$ && ${#value} -le 8 ]] || fail "$key 必须为正整数"
 done
@@ -93,7 +93,7 @@ export GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 GDEC_NOWARMUP=1
 export GDEC_PREFILL_CHUNK=32768
 export GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1
 export GDEC_KVSNAP=1
-export GDEC_KVSNAP_MAX_GB=20
+export GDEC_KVSNAP_MAX_GB="$KVSNAP_MAX_GB"
 # --serve reads GDEC_SPEC_GAMMA; --gamma is for offline --spec-gen.
 export GDEC_SPEC_GAMMA="$MTP_GAMMA"
 engine=("$ROOT/build/gdec" "$MODEL_FILE")

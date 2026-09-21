@@ -86,7 +86,11 @@ needed**; only the AMD GPU driver, plus enough VRAM carved out for the GPU
 in BIOS (a 256K context needs 96 GiB). Differences: image decoding
 supports PNG/JPEG via stb_image (WebP not wired up); prefill chunk
 defaults to 8192; cold loading reads the full weights from disk
-(minute-scale, progress shown in console/logs). Build details are in
+(minute-scale, progress shown in console/logs); the launchers do not
+enable `GDEC_GEMM_WMMA` or `GDEC_GDN_FUSED` (the self-written WMMA GEMM
+and fused GDN kernel already promoted on Linux start.sh, worth ~8-10% PP
+combined but unverified under TheRock — so Windows prefill uses hipBLASLt
+plus the legacy GDN path). Build details are in
 [BUILD_EN.md](BUILD_EN.md).
 
 ## Documentation
