@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Per-frame validation of the front-end's SSE streams.
 
-A streaming client parses each `data:` frame independently, so every frame must
-be valid UTF-8 containing valid JSON. This catches the class of bug where a
+A streaming client parses each `data:` frame independently, so every data frame
+must be valid UTF-8 containing valid JSON. Standard SSE comment heartbeats are
+ignored. This catches the class of bug where a
 multi-byte character is split across frames (the concatenation looks fine, but
 no single frame is parseable) and where the terminator is not exactly `[DONE]`.
 
@@ -41,6 +42,8 @@ def stream(base, path, body):
     for i, fr in enumerate(raw.split(b"\n\n")):
         if not fr:
             continue
+        if fr.startswith(b":"):
+            continue  # SSE keep-alive comment while queued or in prefill.
         if not fr.startswith(b"data: "):
             problems.append(f"frame {i}: no 'data: ' prefix: {fr[:60]!r}")
             continue

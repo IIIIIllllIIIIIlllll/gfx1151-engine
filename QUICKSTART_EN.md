@@ -81,11 +81,11 @@ startup time is 360 seconds. Exit only cleans up the processes started this time
 
 Verified environment: Ubuntu, `gfx1151` GPU, ROCm HIP 7.x / AMD clang.
 GPU builds always use `-O3 -Werror`, link rocBLAS and hipBLASLt, and also require
-the rocPRIM headers. The API uses C++17 / `-O2 -Werror`, depending on nlohmann-json,
-libpng, libjpeg, libwebp, and pthread. Ubuntu install command:
+the rocPRIM headers. The API uses C++17 / `-O2 -Werror`; nlohmann/json is vendored,
+and it depends on libpng, libjpeg, libwebp, and pthread. Ubuntu install command:
 
 ```bash
-sudo apt install build-essential nlohmann-json3-dev libpng-dev libjpeg-dev libwebp-dev
+sudo apt install build-essential libpng-dev libjpeg-dev libwebp-dev
 ```
 
 The scripts first look for `hipcc` in PATH, otherwise they use `/opt/rocm/bin/hipcc`.

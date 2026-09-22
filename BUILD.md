@@ -8,11 +8,12 @@
 编译器为 ROCm 自带 `hipcc`(HIP 7.x / AMD clang)。
 
 引擎需要 HIP、rocBLAS、hipBLASLt、rocPRIM 开发文件和 Linux C++ 标准库。
-API 额外需要 g++、nlohmann-json、libpng、libjpeg、libwebp 开发包。
+API 额外需要 g++、libpng、libjpeg、libwebp 开发包；nlohmann/json 已随仓库
+放在 `third_party/nlohmann/json.hpp`，不需要系统安装。
 Ubuntu 安装命令:
 
 ```bash
-sudo apt install build-essential nlohmann-json3-dev libpng-dev libjpeg-dev libwebp-dev
+sudo apt install build-essential libpng-dev libjpeg-dev libwebp-dev
 ```
 
 ROCm 需要支持 `gfx1151` 的版本。不要把 GPU 架构参数直接套用到其他显卡。
@@ -167,8 +168,10 @@ g++ -O3 -Werror -std=c++17 -o build/hgn_dump src/hgn_dump.cpp
 找不到 `hipcc`:使用 `/opt/rocm/bin/hipcc` 并检查 ROCm 安装。
 找不到 `rocprim/...`、`hipblaslt/...` 或 `-lhipblaslt`:检查同一套
 ROCm 的开发头文件和库是否安装,避免混用版本。
-找不到 `nlohmann/json.hpp`、`png.h`、`jpeglib.h`、`webp/decode.h`:
-安装上方 API 开发包。
+找不到 `nlohmann/json.hpp`:
+确认仓库中的 `third_party/nlohmann/json.hpp` 存在。
+找不到 `png.h`、`jpeglib.h`、`webp/decode.h`:
+安装上方图像开发包。
 出现 `no kernel image` / 架构错误:核对显卡与 `--offload-arch`,不要
 只删除参数掩盖问题。
 `-Werror` 失败:保留诊断并修正对应兼容性问题,不建议直接关闭。

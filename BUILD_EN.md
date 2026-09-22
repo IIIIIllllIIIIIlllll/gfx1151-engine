@@ -8,12 +8,13 @@ Build on a Linux / AMD ROCm machine. GPU target `gfx1151` (AMD Strix Halo),
 compiler is ROCm's bundled `hipcc` (HIP 7.x / AMD clang).
 
 The engine requires HIP, rocBLAS, hipBLASLt, rocPRIM development files and the
-Linux C++ standard library. The API additionally requires the g++,
-nlohmann-json, libpng, libjpeg, and libwebp development packages.
+Linux C++ standard library. The API additionally requires g++, libpng, libjpeg,
+and libwebp development packages. nlohmann/json is vendored at
+`third_party/nlohmann/json.hpp`, so no system nlohmann-json package is required.
 Ubuntu install command:
 
 ```bash
-sudo apt install build-essential nlohmann-json3-dev libpng-dev libjpeg-dev libwebp-dev
+sudo apt install build-essential libpng-dev libjpeg-dev libwebp-dev
 ```
 
 ROCm must be a version that supports `gfx1151`. Do not apply the GPU
@@ -196,8 +197,10 @@ installation.
 Can't find `rocprim/...`, `hipblaslt/...` or `-lhipblaslt`: check whether the
 development headers and libraries of the same ROCm installation are
 installed; avoid mixing versions.
-Can't find `nlohmann/json.hpp`, `png.h`, `jpeglib.h`, `webp/decode.h`:
-install the API development packages listed above.
+Can't find `nlohmann/json.hpp`:
+make sure the repository's `third_party/nlohmann/json.hpp` is present.
+Can't find `png.h`, `jpeglib.h`, or `webp/decode.h`:
+install the image development packages listed above.
 Getting `no kernel image` / architecture errors: verify the graphics card
 against `--offload-arch`; do not just remove the flag to mask the problem.
 `-Werror` failures: keep the diagnostics and fix the corresponding

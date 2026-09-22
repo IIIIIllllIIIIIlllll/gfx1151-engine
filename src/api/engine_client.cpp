@@ -15,6 +15,7 @@
 #endif
 
 #include <cerrno>
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -296,7 +297,8 @@ std::string build_gen_request(const GenParams& p) {
     return s;
 }
 
-GenResult EngineClient::generate(const GenParams& p, const TokenFn& on_token) {
+GenResult EngineClient::generate(const GenParams& p, const TokenFn& on_token,
+                                 const WaitFn& on_wait) {
     GenResult out;
     std::lock_guard<std::mutex> lk(gen_mtx_);
     if (!valid_vision_payload(p)) {
@@ -325,9 +327,30 @@ GenResult EngineClient::generate(const GenParams& p, const TokenFn& on_token) {
     // --- read T lines until the D terminator ------------------------------
     bool saw_any = false;
     bool cancelled = false;
+    bool heartbeat = static_cast<bool>(on_wait);
+    // Poll in short slices when a heartbeat callback is present.  This keeps
+    // long prefill gaps observable without changing the overall deadline.
+    auto read_with_wait = [&](std::string* line, double timeout_s) {
+        const double deadline = now_s() + timeout_s;
+        for (;;) {
+            const double left = deadline - now_s();
+            if (left <= 0.0) {
+                read_timed_out_ = true;
+                return false;
+            }
+            const double slice = heartbeat ? std::min(left, 1.0) : left;
+            if (read_line(line, slice)) return true;
+            if (!read_timed_out_ || !heartbeat || now_s() >= deadline) return false;
+            if (!on_wait()) {
+                heartbeat = false;
+                cancelled = true;
+                cancel(p.req);
+            }
+        }
+    };
     for (;;) {
         std::string l;
-        if (!read_line(&l, saw_any ? next_timeout_ : first_timeout_)) {
+        if (!read_with_wait(&l, saw_any ? next_timeout_ : first_timeout_)) {
             out.timed_out = read_timed_out_;
             if (out.timed_out) cancel(p.req);
             close();

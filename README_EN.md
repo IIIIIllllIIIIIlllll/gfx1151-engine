@@ -49,7 +49,7 @@ gfx1151)**, 122 GiB RAM:
   driver (the GPU needs VRAM carved out in BIOS), see the "Windows" section
 - Available memory ≥ 100 GiB (68 GiB weights pinned (page-locked) + KV)
 - Build dependencies: rocBLAS, hipBLASLt, rocPRIM; the API frontend also
-  needs nlohmann-json, libpng, libjpeg, libwebp
+  needs libpng, libjpeg, libwebp; nlohmann/json is vendored in the repository
 
 ## Quick Start
 

@@ -84,6 +84,87 @@ static uint64_t state_bytes(const Sizes& s) {
          2ull * s.nqsa * s.ntok * 512 * s.kvb;
 }
 
+
+// LRU maintenance is intentionally separate from the request path. The queue
+// is bounded to one pending job: a newer save supersedes an older maintenance
+// pass, so a burst of requests cannot grow an unbounded background queue.
+struct MaintJob {
+  Cfg cfg;
+  std::string protect;
+  bool touch_existing = false;
+};
+
+static std::mutex g_maint_mtx;
+static std::condition_variable g_maint_cv;
+static MaintJob g_maint_job;
+static bool g_maint_pending = false;
+static bool g_maint_started = false;
+
+static void maintain_lru(const MaintJob& job) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const std::string dst = job.cfg.dir + "/" + job.protect;
+  if (job.touch_existing && fs::exists(dst, ec))
+    fs::last_write_time(dst, fs::file_time_type::clock::now(), ec);
+
+  struct Ent {
+    fs::path p;
+    fs::file_time_type t;
+    uint64_t bytes;
+  };
+  std::vector<Ent> ents;
+  uint64_t total = 0;
+  for (auto& de : fs::directory_iterator(job.cfg.dir, ec)) {
+    Sizes s;
+    std::string fn = de.path().filename().string();
+    if (fn.rfind("s_", 0) || !read_meta(de.path().string(), s)) continue;
+    uint64_t b = state_bytes(s) + (uint64_t)s.ntok * 4;
+    ents.push_back({de.path(), fs::last_write_time(de.path(), ec), b});
+    total += b;
+  }
+  std::sort(ents.begin(), ents.end(),
+            [](const Ent& a, const Ent& b) { return a.t < b.t; });
+  for (auto& e : ents) {
+    if (total <= job.cfg.cap_bytes) break;
+    if (e.p.filename().string() == job.protect) continue;
+    uint64_t b = e.bytes;
+    ec.clear();
+    fs::remove_all(e.p, ec);
+    if (!ec) {
+      total -= b;
+      fprintf(stderr, "kvsnap: evicted %s (LRU, cap %.1f GB)\n",
+              e.p.filename().string().c_str(),
+              job.cfg.cap_bytes / 1073741824.0);
+    }
+  }
+}
+
+static void maintain_worker() {
+  for (;;) {
+    MaintJob job;
+    {
+      std::unique_lock<std::mutex> lk(g_maint_mtx);
+      g_maint_cv.wait(lk, [] { return g_maint_pending; });
+      job = std::move(g_maint_job);
+      g_maint_pending = false;
+    }
+    maintain_lru(job);
+  }
+}
+
+static void schedule_lru(const Cfg& cfg, const char* protect,
+                         bool touch_existing) {
+  {
+    std::lock_guard<std::mutex> lk(g_maint_mtx);
+    if (!g_maint_started) {
+      g_maint_started = true;
+      std::thread(maintain_worker).detach();
+    }
+    g_maint_job = MaintJob{cfg, protect ? protect : "", touch_existing};
+    g_maint_pending = true;
+  }
+  g_maint_cv.notify_one();
+}
 static void save(GpuModel& m, const std::vector<int>& toks, const Cfg& cfg) {
   namespace fs = std::filesystem;
   const int ntok = (int)toks.size();
@@ -95,7 +176,7 @@ static void save(GpuModel& m, const std::vector<int>& toks, const Cfg& cfg) {
   std::string dst = cfg.dir + "/" + name, tmp = cfg.dir + "/tmp_" + name;
   std::error_code ec;
   if (fs::exists(dst, ec)) {  // same state already cached: just bump LRU time
-    fs::last_write_time(dst, fs::file_time_type::clock::now(), ec);
+    schedule_lru(cfg, name, true);
     return;
   }
   fs::remove_all(tmp, ec);
@@ -184,36 +265,9 @@ static void save(GpuModel& m, const std::vector<int>& toks, const Cfg& cfg) {
     fprintf(stderr,
             "%s kvsnap: slow save %.1fs (d2h %.1fs, write %.1fs, other %.1fs)\n",
             log_ts(), sv, g_t_d2h, g_t_wr, sv - g_t_d2h - g_t_wr);
-  // LRU eviction over the cap: oldest directory mtime first, never the one
-  // just written. Sizes derive from each snapshot's meta (no du(1) needed).
-  struct Ent {
-    fs::path p;
-    fs::file_time_type t;
-    uint64_t bytes;
-  };
-  std::vector<Ent> ents;
-  uint64_t total = 0;
-  for (auto& de : fs::directory_iterator(cfg.dir, ec)) {
-    Sizes s;
-    std::string fn = de.path().filename().string();
-    if (fn.rfind("s_", 0) || !read_meta(de.path().string(), s)) continue;
-    uint64_t b = state_bytes(s) + (uint64_t)s.ntok * 4;
-    ents.push_back({de.path(), fs::last_write_time(de.path(), ec), b});
-    total += b;
-  }
-  std::sort(ents.begin(), ents.end(),
-            [](const Ent& a, const Ent& b) { return a.t < b.t; });
-  for (auto& e : ents) {
-    if (total <= cfg.cap_bytes) break;
-    if (e.p.filename().string() == name) continue;  // protect the new one
-    uint64_t b = e.bytes;
-    fs::remove_all(e.p, ec);
-    if (!ec) {
-      total -= b;
-      fprintf(stderr, "kvsnap: evicted %s (LRU, cap %.1f GB)\n",
-              e.p.filename().string().c_str(), cfg.cap_bytes / 1073741824.0);
-    }
-  }
+  // Queue LRU accounting/eviction after publishing. Atomic rename remains the
+  // snapshot commit point; maintenance cannot make a partial tree visible.
+  schedule_lru(cfg, name, false);
 }
 
 // map a blob read-only and H2D it into place; expected size must match exactly.
@@ -231,7 +285,7 @@ static bool rd_blob(const std::string& path, void* dptr, size_t n) {
 }
 
 static bool restore(GpuModel& m, const std::string& dir,
-                    std::vector<int>& toks_out) {
+                    std::vector<int>& toks_out, const Cfg& cfg) {
   Sizes s;
   const int nqsa = g_cfg.layers / 4, ngdn = g_cfg.layers - nqsa;
   const int kvb = m.qsa_kv_fp32 ? 4 : 2;
@@ -279,9 +333,9 @@ static bool restore(GpuModel& m, const std::string& dir,
   CK(hipMemcpy(m.d_pos, &m.pos, 4, hipMemcpyHostToDevice));
   CK(hipMemcpy(m.d_ringpos, &m.ple_ringpos, 4, hipMemcpyHostToDevice));
   m.chist.assign(toks_out.begin(), toks_out.end());
-  // bump LRU time (self-contained snapshots: eviction never breaks others)
-  std::error_code ec;
-  std::filesystem::last_write_time(dir, std::filesystem::file_time_type::clock::now(), ec);
+  // LRU touch and eviction are coalesced onto the bounded maintenance worker.
+  std::string name = std::filesystem::path(dir).filename().string();
+  schedule_lru(cfg, name.c_str(), true);
   return true;
 }
 
@@ -920,7 +974,7 @@ static int run(GpuModel& m, int port) {
               kvs, g.ids, &sn, is_mrope ? &g.mrope_grids : nullptr, req_ih);
           if (!sp.empty()) {
             auto r0 = std::chrono::steady_clock::now();
-            if (kvsnap::restore(m, sp, hist)) {  // hist := snapshot tokens
+            if (kvsnap::restore(m, sp, hist, kvs)) {  // hist := snapshot tokens
               mcp = hist.size();
               cont = true;
               n_cached = (int)mcp;
@@ -1089,16 +1143,8 @@ static int run(GpuModel& m, int port) {
         double pre_ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t0)
                             .count();
-        // Prompt-boundary snapshot: chat templates re-render history as TEXT,
-        // so the next turn's ids match this turn's PROMPT ids exactly but
-        // diverge from the generated ids (BPE boundary effects). Caching the
-        // end-of-prefill state is what makes multi-turn reuse actually hit.
-        // save() dedups by content hash, so repeats cost nothing.
-        // M-RoPE turns are cached too: the KVS2 meta records grids and the
-        // patch-bytes hash so a different image with identical placeholder
-        // ids can never restore this state.
-        if (!kvs.dir.empty() && hist.size() >= kvs.min_tokens)
-          kvsnap::save(m, hist, kvs);
+        // Phase 1: snapshot only at end-of-turn. This removes the first-token
+        // stall while the full asynchronous capture path is being designed.
         rckpt::save(m, hist);  // prompt-end RAM checkpoint (cheap, deduped)
         auto d0 = std::chrono::steady_clock::now();
         int ngen = 0;

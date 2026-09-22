@@ -32,6 +32,8 @@ def parse_sse(raw):
     for frame in raw.decode("utf-8").split("\n\n"):
         if not frame:
             continue
+        if frame.startswith(":"):
+            continue  # SSE keep-alive comment while a request is queued.
         check(frame.startswith("data: "), "sse-frame-prefix", frame[:60])
         payload = frame[6:]
         events.append(payload if payload == "[DONE]" else json.loads(payload))
@@ -307,12 +309,21 @@ def main():
     time.sleep(0.25)
     started = time.monotonic()
     status, _, raw = request(args.base, "/v1/completions", {
-        "prompt": "x", "temperature": 0, "max_tokens": 2,
+        "prompt": "x", "temperature": 0, "max_tokens": 2, "stream": True,
     })
     elapsed = time.monotonic() - started
     slow.join()
-    check(status == 503 and elapsed < 1.0, "engine-busy-fast-503", raw[:300])
-    check(slow_result and slow_result[0][0] == 200, "engine-busy-owner-completes")
+    events = parse_sse(raw) if status == 200 else []
+    empty_wait = any(
+        isinstance(event, dict)
+        and event.get("choices")
+        and event["choices"][0].get("text") == ""
+        and event["choices"][0].get("finish_reason") is None
+        for event in events
+    )
+    check(status == 200 and elapsed >= 1.5 and empty_wait,
+          "engine-queued-stream-heartbeat", raw[:500])
+    check(slow_result and slow_result[0][0] == 200, "engine-queued-owner-completes")
 
     print("RESULT PASS")
 

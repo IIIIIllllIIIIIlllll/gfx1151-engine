@@ -77,7 +77,7 @@ case "$TARGET" in
     CXX="$TR/lib/llvm/bin/clang++.exe"
     [[ -x "$CXX" ]] || { echo "找不到 TheRock clang++: $CXX" >&2; exit 1; }
     echo "[编译] build/gdec-api-win.exe"
-    "$CXX" -O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS -Isrc/api -I"$TR/include" \
+    "$CXX" -O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS -Isrc/api -Ithird_party -I"$TR/include" \
       src/api/http.cpp src/api/engine_client.cpp src/api/tokenizer.cpp \
       src/api/chat_template.cpp src/api/json_py.cpp src/api/toolparse.cpp \
       src/api/vision.cpp src/api/reqstat.cpp src/api/main.cpp -lws2_32 -o build/gdec-api-win.exe

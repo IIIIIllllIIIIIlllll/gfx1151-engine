@@ -71,7 +71,7 @@ build_engine() {
     --offload-arch="$GPU_ARCH" src/gpu/gdec.cpp -lrocblas -lhipblaslt
 }
 
-API_FLAGS=(-O2 -std=c++17 -Isrc/api -Wall -Wextra -Wpedantic -Werror)
+API_FLAGS=(-O2 -std=c++17 -Isrc/api -Ithird_party -Wall -Wextra -Wpedantic -Werror)
 # tokenizer/chat_template 由 CLI 与服务器共用,每个目标须显式列出源文件
 # (否则 main.cpp 会与 CLI 的 main 冲突)。
 build_api() {

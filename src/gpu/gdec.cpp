@@ -89,6 +89,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -98,6 +99,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>

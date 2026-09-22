@@ -16,6 +16,7 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -63,9 +64,12 @@ std::mutex g_conn_mtx;  // serialize (re)connects
 std::atomic<long long> g_req_seq{0};
 
 // The engine is batch-1 (INFO reports kv_slots = 1), so requests are
-// serialized here rather than queued engine-side.
+// serialized here rather than queued engine-side.  Waiting requests stay in
+// this front-end queue until the single engine slot is released.
 std::mutex g_slot_mtx;
+std::condition_variable g_slot_cv;
 int g_in_flight = 0;
+int g_queued = 0;
 std::chrono::steady_clock::time_point g_busy_since;
 
 // generation_config.json of this checkpoint.
@@ -100,25 +104,44 @@ const char* kEngineRejected =
 
 class SlotGuard {
   public:
-    explicit SlotGuard(bool cache_probe = false) {
-        std::lock_guard<std::mutex> lk(g_slot_mtx);
-        if (g_in_flight != 0) {
-            if (cache_probe)
-                http::fail(500, "internal error: TimeoutError: ", "server_error",
-                           "server_error");
-            http::fail(503, "engine busy", "server_error", "engine_busy");
+    explicit SlotGuard(const std::function<bool()>& on_wait = {}) {
+        std::unique_lock<std::mutex> lk(g_slot_mtx);
+        const bool queued = g_in_flight != 0;
+        if (queued) ++g_queued;
+        while (g_in_flight != 0) {
+            if (!on_wait) {
+                g_slot_cv.wait(lk, [] { return g_in_flight == 0; });
+                break;
+            }
+            // Do not hold the slot mutex while writing to the client.  The
+            // callback also lets a disconnected stream leave the queue.
+            lk.unlock();
+            const bool keep_waiting = on_wait();
+            lk.lock();
+            if (!keep_waiting) {
+                --g_queued;
+                g_slot_cv.notify_all();
+                return;
+            }
+            if (g_in_flight != 0) g_slot_cv.wait_for(lk, std::chrono::seconds(1));
         }
+        if (queued) --g_queued;
         g_in_flight = 1;
         g_busy_since = std::chrono::steady_clock::now();
+        acquired_ = true;
     }
     ~SlotGuard() {
-        {
-            std::lock_guard<std::mutex> lk(g_slot_mtx);
-            g_in_flight = 0;
-        }
+        if (!acquired_) return;
+        std::lock_guard<std::mutex> lk(g_slot_mtx);
+        g_in_flight = 0;
+        g_slot_cv.notify_all();
     }
+    bool acquired() const { return acquired_; }
     SlotGuard(const SlotGuard&) = delete;
     SlotGuard& operator=(const SlotGuard&) = delete;
+
+  private:
+    bool acquired_ = false;
 };
 
 bool engine_ready(std::string* err) {
@@ -256,8 +279,22 @@ struct GenOutcome {
 // empty for non-streaming use.
 GenOutcome run_generation(GenSpec& spec,
                           const std::function<bool(const std::string&)>& on_delta,
-                          const std::string& log_tag) {
-    SlotGuard slot;
+                          const std::string& log_tag,
+                          const std::function<bool()>& on_wait = {}) {
+    GenOutcome out;
+    std::function<bool()> wait_callback;
+    if (on_wait) {
+        wait_callback = [&]() {
+            const bool keep_waiting = on_wait();
+            if (!keep_waiting) out.client_gone = true;
+            return keep_waiting;
+        };
+    }
+    SlotGuard slot(wait_callback);
+    if (!slot.acquired()) {
+        out.client_gone = true;
+        return out;
+    }
     std::string err;
     if (!engine_ready(&err)) {
         fprintf(stderr, "REQ %s 502 engine connect failed: %s\n", log_tag.c_str(), err.c_str());
@@ -289,7 +326,6 @@ GenOutcome run_generation(GenSpec& spec,
     p.patches = std::move(spec.patches);
     p.snaps = spec.snaps;
 
-    GenOutcome out;
     out.served_max_tokens = p.max_tokens;
     if (spec.max_tokens > p.max_tokens) out.clamped_from = spec.max_tokens;
     Detokenizer detok(&g_tok);
@@ -352,7 +388,7 @@ GenOutcome run_generation(GenSpec& spec,
         (void)lp;
         ++emitted;
         return emit(detok.push(tok));
-    });
+    }, wait_callback);
     out.ttft_ms = ttft;
 
     if (!r.transport_ok) {
@@ -869,7 +905,7 @@ void handle_models(const http::Request&, http::Response* r, http::Stream*) {
 }
 
 void handle_cache(const http::Request&, http::Response* r, http::Stream*) {
-    SlotGuard slot(/*cache_probe=*/true);
+    SlotGuard slot;
     std::string line, err;
     {
         std::lock_guard<std::mutex> lk(g_conn_mtx);
@@ -907,7 +943,10 @@ void handle_health(const http::Request&, http::Response* r, http::Stream*) {
     }
     j["slots"] = 1;
     j["slot_ctx"] = g_cfg.context;
-    j["queued"] = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_slot_mtx);
+        j["queued"] = g_queued;
+    }
     j["decode"] = std::string(
         "greedy at explicit temperature 0; Qwen-default sampling (temp 1.0, top_k 20, "
         "top_p 0.95) when temperature is omitted; sampled at temperature > 0");
@@ -984,7 +1023,9 @@ void handle_completions(const http::Request& q, http::Response* r, http::Stream*
     };
 
     if (!stream) {
-        GenOutcome o = run_generation(spec, nullptr, id);
+        GenOutcome o = run_generation(
+            spec, nullptr, id,
+            [st]() { return st == nullptr || !st->disconnected(); });
         json j = frame_base();
         json choice{{"index", 0}, {"finish_reason", o.reason}, {"text", o.text}};
         if (spec.logprobs) choice["logprobs"] = logprobs_json(o.logprobs);
@@ -995,6 +1036,13 @@ void handle_completions(const http::Request& q, http::Response* r, http::Stream*
     }
 
     r->sse = true;
+    auto on_wait = [&]() {
+        if (st->disconnected()) return false;
+        json frame = frame_base();
+        frame["choices"] = json::array(
+            {json{{"index", 0}, {"finish_reason", nullptr}, {"text", ""}}});
+        return send_frame(st, frame);
+    };
     GenOutcome o = run_generation(
         spec,
         [&](const std::string& d) {
@@ -1003,7 +1051,7 @@ void handle_completions(const http::Request& q, http::Response* r, http::Stream*
                 {json{{"index", 0}, {"finish_reason", nullptr}, {"text", d}}});
             return send_frame(st, frame);
         },
-        id);
+        id, on_wait);
     json fin = frame_base();
     fin["choices"] =
         json::array({json{{"index", 0}, {"finish_reason", o.reason}, {"text", ""}}});
@@ -1247,7 +1295,9 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
     };
 
     if (!stream) {
-        GenOutcome o = run_generation(spec, nullptr, id);
+        GenOutcome o = run_generation(
+            spec, nullptr, id,
+            [st]() { return st == nullptr || !st->disconnected(); });
         std::string reasoning, answer;
         if (tool_setup.choice.forced())
             answer = o.text;
@@ -1314,6 +1364,10 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
         return true;
     };
     if (!dispatch_tool_events(parser.feed(tool_setup.choice.parser_prefix()))) return;
+    auto on_wait = [&]() {
+        if (st->disconnected()) return false;
+        return send_frame(st, text_chunk("content", ""));
+    };
     GenOutcome o = run_generation(
         spec,
         [&](const std::string& d) {
@@ -1325,7 +1379,7 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
                 return false;
             return dispatch_tool_events(parser.feed(ct));
         },
-        id);
+        id, on_wait);
     if (o.client_gone) return;
     if (!tool_setup.choice.forced()) {
         std::string rp, ct;
@@ -1462,7 +1516,9 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
     };
 
     if (!stream) {
-        GenOutcome o = run_generation(spec, nullptr, id);
+        GenOutcome o = run_generation(
+            spec, nullptr, id,
+            [st]() { return st == nullptr || !st->disconnected(); });
         std::string reasoning, answer;
         if (tool_setup.choice.forced())
             answer = o.text;
@@ -1632,6 +1688,12 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
     toolparse::StreamParser parser(
         tool_setup.tools, []() { return make_id("call_"); }, tool_setup.enabled());
     if (!dispatch_tool_events(parser.feed(tool_setup.choice.parser_prefix()))) return;
+    auto on_wait = [&]() {
+        if (st->disconnected()) return false;
+        // No response item exists until generation starts, so use a standard
+        // SSE comment as a protocol-neutral keep-alive during queue/prefill.
+        return st->send_raw(": keep-alive\n\n");
+    };
     GenOutcome o = run_generation(
         spec,
         [&](const std::string& delta) {
@@ -1641,7 +1703,7 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
             splitter.feed(delta, &reasoning_delta, &content_delta);
             return dispatch_tool_events(parser.feed(content_delta));
         },
-        id);
+        id, on_wait);
     if (o.client_gone) return;
     if (!tool_setup.choice.forced()) {
         std::string reasoning_delta, content_delta;

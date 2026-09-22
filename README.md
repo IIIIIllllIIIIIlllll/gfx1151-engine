@@ -39,7 +39,7 @@
   (GPU 需 BIOS 划分显存),见「Windows」一节
 - 可用内存 ≥ 100 GiB(权重 68 GiB 锁页 + KV)
 - 编译依赖:rocBLAS、hipBLASLt、rocPRIM;API 前端另需
-  nlohmann-json、libpng、libjpeg、libwebp
+  libpng、libjpeg、libwebp（nlohmann/json 已随仓库提供）
 
 ## 快速开始
 

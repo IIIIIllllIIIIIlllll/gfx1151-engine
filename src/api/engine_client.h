@@ -66,6 +66,9 @@ struct GenResult {
 // Called for every T line. Return false to send `X <req>` and stop reading
 // (the engine still emits its D line, which generate() consumes).
 using TokenFn = std::function<bool(int /*token*/, float /*logprob*/)>;
+// Called periodically while the engine has not produced the next T line.
+// Returning false cancels the request, but generate() still drains its D line.
+using WaitFn = std::function<bool()>;
 
 // The `GEN ...` request line for these params, newline included. Exposed so the
 // grammar can be checked without a live engine (tools/eng_cli --dump-req).
@@ -91,10 +94,13 @@ class EngineClient {
     bool cstat(std::string* line, std::string* err);
 
     // Run one GEN to completion (or until `on_token` asks to stop). Blocks.
+    // `on_wait` is called at roughly one-second intervals while waiting for
+    // prefill or the next token, so streaming front-ends can send heartbeats.
     // `on_token` may be empty. On transport failure returns a result with
     // transport_ok = false; a protocol-level rejection (D ... error) returns
     // transport_ok = true with reason == "error".
-    GenResult generate(const GenParams& p, const TokenFn& on_token);
+    GenResult generate(const GenParams& p, const TokenFn& on_token,
+                       const WaitFn& on_wait = {});
 
     // Write `X <req>` without disturbing an in-flight read. Safe to call from
     // another thread (e.g. when the HTTP client disconnects).

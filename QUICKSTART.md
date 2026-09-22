@@ -82,11 +82,11 @@ bash build.sh test     # 编译并运行 kernel 单测,不加载模型
 
 验证环境:Ubuntu,`gfx1151` GPU,ROCm HIP 7.x / AMD clang。
 GPU 编译固定使用 `-O3 -Werror`,链接 rocBLAS 和 hipBLASLt,还需要
-rocPRIM 头文件。API 使用 C++17 / `-O2 -Werror`,依赖 nlohmann-json、
-libpng、libjpeg、libwebp 和 pthread。Ubuntu 安装命令:
+rocPRIM 头文件。API 使用 C++17 / `-O2 -Werror`,nlohmann/json 已随仓库提供，
+另依赖 libpng、libjpeg、libwebp 和 pthread。Ubuntu 安装命令:
 
 ```bash
-sudo apt install build-essential nlohmann-json3-dev libpng-dev libjpeg-dev libwebp-dev
+sudo apt install build-essential libpng-dev libjpeg-dev libwebp-dev
 ```
 
 脚本优先查找 PATH 中的 `hipcc`,否则使用 `/opt/rocm/bin/hipcc`。
