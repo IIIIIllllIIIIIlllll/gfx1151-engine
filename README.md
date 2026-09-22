@@ -21,8 +21,8 @@
 - **模型转换工具**:HF safetensors → `.hgn`,量化无需校准数据,
   可分发给自己的微调模型使用(见 CONVERT.md)。
 
-实测(gfx1151,122 GiB 内存):prefill 约 1100–1200 tok/s,decode 约
-30–55 tok/s(视投机命中率)。
+实测(gfx1151,122 GiB 内存):128K上下文 prefill 约 1100–1200 tok/s,decode 约
+30–55 tok/s(视投机命中率)。120w。
 
 ## 要求
 
