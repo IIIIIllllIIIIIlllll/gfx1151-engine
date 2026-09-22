@@ -36,6 +36,7 @@ bash build.sh test            # 编 ktest 并运行 kernel 单测
 | `build/tok_cli` `tpl_cli` `eng_cli` | tokenizer / 模板 / 引擎协议 CLI |
 | `build/http_selftest` `toolparse_test` `vision_test` | API 组件自测 |
 | `build/ktest` | 引擎 kernel 单测 |
+| `build/lib` | 随包 ROCm/图像运行库及 gfx1151 kernel db |
 
 行为要点:
 
@@ -47,11 +48,18 @@ bash build.sh test            # 编 ktest 并运行 kernel 单测
 - 引擎或 API 正在运行(或另一个编译/启动任务持有锁)时拒绝编译,
   先停止服务再编。
 - 环境变量:`HIPCC`(默认 PATH 中的 hipcc,其次 `/opt/rocm/bin/hipcc`)、
-  `GPU_ARCH`(默认 `gfx1151`)、`CXX`(默认 `g++`)。例:
+  `GPU_ARCH`(默认 `gfx1151`)、`CXX`(默认 `g++`)、`ROCM_PATH`（仅在无法
+  从 `HIPCC` 推断 ROCm 根目录时需要）。例:
 
 ```bash
 HIPCC=/opt/rocm/bin/hipcc GPU_ARCH=gfx1151 bash build.sh
 ```
+
+- 构建后会根据 ELF 的实际依赖，把 ROCm 用户态运行库和 API 所需的
+  libpng/libjpeg/libwebp 依赖闭包复制到 `build/lib/`，并仅复制
+  `GPU_ARCH` 对应的 rocBLAS/hipBLASLt kernel db。二进制带
+  `$ORIGIN/lib` RPATH，`start.sh` 也会显式使用这套私有库；部署时把整个
+  `build/` 一起复制即可，目标机器不需要另装这些运行库。
 
 ## 编译选项(供参考)
 
@@ -59,6 +67,7 @@ HIPCC=/opt/rocm/bin/hipcc GPU_ARCH=gfx1151 bash build.sh
 
 ```bash
 hipcc -O3 -Werror --offload-arch=gfx1151 \
+  -Wl,-rpath,'$ORIGIN/lib' -Wl,--disable-new-dtags \
   -o build/gdec src/gpu/gdec.cpp -lrocblas -lhipblaslt
 ```
 

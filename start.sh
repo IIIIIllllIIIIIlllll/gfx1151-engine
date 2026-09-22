@@ -11,6 +11,19 @@ case "${1:-}" in
   *) fail '用法：bash start.sh [--check]' ;;
 esac
 source "$ROOT/service.conf"
+# build.sh 将 ROCm 与图像解码运行库放在这里；显式设置也覆盖 systemd scope
+# 可能继承的系统 ROCm 路径。kernel db 使用绝对路径，不依赖当前工作目录。
+[[ -d "$ROOT/build/lib" ]] || fail '缺少 build/lib，请重新运行 bash build.sh'
+export LD_LIBRARY_PATH="$ROOT/build/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export ROCBLAS_TENSILE_LIBPATH="$ROOT/build/lib/rocblas/library"
+export HIPBLASLT_TENSILE_LIBPATH="$ROOT/build/lib/hipblaslt/library"
+[[ -d "$ROCBLAS_TENSILE_LIBPATH" && -d "$HIPBLASLT_TENSILE_LIBPATH" ]] || \
+  fail '缺少 rocBLAS/hipBLASLt kernel db，请重新运行 bash build.sh'
+for pattern in 'libamdhip64.so.*' 'librocblas.so.*' 'libhipblaslt.so.*' \
+               'libpng16.so.*' 'libjpeg.so.*' 'libwebp.so.*'; do
+  compgen -G "$ROOT/build/lib/$pattern" >/dev/null || \
+    fail "缺少随包运行库：$pattern，请重新运行 bash build.sh"
+done
 for key in ENGINE_PORT API_PORT MAX_CONTEXT MTP_GAMMA MEMORY_CAP_GB MIN_AVAILABLE_GB START_TIMEOUT STALL_TIMEOUT KVSNAP_MAX_GB RCKPT_MAX; do
   value="${!key}"
   [[ "$value" =~ ^[1-9][0-9]*$ && ${#value} -le 8 ]] || fail "$key 必须为正整数"

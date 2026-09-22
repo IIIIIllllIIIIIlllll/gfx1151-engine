@@ -12,6 +12,7 @@
 #   build/gdec-api      API 服务器(src/api/*.cpp)
 #   build/{tok_cli,tpl_cli,eng_cli,http_selftest,toolparse_test,vision_test}
 #   build/ktest         引擎内核测试
+#   build/lib/          ROCm、图像解码运行库与 gfx1151 kernel db
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
@@ -45,6 +46,12 @@ if [[ "$TARGET" != api ]]; then
   command -v "$HIPCC" >/dev/null || { echo '找不到 hipcc，请安装 ROCm 或设置 HIPCC' >&2; exit 1; }
 fi
 CXX="${CXX:-g++}"
+# 使用旧式 DT_RPATH 让 $ORIGIN/lib 同时覆盖 ROCm 库的间接依赖；构建后的
+# ELF 可随 build/ 移动，不依赖 /opt/rocm 的固定安装路径。
+BUNDLE_RPATH=(-Wl,-rpath,'$ORIGIN/lib' -Wl,--disable-new-dtags)
+BUNDLE_SCAN_DIR="build/.runtime-scan.$$"
+cleanup_build() { rm -rf -- "$BUNDLE_SCAN_DIR"; }
+trap cleanup_build EXIT
 
 # run <内存cap GB> <超时秒> <cmd...>:内存限额 + 超时保护下执行编译命令
 run() {
@@ -66,12 +73,143 @@ compile() {
   fi
 }
 
-build_engine() {
-  compile "build/$ENGINE_NAME" 8 600 "$HIPCC" -O3 -Werror \
-    --offload-arch="$GPU_ARCH" src/gpu/gdec.cpp -lrocblas -lhipblaslt
+# glibc、libstdc++ 与编译器 ABI 仍由目标 Linux 提供；其余实际动态依赖
+# （ROCm 闭包、libdrm/libelf 等依赖，以及 API 图像库闭包）复制到 build/lib。
+is_base_system_lib() {
+  case "$1" in
+    libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*|\
+    libresolv.so.*|libutil.so.*|libgcc_s.so.*|libstdc++.so.*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
-API_FLAGS=(-O2 -std=c++17 -Isrc/api -Ithird_party -Wall -Wextra -Wpedantic -Werror)
+bundle_binary_libs() {
+  local binary="$1" scan ldd_output line soname arrow resolved rest tmp
+  [[ -x "$binary" ]] || { echo "找不到待打包 ELF: $binary" >&2; return 1; }
+  command -v ldd >/dev/null || { echo '缺少 ldd，无法收集 Linux 运行库' >&2; return 1; }
+  mkdir -p build/lib "$BUNDLE_SCAN_DIR"
+
+  # 在无 lib/ 邻居的临时目录解析，避免上次打包的 $ORIGIN/lib 干扰本次 ldd。
+  scan="$BUNDLE_SCAN_DIR/$(basename "$binary")"
+  cp -f -- "$binary" "$scan"
+  if ! ldd_output="$(LC_ALL=C ldd "$scan")"; then
+    echo "无法解析 $binary 的运行库" >&2
+    return 1
+  fi
+  while IFS= read -r line; do
+    read -r soname arrow resolved rest <<<"$line"
+    [[ "$arrow" == '=>' ]] || continue
+    if [[ "$resolved" == 'not' ]]; then
+      echo "$binary 缺少运行库: $soname" >&2
+      return 1
+    fi
+    [[ "$resolved" == /* ]] || continue
+    is_base_system_lib "$soname" && continue
+    tmp="build/lib/${soname}.tmp.$$"
+    cp -Lf --preserve=mode,timestamps -- "$resolved" "$tmp"
+    mv -f -- "$tmp" "build/lib/$soname"
+    echo "[运行库] $soname"
+  done <<<"$ldd_output"
+}
+
+resolve_rocm_root() {
+  local hipcc_path candidate
+  if [[ -n "${ROCM_PATH:-}" ]]; then
+    readlink -f -- "$ROCM_PATH"
+    return
+  fi
+  hipcc_path="$(readlink -f -- "$(command -v "$HIPCC")")"
+  candidate="$(dirname -- "$(dirname -- "$hipcc_path")")"
+  if [[ -d "$candidate/lib/rocblas/library" ||
+        -d "$candidate/lib64/rocblas/library" ]]; then
+    printf '%s\n' "$candidate"
+    return
+  fi
+  [[ -d /opt/rocm ]] && { readlink -f /opt/rocm; return; }
+  echo '无法从 HIPCC 推断 ROCm 根目录，请设置 ROCM_PATH' >&2
+  return 1
+}
+
+find_kernel_db() {
+  local rocm_root="$1" component="$2" candidate
+  for candidate in \
+    "$rocm_root/lib/$component/library" \
+    "$rocm_root/lib64/$component/library"; do
+    [[ -d "$candidate" ]] && { printf '%s\n' "$candidate"; return; }
+  done
+  candidate="$(find -L "$rocm_root" -maxdepth 5 -type d \
+    -path "*/$component/library" -print -quit 2>/dev/null || true)"
+  [[ -n "$candidate" ]] && { printf '%s\n' "$candidate"; return; }
+  echo "找不到 $component kernel db（ROCm: $rocm_root）" >&2
+  return 1
+}
+
+bundle_kernel_db() {
+  local rocm_root="$1" component="$2" src dst stage item base copied=0
+  local -a matches
+  src="$(find_kernel_db "$rocm_root" "$component")" || return 1
+  dst="build/lib/$component/library"
+  stage="build/lib/$component/.library.tmp.$$"
+  rm -rf -- "$stage"
+  mkdir -p "$stage"
+
+  # 新版 ROCm 按 gfx 架构分目录；旧版使用顶层带架构名的分片，两种都收集。
+  if [[ -d "$src/$GPU_ARCH" ]]; then
+    cp -aL -- "$src/$GPU_ARCH" "$stage/"
+    copied=1
+  fi
+  matches=("$src/"*"$GPU_ARCH"*)
+  for item in "${matches[@]}"; do
+    [[ -e "$item" || -L "$item" ]] || continue
+    base="$(basename -- "$item")"
+    [[ "$base" == "$GPU_ARCH" ]] && continue
+    cp -aL -- "$item" "$stage/"
+    copied=1
+  done
+  (( copied )) || {
+    rm -rf -- "$stage"
+    echo "$component kernel db 中没有 $GPU_ARCH: $src" >&2
+    return 1
+  }
+  rm -rf -- "$dst"
+  mv -- "$stage" "$dst"
+  echo "[kernel db] $dst"
+}
+
+bundle_gpu_runtime() {
+  local binary="$1" rocm_root
+  bundle_binary_libs "$binary"
+  require_bundled_lib 'libamdhip64.so.*'
+  require_bundled_lib 'librocblas.so.*'
+  require_bundled_lib 'libhipblaslt.so.*'
+  rocm_root="$(resolve_rocm_root)"
+  bundle_kernel_db "$rocm_root" rocblas
+  bundle_kernel_db "$rocm_root" hipblaslt
+}
+
+require_bundled_lib() {
+  local pattern="$1"
+  compgen -G "build/lib/$pattern" >/dev/null || {
+    echo "运行库未打包: $pattern" >&2
+    return 1
+  }
+}
+
+bundle_api_runtime() {
+  bundle_binary_libs "$1"
+  require_bundled_lib 'libpng16.so.*'
+  require_bundled_lib 'libjpeg.so.*'
+  require_bundled_lib 'libwebp.so.*'
+}
+
+build_engine() {
+  compile "build/$ENGINE_NAME" 8 600 "$HIPCC" -O3 -Werror \
+    --offload-arch="$GPU_ARCH" src/gpu/gdec.cpp -lrocblas -lhipblaslt \
+    "${BUNDLE_RPATH[@]}"
+}
+
+API_FLAGS=(-O2 -std=c++17 -Isrc/api -Ithird_party -Wall -Wextra -Wpedantic
+           -Werror "${BUNDLE_RPATH[@]}")
 # tokenizer/chat_template 由 CLI 与服务器共用,每个目标须显式列出源文件
 # (否则 main.cpp 会与 CLI 的 main 冲突)。
 build_api() {
@@ -96,14 +234,28 @@ build_api() {
 
 build_test() {
   compile build/ktest 8 600 "$HIPCC" -O3 -Werror --offload-arch="$GPU_ARCH" \
-    -I src/gpu tools/ktest.cu -lrocblas -lhipblaslt || return 1
-  run 8 600 build/ktest
+    -I src/gpu tools/ktest.cu -lrocblas -lhipblaslt \
+    "${BUNDLE_RPATH[@]}" || return 1
 }
 
 case "$TARGET" in
-  engine) build_engine ;;
-  api)    build_api ;;
-  test)   build_test ;;
+  engine)
+    build_engine
+    bundle_gpu_runtime "build/$ENGINE_NAME"
+    ;;
+  api)
+    build_api
+    bundle_api_runtime build/gdec-api
+    ;;
+  test)
+    build_test
+    bundle_gpu_runtime build/ktest
+    run 8 600 env \
+      "LD_LIBRARY_PATH=$ROOT/build/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+      "ROCBLAS_TENSILE_LIBPATH=$ROOT/build/lib/rocblas/library" \
+      "HIPBLASLT_TENSILE_LIBPATH=$ROOT/build/lib/hipblaslt/library" \
+      build/ktest
+    ;;
   all)
     pids=()
     build_engine & pids+=($!)
@@ -111,6 +263,8 @@ case "$TARGET" in
     fail=0
     for p in "${pids[@]}"; do wait "$p" || fail=1; done
     [[ "$fail" == 0 ]] || { echo '[失败] 见上方编译输出' >&2; exit 1; }
+    bundle_gpu_runtime "build/$ENGINE_NAME"
+    bundle_api_runtime build/gdec-api
     ;;
 esac
-echo '[完成] 编译输出位于 build/'
+echo '[完成] 编译输出与私有运行库位于 build/'

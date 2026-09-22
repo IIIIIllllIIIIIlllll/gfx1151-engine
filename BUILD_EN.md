@@ -38,6 +38,7 @@ Artifacts:
 | `build/tok_cli` `tpl_cli` `eng_cli` | tokenizer / template / engine protocol CLIs |
 | `build/http_selftest` `toolparse_test` `vision_test` | API component self-tests |
 | `build/ktest` | engine kernel unit tests |
+| `build/lib` | bundled ROCm/image runtimes and gfx1151 kernel databases |
 
 Behavior notes:
 
@@ -53,11 +54,19 @@ Behavior notes:
   build/launch task holds the lock); stop the service before building.
 - Environment variables: `HIPCC` (defaults to hipcc on PATH, then
   `/opt/rocm/bin/hipcc`), `GPU_ARCH` (default `gfx1151`), `CXX` (default
-  `g++`). Example:
+  `g++`), and `ROCM_PATH` (only needed when the ROCm root cannot be inferred
+  from `HIPCC`). Example:
 
 ```bash
 HIPCC=/opt/rocm/bin/hipcc GPU_ARCH=gfx1151 bash build.sh
 ```
+
+- After compilation, the script follows the ELF dependencies and copies the
+  ROCm user-space runtime plus the libpng/libjpeg/libwebp dependency closure
+  into `build/lib/`. It also copies only the rocBLAS/hipBLASLt kernel database
+  for `GPU_ARCH`. The binaries contain an `$ORIGIN/lib` RPATH and `start.sh`
+  explicitly selects the bundled files, so deployments should copy the whole
+  `build/` directory and do not need these runtimes installed separately.
 
 ## Compile options (for reference)
 
@@ -65,6 +74,7 @@ Engine:
 
 ```bash
 hipcc -O3 -Werror --offload-arch=gfx1151 \
+  -Wl,-rpath,'$ORIGIN/lib' -Wl,--disable-new-dtags \
   -o build/gdec src/gpu/gdec.cpp -lrocblas -lhipblaslt
 ```
 
