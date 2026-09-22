@@ -2,6 +2,14 @@
 
 *English: [NGRAM_EN.md](NGRAM_EN.md)*
 
+## 来源与声明
+
+本文件所述 ngram 投机解码——以历史文本中的 n-gram 匹配起草候选 token、
+由目标模型批量验证、按接受长度回退——借鉴了开源项目
+[llama.cpp](https://github.com/ggml-org/llama.cpp)（MIT 许可证）的
+ngram speculative decoding 思路与参数实践（草稿长度、接受比对等），
+特此致谢。llama.cpp 的 MIT 许可证与本项目的 AGPL-3.0 分发兼容。
+
 ## 2026-09-19 更新：分块 verify（修复 ngram 轮输出卡顿）
 
 **问题**：ngram 轮把 ≤64 token 草稿作为一次 65 行原子 verify（~350ms），

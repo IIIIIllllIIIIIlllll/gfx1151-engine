@@ -8,6 +8,18 @@
 68 GiB 量化权重以 4-bit 量化存放在主机内存,GPU kernel 直读,不需要大显存;
 整机 122 GiB 内存即可提供 256K 上下文。
 
+## 性能实测
+
+开发机器为 **GMK EVO-X2(AMD Ryzen AI Max+ 395,Strix Halo / gfx1151)**,
+122 GiB 内存:
+
+| 指标 | 数值 |
+| --- | --- |
+| Prefill(128K 上下文) | 约 1100–1200 tok/s |
+| Decode | 约 30–55 tok/s(视投机命中率) |
+| 平均功耗 | 约 120 W |
+| 瞬时最大功耗 | 约 130 W(爆发持续几秒后回落至 120 W 左右) |
+
 ## 特性
 
 - **投机解码 chain**:ngram 优先起草、MTP 兜底,逐轮回退;贪心逐位比对,
@@ -19,10 +31,7 @@
 - **256K 上下文**,两级 prompt 缓存:消息边界的内存检查点(编辑重发秒回)
   + KV 快照跨重启恢复。
 - **模型转换工具**:HF safetensors → `.hgn`,量化无需校准数据,
-  可分发给自己的微调模型使用(见 CONVERT.md)。
-
-实测(gfx1151,122 GiB 内存):128K上下文 prefill 约 1100–1200 tok/s,decode 约
-30–55 tok/s(视投机命中率)。120w。
+  可分发给自己的微调模型使用(见 [CONVERT.md](CONVERT.md))。
 
 ## 要求
 
@@ -69,12 +78,18 @@ bash build_win.sh launcher  # 免脚本启动器 start_win.exe
 
 分发:`build/` + `start_win.exe` + `models/` 拷到任意 gfx1151 Windows
 机器即用,**无需安装 ROCm/TheRock**;仅需 AMD 显卡驱动,并在 BIOS 为 GPU
-划分足够显存(256K 上下文需 96 GiB)。差异:图片解码经 stb_image 支持
-PNG/JPEG(WebP 未接);prefill chunk 默认 8192;冷加载为整权重读盘
-(分钟级,进度见控制台/日志);启动器未开 `GDEC_GEMM_WMMA` 与
-`GDEC_GDN_FUSED`(Linux start.sh 已转正的自写 WMMA GEMM 与 GDN 融合
-kernel,合计约 8-10% PP,TheRock 下未验证——故 Windows 端 prefill 走
-hipBLASLt + 旧 GDN 路径)。编译细节见 [BUILD.md](BUILD.md)。
+划分足够显存(256K 上下文需 96 GiB)。
+
+与 Linux 版的差异:
+
+- 图片解码经 stb_image 支持 PNG/JPEG(WebP 未接)
+- prefill chunk 默认 8192
+- 冷加载为整权重读盘(分钟级,进度见控制台/日志)
+- 启动器未开 `GDEC_GEMM_WMMA` 与 `GDEC_GDN_FUSED`(Linux start.sh 已转正的
+  自写 WMMA GEMM 与 GDN 融合 kernel,合计约 8-10% PP,TheRock 下未验证——
+  故 Windows 端 prefill 走 hipBLASLt + 旧 GDN 路径)
+
+编译细节见 [BUILD.md](BUILD.md)。
 
 ## 文档
 
@@ -96,6 +111,8 @@ bash build.sh test   # kernel 单测,不加载模型,预期 ALL PASS
 ## 致谢
 
 本项目的实现方式借鉴了 peonist-ai 的 [halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server);`.hgn` 权重容器格式即 halogen 的 checkpoint 容器格式(见 [HGN-FORMAT.md](HGN-FORMAT.md))。感谢 halogen 作者的工作。
+
+ngram 投机解码的起草思路另借鉴了开源项目 [llama.cpp](https://github.com/ggml-org/llama.cpp)(MIT 许可证),声明详见 [NGRAM.md](NGRAM.md) 的「来源与声明」一节。
 
 ## 许可证
 

@@ -1,6 +1,17 @@
 # Ngram verify / GDN candidate optimization verification (2026-09-15)
 *中文版:[NGRAM.md](NGRAM.md)*
 
+## Attribution
+
+The ngram speculative decoding described in this document — drafting
+candidate tokens from n-gram matches in the history text, batch-verifying
+them against the target model, and rewinding by the accepted length —
+borrows ideas and parameter practices (draft length, acceptance
+comparison, etc.) from the ngram speculative decoding of
+[llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT license). The
+MIT license of llama.cpp is compatible with this project's AGPL-3.0
+distribution.
+
 ## 2026-09-19 update: chunked verify (fixes ngram-round output stalls)
 
 **Problem**: an ngram round submits a draft of up to 64 tokens as a single 65-row atomic verify (~350ms), and on partial acceptance it must replay the entire accepted prefix (~150ms); the client receives no tokens during this time, which shows up in production logs as ~1.5s streaming gaps ("stalls").

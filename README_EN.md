@@ -10,6 +10,18 @@ The 68 GiB of quantized weights are stored in host memory in 4-bit
 quantization and read directly by the GPU kernels — no large VRAM needed;
 a machine with 122 GiB of RAM can serve a 256K context.
 
+## Measured Performance
+
+Development machine: **GMK EVO-X2 (AMD Ryzen AI Max+ 395, Strix Halo /
+gfx1151)**, 122 GiB RAM:
+
+| Metric | Value |
+| --- | --- |
+| Prefill (128K context) | ~1100–1200 tok/s |
+| Decode | ~30–55 tok/s (depends on speculative hit rate) |
+| Average power draw | ~120 W |
+| Peak (instantaneous) power draw | ~130 W (bursts for a few seconds, then settles back to ~120 W) |
+
 ## Features
 
 - **Speculative decoding chain**: ngram drafts first, MTP as fallback, with
@@ -30,9 +42,6 @@ a machine with 122 GiB of RAM can serve a 256K context.
 - **Model conversion tool**: HF safetensors → `.hgn`; quantization needs no
   calibration data, and can be distributed for your own fine-tuned models
   (see CONVERT_EN.md).
-
-Measured (gfx1151, 122 GiB RAM): 128K context prefill about 1100–1200 tok/s, decode about
-30–55 tok/s (depends on speculative hit rate). 120w.
 
 ## Requirements
 
@@ -85,15 +94,20 @@ connect to `http://<host>:8731/v1`.
 Distribution: copy `build/` + `start_win.exe` + `models/` to any gfx1151
 Windows machine and it just works — **no ROCm/TheRock installation
 needed**; only the AMD GPU driver, plus enough VRAM carved out for the GPU
-in BIOS (a 256K context needs 96 GiB). Differences: image decoding
-supports PNG/JPEG via stb_image (WebP not wired up); prefill chunk
-defaults to 8192; cold loading reads the full weights from disk
-(minute-scale, progress shown in console/logs); the launchers do not
-enable `GDEC_GEMM_WMMA` or `GDEC_GDN_FUSED` (the self-written WMMA GEMM
-and fused GDN kernel already promoted on Linux start.sh, worth ~8-10% PP
-combined but unverified under TheRock — so Windows prefill uses hipBLASLt
-plus the legacy GDN path). Build details are in
-[BUILD_EN.md](BUILD_EN.md).
+in BIOS (a 256K context needs 96 GiB).
+
+Differences from the Linux version:
+
+- Image decoding supports PNG/JPEG via stb_image (WebP not wired up)
+- Prefill chunk defaults to 8192
+- Cold loading reads the full weights from disk (minute-scale, progress
+  shown in console/logs)
+- The launchers do not enable `GDEC_GEMM_WMMA` or `GDEC_GDN_FUSED` (the
+  self-written WMMA GEMM and fused GDN kernel already promoted on Linux
+  start.sh, worth ~8-10% PP combined but unverified under TheRock — so
+  Windows prefill uses hipBLASLt plus the legacy GDN path)
+
+Build details are in [BUILD_EN.md](BUILD_EN.md).
 
 ## Documentation
 
@@ -121,6 +135,8 @@ bash build.sh test   # Kernel unit tests, no model loading, expect ALL PASS
 ## Acknowledgements
 
 This project's implementation borrows from [halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server) by peonist-ai. The `.hgn` weight container format is halogen's checkpoint container format — see [HGN-FORMAT_EN.md](HGN-FORMAT_EN.md). Many thanks to the halogen authors.
+
+The ngram speculative drafting approach also borrows ideas from the open-source [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT license); see the "Attribution" section of [NGRAM_EN.md](NGRAM_EN.md).
 
 ## License
 
