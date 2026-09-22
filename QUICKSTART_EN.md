@@ -72,6 +72,12 @@ Port, listen address, context, MTP, and memory cap are centralized in `service.c
 listens on `0.0.0.0:8731`, accessible from the LAN; if you only need local access, change it to
 `API_HOST="127.0.0.1"`.
 
+Query live memory accounting with `curl http://127.0.0.1:8731/memory`. The
+response separates HIP device allocations, expert weights backed by
+`mmap + hipHostRegister`, pinned host memory, and process RSS.
+`gpu_accessible_committed_bytes` is the engine-accounted total; unregistered,
+reclaimable file-mmap page cache is intentionally excluded.
+
 The engine uses `tools/run_capped.sh`, with a default memory cap of 86 GiB and at least
 100 GiB of free memory required before startup; it refuses to start while another engine or a startup task from the same project is running.
 If there is no progress in logs, engine I/O, or GPU GTT allocation for 60 seconds during loading, startup stops; the maximum

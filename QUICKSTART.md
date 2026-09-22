@@ -73,6 +73,11 @@ bash build.sh test     # 编译并运行 kernel 单测,不加载模型
 监听 `0.0.0.0:8731`,可从局域网访问;只需本机访问时改为
 `API_HOST="127.0.0.1"`。
 
+运行时内存可通过 `curl http://127.0.0.1:8731/memory` 查询。返回值区分
+HIP 设备分配、`mmap + hipHostRegister` 的专家权重、pinned host 内存和
+进程 RSS；`gpu_accessible_committed_bytes` 是引擎自身可准确记账的合计，
+不会把未注册、可回收的文件 mmap 页缓存误算为显存。
+
 引擎使用 `tools/run_capped.sh`,默认 86 GiB 内存上限、启动前至少
 100 GiB 可用内存;另一个引擎或同项目启动任务运行时会拒绝重复启动。
 加载阶段持续 60 秒没有日志、引擎 I/O 或 GPU GTT 分配进展会停止;最长

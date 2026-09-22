@@ -43,6 +43,9 @@ def handle(conn):
             if line == "INFO":
                 send_line(conn, "I 1 0 262144 8 1 1 0 0 0 1 262144 0 1")
                 continue
+            if line == "MEM":
+                send_line(conn, "M 1 100 120 200 10 20 310 900 1000 100 400 50")
+                continue
             if line == "CSTAT":
                 send_line(conn, "C fake")
                 continue

@@ -816,6 +816,25 @@ static int run(GpuModel& m, int port) {
                                             : (m.mtp_avail ? 1 : 0),
                  m.mtp_avail ? 1 : 0, m.maxctx);
         alive = send_all(cfd, ib);
+      } else if (verb == "MEM") {
+        EngineMemStats ms = memstats_snapshot();
+        char mb[512];
+        // M version device_cur device_peak registered_cur pinned_cur
+        //   pinned_peak committed_cur hip_free hip_total hip_delta rss locked
+        snprintf(mb, sizeof mb,
+                 "M 1 %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
+                 (unsigned long long)ms.device_current,
+                 (unsigned long long)ms.device_peak,
+                 (unsigned long long)ms.registered_current,
+                 (unsigned long long)ms.pinned_current,
+                 (unsigned long long)ms.pinned_peak,
+                 (unsigned long long)ms.committed_current,
+                 (unsigned long long)ms.hip_free,
+                 (unsigned long long)ms.hip_total,
+                 (unsigned long long)ms.hip_used_since_start,
+                 (unsigned long long)ms.process_rss,
+                 (unsigned long long)ms.process_locked);
+        alive = send_all(cfd, mb);
       } else if (verb == "X") {
         // no GEN in flight at this point (mid-decode cancel is polled below)
         int64_t req = 0;
@@ -1421,4 +1440,3 @@ static int run(GpuModel& m, int port) {
 }
 
 }  // namespace serve
-

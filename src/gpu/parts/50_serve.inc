@@ -1,8 +1,10 @@
 // ---------------- serve mode (gdec wire protocol) ----------------------------
-// Batch-1: one connection, one in-flight request. Verbs: PING / INFO / GEN / X.
+// Batch-1: one connection, one in-flight request. Verbs:
+// PING / INFO / MEM / GEN / X.
 // GEN accepts an optional SAMPLE suffix (temp>0, top_k/top_p/min_p/seed) with
 // PENALTY/BIAS/LOGPROBS as sampler-only companions; drafter>0 is rejected.
-// INFO reports sampling on, prompt cache on, kv_slots=1.
+// INFO reports sampling on, prompt cache on, kv_slots=1. MEM reports tracked
+// HIP allocations plus driver/process corroborating counters.
 // The verb grammars below (parse_gen, INFO fields) are the specification.
 
 // ---------------- KV snapshots: SSD prompt cache ---------------------------
@@ -30,4 +32,3 @@
 // All errors are non-fatal: the cache is an accelerator, never a
 // correctness dependency.
 namespace kvsnap {
-

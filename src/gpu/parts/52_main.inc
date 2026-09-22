@@ -206,6 +206,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "loaded %zu tensors (base+%zu overlay)\n", ckpt.tensor_count(),
             overlays.size());
     g_cfg.vocab = (int)ckpt.at("lm_head.weight").dims[0];
+    memstats_capture_hip_baseline();
     devarena_init(ckpt, maxctx);
     load_arena(ckpt);
     GpuModel m(ckpt, maxctx);
@@ -221,6 +222,7 @@ int main(int argc, char** argv) {
       m.prefill_batch(warm);
       m.reset_state();
     }
+    memstats_log("ready");
     return serve::run(m, port);
   }
   if (tokens.empty()) {
@@ -242,6 +244,7 @@ int main(int argc, char** argv) {
           overlays.size());
   g_cfg.vocab = (int)ckpt.at("lm_head.weight").dims[0];
 
+  memstats_capture_hip_baseline();
   devarena_init(ckpt, maxctx);
   load_arena(ckpt);
 

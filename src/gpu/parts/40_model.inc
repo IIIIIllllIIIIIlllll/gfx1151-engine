@@ -2177,7 +2177,8 @@ struct GpuModel {
         static int* hoff_pin = nullptr;
         static hipEvent_t ev_eoff = nullptr;
         if (!hoff_pin) {
-          CK(hipHostMalloc((void**)&hoff_pin, (size_t)(E + 1) * 4));
+          CK(hipHostMalloc((void**)&hoff_pin, (size_t)(E + 1) * 4,
+                           hipHostMallocDefault));
           CK(hipEventCreateWithFlags(&ev_eoff, hipEventDisableTiming));
         }
         CK(hipMemcpyAsync(hoff_pin, d_eoff, (E + 1) * 4, hipMemcpyDeviceToHost,
@@ -4984,4 +4985,3 @@ __global__ void k_axpy_sg(float* __restrict__ acc, const float* __restrict__ y,
     acc[i] += s * y[i];
   }
 }
-

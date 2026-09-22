@@ -21,6 +21,14 @@ def request(base, path, body):
         return error.code, error.headers.get("content-type", ""), error.read()
 
 
+def get(base, path):
+    try:
+        with urllib.request.urlopen(base + path, timeout=20) as response:
+            return response.status, response.headers.get("content-type", ""), response.read()
+    except urllib.error.HTTPError as error:
+        return error.code, error.headers.get("content-type", ""), error.read()
+
+
 def check(condition, name, detail=""):
     if not condition:
         raise AssertionError(f"{name}: {detail}")
@@ -50,6 +58,13 @@ def main():
         "AQUBAScY42YAAAAASUVORK5CYII="
     )
     tiny_png_url = "data:image/png;base64," + tiny_png
+
+    status, _, raw = get(args.base, "/memory")
+    memory = json.loads(raw)
+    check(status == 200 and memory["device_current_bytes"] == 100 and
+          memory["registered_mmap_bytes"] == 200 and
+          memory["gpu_accessible_committed_bytes"] == 310,
+          "engine-memory", raw[:500])
 
     invalid = [
         ("temperature-type", "/v1/completions", {"prompt": "x", "temperature": "bad"}),

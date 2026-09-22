@@ -90,6 +90,8 @@ class EngineClient {
     bool ping(std::string* err);
     // Send INFO and return the raw `I ...` line (for context/drafter probing).
     bool info(std::string* line, std::string* err);
+    // Send MEM and return the raw `M ...` engine-memory line.
+    bool memory(std::string* line, std::string* err);
     // Send CSTAT and return the raw `C ...` line.
     bool cstat(std::string* line, std::string* err);
 

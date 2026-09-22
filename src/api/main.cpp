@@ -923,6 +923,50 @@ void handle_cache(const http::Request&, http::Response* r, http::Stream*) {
     r->body = json_py::dumps(j, /*spaced=*/false);
 }
 
+void handle_memory(const http::Request&, http::Response* r, http::Stream*) {
+    SlotGuard slot;
+    std::string line, err;
+    {
+        std::lock_guard<std::mutex> lk(g_conn_mtx);
+        if (!g_eng.connected()) g_eng.connect(g_cfg.engine_addr, &err);
+    }
+    if (!g_eng.memory(&line, &err)) {
+        r->status = 500;
+        r->body = http::error_json("engine memory query failed: " + err,
+                                   "server_error", "server_error");
+        return;
+    }
+    std::istringstream ss(line);
+    std::string tag;
+    unsigned long long version = 0, device = 0, device_peak = 0, registered = 0,
+                       pinned = 0, pinned_peak = 0, committed = 0, hip_free = 0,
+                       hip_total = 0, hip_delta = 0, rss = 0, locked = 0;
+    if (!(ss >> tag >> version >> device >> device_peak >> registered >> pinned >>
+          pinned_peak >> committed >> hip_free >> hip_total >> hip_delta >> rss >>
+          locked) ||
+        tag != "M" || version != 1) {
+        r->status = 500;
+        r->body = http::error_json("invalid engine memory reply", "server_error",
+                                   "server_error");
+        return;
+    }
+    json j;
+    j["device_current_bytes"] = device;
+    j["device_peak_bytes"] = device_peak;
+    j["registered_mmap_bytes"] = registered;
+    j["pinned_host_current_bytes"] = pinned;
+    j["pinned_host_peak_bytes"] = pinned_peak;
+    j["gpu_accessible_committed_bytes"] = committed;
+    j["hip_free_bytes"] = hip_free;
+    j["hip_total_bytes"] = hip_total;
+    j["hip_used_since_engine_start_bytes"] = hip_delta;
+    j["process_rss_bytes"] = rss;
+    j["process_locked_bytes"] = locked;
+    j["accounting"] =
+        "engine-requested HIP allocations; unregistered pageable mmap is excluded";
+    r->body = json_py::dumps(j, /*spaced=*/false);
+}
+
 void handle_health(const http::Request&, http::Response* r, http::Stream*) {
     json j;
     j["status"] = "ok";
@@ -1818,6 +1862,7 @@ int main(int argc, char** argv) {
 
     srv.on("GET", "/v1/models", handle_models);
     srv.on("GET", "/health", handle_health);
+    srv.on("GET", "/memory", handle_memory);
     srv.on("GET", "/cache", handle_cache);
     srv.on("POST", "/v1/completions", handle_completions);
     srv.on("POST", "/v1/chat/completions", handle_chat);
