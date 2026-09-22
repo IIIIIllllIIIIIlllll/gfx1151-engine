@@ -4,3 +4,7 @@ models/
 *.tmp.*
 start_win.exe
 __pycache__/
+data/kvsnap
+data/ppbench/
+data/*.bin
+.rocprofv3
