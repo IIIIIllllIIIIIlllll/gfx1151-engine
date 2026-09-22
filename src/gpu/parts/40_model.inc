@@ -2965,9 +2965,10 @@ struct GpuModel {
     phase("argmax_d2h", TP);
     double sec =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count();
-    // quiet: spec-verify re-ingest chunks (<= gamma+1 tokens each round);
-    // logging those would spam one line per spec round.
-    if (!quiet)
+    // quiet: spec-verify re-ingest chunks (<= gamma+1 tokens each round).
+    // Serve-mode prompt chunks use the live progress and request summary logs;
+    // keep this legacy line only for offline prefill benchmarks.
+    if (!quiet && prog_total <= 0)
       fprintf(stderr, "\n%s prefill: %d tokens in %.2f s = %.1f tok/s\n", log_ts(),
               P, sec, P / sec);
     if (prog_total > 0) prog_base += P;  // live progress: chunk complete
