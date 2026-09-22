@@ -3,6 +3,7 @@
 #
 # 用法:
 #   bash build.sh                 # all:引擎 + API(服务器+CLI工具),并行
+#   bash build.sh --bundle        # 同上，并打包分发所需的全部运行库
 #   bash build.sh engine [名字]   # 只编引擎 → build/<名字>(默认 gdec)
 #   bash build.sh api             # 只编 API 服务器 + CLI 工具
 #   bash build.sh test            # 编 ktest 并运行
@@ -12,17 +13,27 @@
 #   build/gdec-api      API 服务器(src/api/*.cpp)
 #   build/{tok_cli,tpl_cli,eng_cli,http_selftest,toolparse_test,vision_test}
 #   build/ktest         引擎内核测试
-#   build/lib/          ROCm、图像解码运行库与 gfx1151 kernel db
+#   build/lib/          --bundle 时生成的运行库与 gfx1151 kernel db
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-usage() { sed -n '2,14p' "$0"; }
+usage() { sed -n '2,15p' "$0"; }
+BUNDLE_RUNTIME=0
+POSITIONAL=()
+for arg in "$@"; do
+  case "$arg" in
+    --bundle) BUNDLE_RUNTIME=1 ;;
+    -h|--help) usage; exit 0 ;;
+    --*) echo "未知选项: $arg" >&2; usage >&2; exit 2 ;;
+    *) POSITIONAL+=("$arg") ;;
+  esac
+done
+set -- "${POSITIONAL[@]}"
 [[ $# -le 2 ]] || { usage >&2; exit 2; }
 TARGET="${1:-all}"
 ENGINE_NAME="${2:-gdec}"
 case "$TARGET" in
-  -h|--help) usage; exit 0 ;;
   all|engine|api|test) ;;
   *) usage >&2; exit 2 ;;
 esac
@@ -46,9 +57,11 @@ if [[ "$TARGET" != api ]]; then
   command -v "$HIPCC" >/dev/null || { echo '找不到 hipcc，请安装 ROCm 或设置 HIPCC' >&2; exit 1; }
 fi
 CXX="${CXX:-g++}"
-# 使用旧式 DT_RPATH 让 $ORIGIN/lib 同时覆盖 ROCm 库的间接依赖；构建后的
-# ELF 可随 build/ 移动，不依赖 /opt/rocm 的固定安装路径。
-BUNDLE_RPATH=(-Wl,-rpath,'$ORIGIN/lib' -Wl,--disable-new-dtags)
+BUNDLE_RPATH=()
+if (( BUNDLE_RUNTIME )); then
+  # 旧式 DT_RPATH 让 $ORIGIN/lib 同时覆盖 ROCm 库的间接依赖。
+  BUNDLE_RPATH=(-Wl,-rpath,'$ORIGIN/lib' -Wl,--disable-new-dtags)
+fi
 BUNDLE_SCAN_DIR="build/.runtime-scan.$$"
 cleanup_build() { rm -rf -- "$BUNDLE_SCAN_DIR"; }
 trap cleanup_build EXIT
@@ -241,20 +254,24 @@ build_test() {
 case "$TARGET" in
   engine)
     build_engine
-    bundle_gpu_runtime "build/$ENGINE_NAME"
+    (( ! BUNDLE_RUNTIME )) || bundle_gpu_runtime "build/$ENGINE_NAME"
     ;;
   api)
     build_api
-    bundle_api_runtime build/gdec-api
+    (( ! BUNDLE_RUNTIME )) || bundle_api_runtime build/gdec-api
     ;;
   test)
     build_test
-    bundle_gpu_runtime build/ktest
-    run 8 600 env \
-      "LD_LIBRARY_PATH=$ROOT/build/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-      "ROCBLAS_TENSILE_LIBPATH=$ROOT/build/lib/rocblas/library" \
-      "HIPBLASLT_TENSILE_LIBPATH=$ROOT/build/lib/hipblaslt/library" \
-      build/ktest
+    if (( BUNDLE_RUNTIME )); then
+      bundle_gpu_runtime build/ktest
+      run 8 600 env \
+        "LD_LIBRARY_PATH=$ROOT/build/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        "ROCBLAS_TENSILE_LIBPATH=$ROOT/build/lib/rocblas/library" \
+        "HIPBLASLT_TENSILE_LIBPATH=$ROOT/build/lib/hipblaslt/library" \
+        build/ktest
+    else
+      run 8 600 build/ktest
+    fi
     ;;
   all)
     pids=()
@@ -263,8 +280,18 @@ case "$TARGET" in
     fail=0
     for p in "${pids[@]}"; do wait "$p" || fail=1; done
     [[ "$fail" == 0 ]] || { echo '[失败] 见上方编译输出' >&2; exit 1; }
-    bundle_gpu_runtime "build/$ENGINE_NAME"
-    bundle_api_runtime build/gdec-api
+    if (( BUNDLE_RUNTIME )); then
+      bundle_gpu_runtime "build/$ENGINE_NAME"
+      bundle_api_runtime build/gdec-api
+    fi
     ;;
 esac
-echo '[完成] 编译输出与私有运行库位于 build/'
+if (( BUNDLE_RUNTIME )); then
+  printf 'GPU_ARCH=%s\n' "$GPU_ARCH" >build/bundled-runtime.conf
+  echo '[完成] 分发产物与私有运行库位于 build/'
+else
+  # 仅在本轮编译成功后清理旧分发库，避免编译失败破坏上次可用产物。
+  rm -rf -- build/lib
+  rm -f -- build/bundled-runtime.conf
+  echo '[完成] 编译输出位于 build/（使用系统运行库）'
+fi

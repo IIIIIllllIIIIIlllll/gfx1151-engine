@@ -22,6 +22,7 @@ ROCm 需要支持 `gfx1151` 的版本。不要把 GPU 架构参数直接套用�
 
 ```bash
 bash build.sh                 # all:引擎 + API 并行编译(默认)
+bash build.sh --bundle        # 分发构建：同时打包全部运行依赖
 bash build.sh engine [名字]   # 只编引擎 → build/<名字>(默认 gdec)
 bash build.sh api             # 只编 API 服务器 + CLI 工具
 bash build.sh test            # 编 ktest 并运行 kernel 单测
@@ -36,7 +37,7 @@ bash build.sh test            # 编 ktest 并运行 kernel 单测
 | `build/tok_cli` `tpl_cli` `eng_cli` | tokenizer / 模板 / 引擎协议 CLI |
 | `build/http_selftest` `toolparse_test` `vision_test` | API 组件自测 |
 | `build/ktest` | 引擎 kernel 单测 |
-| `build/lib` | 随包 ROCm/图像运行库及 gfx1151 kernel db |
+| `build/lib` | `--bundle` 生成的 ROCm/图像运行库及 gfx1151 kernel db |
 
 行为要点:
 
@@ -55,7 +56,9 @@ bash build.sh test            # 编 ktest 并运行 kernel 单测
 HIPCC=/opt/rocm/bin/hipcc GPU_ARCH=gfx1151 bash build.sh
 ```
 
-- 构建后会根据 ELF 的实际依赖，把 ROCm 用户态运行库和 API 所需的
+- 默认构建供本机使用，直接加载系统已经安装的 ROCm 和图像运行库，不创建
+  `build/lib/`。分发时加 `--bundle`；脚本会根据 ELF 的实际依赖，把 ROCm
+  用户态运行库和 API 所需的
   libpng/libjpeg/libwebp 依赖闭包复制到 `build/lib/`，并仅复制
   `GPU_ARCH` 对应的 rocBLAS/hipBLASLt kernel db。二进制带
   `$ORIGIN/lib` RPATH，`start.sh` 也会显式使用这套私有库；部署时把整个
@@ -70,6 +73,8 @@ hipcc -O3 -Werror --offload-arch=gfx1151 \
   -Wl,-rpath,'$ORIGIN/lib' -Wl,--disable-new-dtags \
   -o build/gdec src/gpu/gdec.cpp -lrocblas -lhipblaslt
 ```
+
+上面的 RPATH 参数只在 `--bundle` 分发构建中添加。
 
 不要自行加 `-ffast-math`,它会改变数值行为。
 

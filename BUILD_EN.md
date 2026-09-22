@@ -24,6 +24,7 @@ architecture flags directly to other graphics cards.
 
 ```bash
 bash build.sh                 # all: build engine + API in parallel (default)
+bash build.sh --bundle        # distribution build with all runtime dependencies
 bash build.sh engine [name]   # engine only → build/<name> (default gdec)
 bash build.sh api             # API server + CLI tools only
 bash build.sh test            # build ktest and run kernel unit tests
@@ -38,7 +39,7 @@ Artifacts:
 | `build/tok_cli` `tpl_cli` `eng_cli` | tokenizer / template / engine protocol CLIs |
 | `build/http_selftest` `toolparse_test` `vision_test` | API component self-tests |
 | `build/ktest` | engine kernel unit tests |
-| `build/lib` | bundled ROCm/image runtimes and gfx1151 kernel databases |
+| `build/lib` | ROCm/image runtimes and gfx1151 kernel databases from `--bundle` |
 
 Behavior notes:
 
@@ -61,8 +62,10 @@ Behavior notes:
 HIPCC=/opt/rocm/bin/hipcc GPU_ARCH=gfx1151 bash build.sh
 ```
 
-- After compilation, the script follows the ELF dependencies and copies the
-  ROCm user-space runtime plus the libpng/libjpeg/libwebp dependency closure
+- The default build is for local use and loads the already installed system
+  runtimes; it does not create `build/lib/`. For distribution, pass
+  `--bundle`; the script follows the ELF dependencies and copies the ROCm
+  user-space runtime plus the libpng/libjpeg/libwebp dependency closure
   into `build/lib/`. It also copies only the rocBLAS/hipBLASLt kernel database
   for `GPU_ARCH`. The binaries contain an `$ORIGIN/lib` RPATH and `start.sh`
   explicitly selects the bundled files, so deployments should copy the whole
@@ -77,6 +80,8 @@ hipcc -O3 -Werror --offload-arch=gfx1151 \
   -Wl,-rpath,'$ORIGIN/lib' -Wl,--disable-new-dtags \
   -o build/gdec src/gpu/gdec.cpp -lrocblas -lhipblaslt
 ```
+
+The RPATH flags above are added only to `--bundle` distribution builds.
 
 Do not add `-ffast-math` yourself; it changes numerical behavior.
 
