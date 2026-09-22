@@ -186,7 +186,7 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
 | `GDEC_QSA_WMMA=1` / `GDEC_QSA_WMMA6=1` | WMMA bf16 稀疏 flash（256/128 thr 两版），需 bf16 KV |
 | `GDEC_GDN_LOOP=1` / `GDEC_GDN_NOSPLIT=1` / `GDEC_GDN_NOSTRIP=1` | GDN 三级回退 |
 | `GDEC_PLE_LOOP=1` | PLE 回退逐 token |
-| `GDEC_PLE_URING=1` | 启用 io_uring PLE 聚集（Linux） |
+| `GDEC_PLE_URING=1` | 启用 io_uring PLE 聚集（Linux；service.conf `PLE_URING=1` 默认开，引擎只查变量存在性） |
 | `GDEC_MOE_NAIVE=1` / `GDEC_MOE_LT=1` / `GDEC_MOE_LT_BF16=1` | MoE：分组 GEMV 回退 / per-expert hipBLASLt / Lt 输出也 bf16 |
 | `GDEC_MOE_HOST_ROUTE=1` / `GDEC_MOE_UNTILED=1` | MoE 路由/切分回退 |
 | `GDEC_MOE_FP32_IO=1` | MoE 激活回退 fp32 staging |

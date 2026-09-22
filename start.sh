@@ -15,6 +15,7 @@ for key in ENGINE_PORT API_PORT MAX_CONTEXT MTP_GAMMA MEMORY_CAP_GB MIN_AVAILABL
   value="${!key}"
   [[ "$value" =~ ^[1-9][0-9]*$ && ${#value} -le 8 ]] || fail "$key 必须为正整数"
 done
+[[ "$PLE_URING" =~ ^[01]$ ]] || fail 'PLE_URING 必须为 0 或 1'
 (( ENGINE_PORT <= 65535 && API_PORT <= 65535 && ENGINE_PORT != API_PORT )) || fail '端口必须为不同的 1–65535 整数'
 (( MTP_GAMMA <= 8 )) || fail 'MTP_GAMMA 范围为 1–8'
 for cmd in flock ss systemctl stat awk pgrep setsid; do command -v "$cmd" >/dev/null || fail "缺少命令：$cmd"; done
@@ -84,6 +85,7 @@ trap 'exit 129' HUP
 export GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1
 # 自写 WMMA dense GEMM（Phase 3g）：8K +2%、32K +3%，对拍 8049 token 仅尾部分歧 4 个。
 export GDEC_GEMM_WMMA=1
+#export GDEC_PROF=1        # 临时诊断：每个 prefill chunk 打印 ple_host/ple_wait 等耗时
 # GDN 融合持久化 kernel（Phase 3c）：intra+strip 全融合、ws 不落 DRAM，kernel 3.34×，
 # 8K +5.7%、32K +4.4%，ids 对拍 8054 token 0 分歧。与 GDEC_GDN_PIPE2 互斥（fused 优先）。
 export GDEC_GDN_FUSED=1
@@ -93,6 +95,9 @@ export GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 GDEC_NOWARMUP=1
 export GDEC_PREFILL_CHUNK=32768
 export GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1
 export GDEC_KVSNAP=1
+# PLE io_uring 聚集由 service.conf 的 PLE_URING 控制；引擎只查 GDEC_PLE_URING
+# 的存在性（设 0 也会开），故 0 时必须不导出。
+if (( PLE_URING )); then export GDEC_PLE_URING=1; fi
 export GDEC_KVSNAP_MAX_GB="$KVSNAP_MAX_GB"
 export GDEC_RCKPT_MAX="$RCKPT_MAX"
 # --serve reads GDEC_SPEC_GAMMA; --gamma is for offline --spec-gen.
