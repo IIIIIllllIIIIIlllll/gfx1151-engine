@@ -1083,6 +1083,166 @@ int main() {
     TCK(hipFree(dout7));
   }
 
+  // ---- 9h. k_qsa_wmma_u（4-token 块并集, GDEC_QSA_UNION）vs 9g 基线 + CPU ref ----
+  // Same sparse setup as 9g with P=2064: tokens 2052..2063 form three aligned
+  // groups that go through k_qsa_union_merge + k_qsa_wmma_u. Group 1's last
+  // token list deliberately excludes its own block to exercise the merge
+  // append + causal-override path. The merge output is checked exactly against
+  // a host-side union; attention output uses the same 3x bound as 9g anchored
+  // on qsa_wmma_btv (the union stream's key order differs per query, so the
+  // result is not bitwise-equal to the per-token kernel).
+  {
+    const int P = 2064, HQ = 24, HKV = 2, DH = 256, FIRST = 2051, G0 = 2052;
+    const int NG = (P - G0) / 4;  // 3 groups: 2052..2063
+    std::vector<float> q((size_t)P * HQ * DH), k((size_t)P * HKV * DH),
+        v((size_t)P * HKV * DH);
+    for (auto& x : q) x = frand();
+    for (auto& x : k) x = frand();
+    for (auto& x : v) x = frand();
+    std::vector<float> qr(q.size()), kr(k.size()), vr(v.size());
+    std::vector<uint16_t> kb(k.size()), vb(v.size());
+    for (size_t i = 0; i < q.size(); i++) qr[i] = bf16_round(q[i]);
+    for (size_t i = 0; i < k.size(); i++) {
+      kb[i] = bf16_bits(k[i]);
+      kr[i] = bf16_round(k[i]);
+      vb[i] = bf16_bits(v[i]);
+      vr[i] = bf16_round(v[i]);
+    }
+    std::vector<int> sel((size_t)P * 512, -1);
+    for (int t = FIRST; t < P; t++) {
+      int n = (t + 1) / 4;
+      int own = t / 4;
+      std::vector<int> blocks;
+      // group 1's last token (2059): exclude its own block (append path)
+      int nmax = (t == G0 + 7) ? own : n;
+      for (int i = 0; i < nmax; i++) blocks.push_back(i);
+      std::shuffle(blocks.begin(), blocks.end(), rng);
+      blocks.resize(512);
+      std::sort(blocks.begin(), blocks.end());
+      for (int i = 0; i < 512; i++) sel[(size_t)t * 512 + i] = blocks[i];
+    }
+    std::vector<uint16_t> vct(((size_t)(P + 3) / 4) * HKV * DH * 4, 0);
+    for (int t = 0; t < P; t++)
+      for (int h = 0; h < HKV; h++)
+        for (int d = 0; d < DH; d++)
+          vct[(((size_t)(t / 4) * HKV + h) * DH + d) * 4 + t % 4] =
+              vb[((size_t)t * HKV + h) * DH + d];
+    float* dq = dup(q);
+    uint16_t *dkc = dup(kb), *dvc = dup(vb), *dvct = dup(vct);
+    int* dsel = dup(sel);
+    float* dout5 = dalloc((size_t)P * HQ * DH);
+    float* doutu = dalloc((size_t)P * HQ * DH);
+    uint16_t *dublk, *dumask;
+    int* ducount;
+    TCK(hipMalloc(&dublk, (size_t)NG * QSA_UCAP * 2));
+    TCK(hipMalloc(&dumask, (size_t)NG * QSA_UCAP * 2));
+    TCK(hipMalloc(&ducount, NG * 4));
+    const int* sel0 = dsel + (size_t)FIRST * 512;
+    k_qsa_wmma<true><<<dim3(P - FIRST, HKV), 256>>>(dq, dkc, dvc, dvct, dout5, P,
+                                                    DH, HKV, HQ, sel0, FIRST);
+    TCK(hipGetLastError());
+    k_qsa_union_merge<<<NG, 128>>>(dsel, G0, dublk, dumask, ducount, QSA_UCAP);
+    TCK(hipGetLastError());
+    k_qsa_wmma_u<<<dim3(NG, HKV), 256>>>(dq, dkc, dvct, doutu, DH, HKV, HQ,
+                                         dublk, dumask, ducount, QSA_UCAP, G0, 0);
+    TCK(hipGetLastError());
+    // host 侧精确校验 merge 输出（升序并集 + 掩码 + 自身块补登 + pad）
+    {
+      std::vector<uint16_t> hblk((size_t)NG * QSA_UCAP),
+          hmsk((size_t)NG * QSA_UCAP);
+      std::vector<int> hcnt(NG);
+      TCK(hipMemcpy(hblk.data(), dublk, hblk.size() * 2, hipMemcpyDeviceToHost));
+      TCK(hipMemcpy(hmsk.data(), dumask, hmsk.size() * 2, hipMemcpyDeviceToHost));
+      TCK(hipMemcpy(hcnt.data(), ducount, NG * 4, hipMemcpyDeviceToHost));
+      int merge_bad = 0;
+      for (int g = 0; g < NG; g++) {
+        const int t0 = G0 + 4 * g, own = t0 / 4;
+        std::map<int, uint32_t> u;
+        for (int qi = 0; qi < 4; qi++)
+          for (int i = 0; i < 512; i++) {
+            int b = sel[(size_t)(t0 + qi) * 512 + i];
+            u[b] |= 0xFu << (4 * qi);
+          }
+        std::vector<std::pair<int, uint32_t>> exp(u.begin(), u.end());
+        if (u.find(own) == u.end() || !(u[own] & (0xFu << 12)))
+          exp.push_back({own, 0});  // 补登（mask=0）
+        while (exp.size() & 3) exp.push_back({0xFFFF, 0});
+        if ((int)exp.size() > QSA_UCAP || hcnt[g] != (int)exp.size()) {
+          merge_bad++;
+          continue;
+        }
+        for (size_t i = 0; i < exp.size(); i++)
+          if (hblk[(size_t)g * QSA_UCAP + i] != (uint16_t)exp[i].first ||
+              hmsk[(size_t)g * QSA_UCAP + i] != (uint16_t)exp[i].second)
+            merge_bad++;
+      }
+      printf("%-28s %s\n", "qsa_union_merge", merge_bad ? "FAIL" : "PASS");
+      fails += merge_bad != 0;
+    }
+    std::vector<float> o5 = dget(dout5, (size_t)P * HQ * DH),
+                       ou = dget(doutu, (size_t)P * HQ * DH);
+    std::vector<float> ref((size_t)P * HQ * DH, 0.f);
+    float scale = 1.f / sqrtf((float)DH);
+    for (int t = G0; t < P; t++) {
+      int visible = t + 1;
+      int ntok = 2048 + visible % 4;
+      const int* blocks = sel.data() + (size_t)t * 512;
+      for (int h = 0; h < HQ; h++) {
+        int kvh = h / (HQ / HKV);
+        const float* qh = qr.data() + ((size_t)t * HQ + h) * DH;
+        float mx = -1e30f;
+        std::vector<float> s(ntok);
+        std::vector<int> src(ntok);
+        for (int p = 0; p < ntok; p++) {
+          src[p] = p < 2048 ? 4 * blocks[p / 4] + p % 4
+                            : (visible / 4) * 4 + p - 2048;
+          const float* kp = kr.data() + ((size_t)src[p] * HKV + kvh) * DH;
+          float a = 0;
+          for (int i = 0; i < DH; i++) a += qh[i] * kp[i];
+          s[p] = a * scale;
+          mx = std::max(mx, s[p]);
+        }
+        float se = 0;
+        for (int p = 0; p < ntok; p++) se += expf(s[p] - mx);
+        for (int i = 0; i < DH; i++) {
+          float a = 0;
+          for (int p = 0; p < ntok; p++)
+            a += expf(s[p] - mx) / se * vr[((size_t)src[p] * HKV + kvh) * DH + i];
+          ref[((size_t)t * HQ + h) * DH + i] = a;
+        }
+      }
+    }
+    double mabs5 = 0, mrel5 = 0, mabsu = 0, mrelu = 0, mabsuv = 0;
+    for (int t = G0; t < P; t++)
+      for (size_t i = (size_t)t * HQ * DH; i < (size_t)(t + 1) * HQ * DH; i++) {
+        double d5 = fabs((double)o5[i] - ref[i]), du = fabs((double)ou[i] - ref[i]);
+        mabs5 = std::max(mabs5, d5);
+        mabsu = std::max(mabsu, du);
+        mabsuv = std::max(mabsuv, (double)fabs(o5[i] - ou[i]));
+        if (fabs((double)ref[i]) > 1e-3) {
+          mrel5 = std::max(mrel5, d5 / fabs((double)ref[i]));
+          mrelu = std::max(mrelu, du / fabs((double)ref[i]));
+        }
+      }
+    double tola = std::min(3 * mabs5, 1e-2), tolr = 3 * mrel5;
+    printf("%-28s maxabs=%.3e maxrel=%.3e  (reference row)\n", "qsa_wmma_btv_grp",
+           mabs5, mrel5);
+    printf("%-28s maxabs=%.3e maxrel=%.3e |o5-ou|=%.3e tol=(%.1e, %.1e)  %s\n",
+           "qsa_wmma_u", mabsu, mrelu, mabsuv, tola, tolr,
+           (mabsu <= tola && mrelu <= tolr) ? "PASS" : "FAIL");
+    if (mabsu > tola || mrelu > tolr) fails++;
+    TCK(hipFree(dq));
+    TCK(hipFree(dkc));
+    TCK(hipFree(dvc));
+    TCK(hipFree(dvct));
+    TCK(hipFree(dsel));
+    TCK(hipFree(dout5));
+    TCK(hipFree(doutu));
+    TCK(hipFree(dublk));
+    TCK(hipFree(dumask));
+    TCK(hipFree(ducount));
+  }
+
   // ---- 10. k_qsa_qsplit batched (grid.y = token) ----
   {
     const int P = 5, DH = 256;

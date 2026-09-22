@@ -127,6 +127,11 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   } else {
     add(2 * nqsa * mc * 512 * 2);           // d_kcb + d_vcb
     if (btv) add(nqsa * ib * 2 * 256 * 4 * 2);  // d_vcbt
+    // GDEC_QSA_UNION: d_ublk + d_umask + d_ucount（按单 chunk 组数）
+    if (btv && getenv("GDEC_QSA_UNION")) {
+      const size_t ng = (size_t)BP / 4 + 1;
+      add(ng * QSA_UCAP * 4 + ng * 4);
+    }
   }
   add(2 * mc * 4);                          // d_posarr + d_ringarr
   // prefill 批缓冲（BP 维）

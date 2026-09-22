@@ -59,6 +59,12 @@ struct GpuModel {
   // GDEC_QSA_WMMA6=1: dim-split 128-thread rewrite (k_qsa_wmma6); layered on
   // the transposed-V path since it reads B fragments from that cache.
   bool qsa_wmma6 = qsa_wmma_btv && getenv("GDEC_QSA_WMMA6") != nullptr;
+  // GDEC_QSA_UNION=1: 4-query 块并集 WMMA prefill（k_qsa_union_merge +
+  // k_qsa_wmma_u），叠加在转置 V 路径上；组边缘回退 k_qsa_wmma<true>。
+  bool qsa_union = qsa_wmma_btv && getenv("GDEC_QSA_UNION") != nullptr;
+  uint16_t* d_ublk = nullptr;  // [ngroups][QSA_UCAP] 并集块号
+  uint16_t* d_umask = nullptr; // [ngroups][QSA_UCAP] 4 query x 4 slot 掩码
+  int* d_ucount = nullptr;     // [ngroups] 并集块数（含 pad，4 的倍数）
   size_t qsa_vt_blocks = 0;
   bool prefill_fused = getenv("GDEC_PREFILL_UNFUSED") == nullptr;
   bool gr_bf16 = getenv("GDEC_GR_BF16") != nullptr && prefill_fused;
@@ -301,6 +307,13 @@ struct GpuModel {
       if (qsa_wmma_btv) {
         qsa_vt_blocks = (size_t)(maxctx + 3) / 4;
         DALLOC(&d_vcbt, (size_t)nqsa * qsa_vt_blocks * 2 * 256 * 4 * 2);
+      }
+      if (qsa_union) {
+        // 并集工作区按单 chunk 的组数分配（maxbatch_cap/4 组，每组 ≤ 2052 块）
+        const size_t ng = (size_t)maxbatch_cap / 4 + 1;
+        DALLOC(&d_ublk, ng * QSA_UCAP * 2);
+        DALLOC(&d_umask, ng * QSA_UCAP * 2);
+        DALLOC(&d_ucount, ng * 4);
       }
     }
     DALLOC(&d_qg, 12288 * 4);
@@ -1831,7 +1844,29 @@ struct GpuModel {
             d_qsb, kc, vc, d_attnb, P, 256, 2, 24, sel, first_abs, nullptr, nullptr,
             nullptr, base);
       else if constexpr (sizeof(KVT) == 2) {
-        if (qsa_wmma6 && vc_transposed)
+        if (qsa_union && vc_transposed) {
+          // 并集路径：[ga, ge) 内的 4 对齐完整组走 merge + k_qsa_wmma_u，
+          // 两侧 ragged 边缘回退逐 token 的 k_qsa_wmma<true>
+          const int ga = (first_abs + 3) & ~3;
+          const int ge = (base + P) & ~3;
+          if (ge - ga >= 4) {
+            const int ngroups = (ge - ga) >> 2;
+            k_qsa_union_merge<<<ngroups, 128, 0, g_str>>>(
+                d_iselected, ga, d_ublk, d_umask, d_ucount, QSA_UCAP);
+            k_qsa_wmma_u<<<dim3(ngroups, 2), 256, 0, g_str>>>(
+                d_qsb, kc, vc_transposed, d_attnb, 256, 2, 24, d_ublk, d_umask,
+                d_ucount, QSA_UCAP, ga, base);
+          }
+          if (ga > first_abs)
+            k_qsa_wmma<true><<<dim3(ga - first_abs, 2), 256, 0, g_str>>>(
+                d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel,
+                first_abs, base);
+          if (base + P > ge)
+            k_qsa_wmma<true><<<dim3(base + P - ge, 2), 256, 0, g_str>>>(
+                d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel, ge,
+                base);
+        }
+        else if (qsa_wmma6 && vc_transposed)
           k_qsa_wmma6<<<dim3(nsparse, 2), 128, 0, g_str>>>(
               d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel,
               first_abs, base);

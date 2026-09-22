@@ -1410,6 +1410,411 @@ __global__ void __launch_bounds__(128)
     }
 }
 
+// --- GDEC_QSA_UNION: 4-query 块并集 WMMA 稀疏 prefill attention ---------------
+// 移植自 llama.cpp-strix-halo qsa.cu 的 qsa3 rows/merge/attn（同模型、同 GPU
+// 验证过），适配引擎数据布局。4 个连续（4 对齐）稀疏 token 的 top-512 块列表
+// 由 k_qsa_union_merge 合成并集（实测重叠 ~2/3，K/V gather 量约 ÷3），
+// k_qsa_wmma_u 一个 block 处理 1 组 × 1 个 KV 头：48 个 Q 行（4 token x 12 头
+// = 3 个 16 行 WMMA tile）共享同一条 K/V 流。
+// 与参考的差异：
+//  - bf16（参考是 f16），fragment 布局以 k_qsa_wmma 注释的本机实测为准
+//    （参考的 key 交错/掩码映射与该布局自洽，照搬）；
+//  - K 走行主序 bf16 cache 按键 gather（同 k_qsa_wmma），V 走 vct 转置
+//    cache（[block][kvh][dim][slot]，与参考 packed pv 同构）；不上 packed K；
+//  - 引擎选择列表是块粒度且升序、无无效项（稀疏 token n>512），merge 直接
+//    4 路归并块号，整块快路径退化为常数；省掉参考的 rows 排序 kernel；
+//  - 参考的尾部 key 由 mask 张量表达；引擎的 dense 尾部 = 组内自身块的
+//    slot 0..qi（qi<3），attn 内对自身块做因果覆盖（slot cc 对 query qi<3
+//    可见 iff cc <= qi；qi=3 无尾部，仅靠 mask），零额外 K/V 流量；自身块
+//    若未被 token g+3 选中则由 merge 补登（mask=0，只剩因果覆盖生效，
+//    语义与逐 token 路径一致）。
+//  - scale 在跨 warp 归约后乘（1/16，与 k_qsa_wmma 一致），softmax 用 __expf。
+#define QSA_UCAP 2052  // 每组并集容量（块）：4x512 + 自身块补登，pad 到 4 倍数
+
+// 4 条升序 top-512 块号列表 -> 并集 + 每 query 有效性掩码（整块 0xF）。
+// 128 lanes：lane 负责块号子区间（row0 分位数划分，真实负载均衡）；两遍归并
+// （pass1 计数 + Hillis-Steele 前缀和，pass2 写出），pad 0xFFFF。
+__global__ void __launch_bounds__(128)
+    k_qsa_union_merge(const int* __restrict__ sel, int g0,
+                      uint16_t* __restrict__ ublk, uint16_t* __restrict__ umask,
+                      int* __restrict__ ucount, int cap) {
+  __shared__ int rows_s[4][512];
+  __shared__ int scan_s[128];
+  const int lane = threadIdx.x, g = blockIdx.x;
+  const int t0 = g0 + 4 * g;  // 组首 token（绝对，4 对齐）
+#pragma unroll
+  for (int qi = 0; qi < 4; ++qi) {
+    const int* src = sel + (size_t)(t0 + qi) * 512;
+    for (int j = lane; j < 512; j += 128) rows_s[qi][j] = src[j];
+  }
+  __syncthreads();
+  const int own = t0 >> 2;
+  int kmax = rows_s[0][511];
+#pragma unroll
+  for (int qi = 1; qi < 4; ++qi) kmax = max(kmax, rows_s[qi][511]);
+  // lane 的块号子区间 [lo, hi)：row0 的分位数
+  const int lo = lane == 0 ? 0 : rows_s[0][4 * lane];
+  const int hi = lane == 127 ? kmax + 1 : rows_s[0][4 * (lane + 1)];
+  int p[4], pe[4];
+#pragma unroll
+  for (int qi = 0; qi < 4; ++qi) {
+    int a = 0, b = 512;
+    while (a < b) {
+      const int mid = (a + b) >> 1;
+      if (rows_s[qi][mid] < lo) a = mid + 1; else b = mid;
+    }
+    p[qi] = a;
+    b = 512;
+    while (a < b) {
+      const int mid = (a + b) >> 1;
+      if (rows_s[qi][mid] < hi) a = mid + 1; else b = mid;
+    }
+    pe[qi] = a;
+  }
+  // pass 1：计数（p[] 保留给 pass 2）
+  int n = 0;
+  {
+    int pp[4], head[4];
+#pragma unroll
+    for (int qi = 0; qi < 4; ++qi) {
+      pp[qi] = p[qi];
+      head[qi] = pp[qi] < pe[qi] ? rows_s[qi][pp[qi]] : 0x7FFFFFFF;
+    }
+    while (true) {
+      int bmin = 0x7FFFFFFF;
+#pragma unroll
+      for (int qi = 0; qi < 4; ++qi) bmin = min(bmin, head[qi]);
+      if (bmin == 0x7FFFFFFF) break;
+#pragma unroll
+      for (int qi = 0; qi < 4; ++qi)
+        if (head[qi] == bmin) {
+          ++pp[qi];
+          head[qi] = pp[qi] < pe[qi] ? rows_s[qi][pp[qi]] : 0x7FFFFFFF;
+        }
+      ++n;
+    }
+  }
+  scan_s[lane] = n;
+  __syncthreads();
+#pragma unroll
+  for (int off = 1; off < 128; off <<= 1) {
+    const int v = lane >= off ? scan_s[lane - off] : 0;
+    __syncthreads();
+    scan_s[lane] += v;
+    __syncthreads();
+  }
+  const int total = scan_s[127];
+  int o = scan_s[lane] - n;
+  uint16_t* ob = ublk + (size_t)g * cap;
+  uint16_t* om = umask + (size_t)g * cap;
+  // pass 2：写出（整块 -> 该 query 4 slot 全置）
+  {
+    int head[4];
+#pragma unroll
+    for (int qi = 0; qi < 4; ++qi)
+      head[qi] = p[qi] < pe[qi] ? rows_s[qi][p[qi]] : 0x7FFFFFFF;
+    while (true) {
+      int bmin = 0x7FFFFFFF;
+#pragma unroll
+      for (int qi = 0; qi < 4; ++qi) bmin = min(bmin, head[qi]);
+      if (bmin == 0x7FFFFFFF) break;
+      uint32_t mk = 0;
+#pragma unroll
+      for (int qi = 0; qi < 4; ++qi)
+        if (head[qi] == bmin) {
+          mk |= 0xFu << (4 * qi);
+          ++p[qi];
+          head[qi] = p[qi] < pe[qi] ? rows_s[qi][p[qi]] : 0x7FFFFFFF;
+        }
+      ob[o] = (uint16_t)bmin;
+      om[o] = (uint16_t)mk;
+      ++o;
+    }
+  }
+  if (lane == 127) {
+    int t = total;
+    // 防御：自身块必须落在并集里（qi<3 的 dense 尾部挂在它的 slot 上）。
+    // 正常总被 token g+3 选中（row3 末位即 own）；万一缺失则补登，
+    // mask=0：qi=3 不可见它（与逐 token 路径一致），qi<3 靠因果覆盖。
+    if (rows_s[3][511] != own) {
+      ob[t] = (uint16_t)own;
+      om[t] = 0;
+      ++t;
+    }
+    while (t & 3) {
+      ob[t] = 0xFFFFu;
+      om[t] = 0;
+      ++t;
+    }
+    ucount[g] = t;
+  }
+}
+
+// 并集 attention：grid (ngroups, 2)，256 线程 = 8 warp。结构同参考
+// qsa3_attn_kernel：warp w 持有全部 48 行的 [32w,+32) 维 Q 切片（寄存器常驻
+// bf16 A... 实为 B 操作数：wmma(K, Q) 得 Sᵀ），QK 跨 warp 经 part[] LDS 归约；
+// warp 0..2 是 owner（行 16w+r），负责 online softmax 并把 P 量化 bf16 经
+// ptile LDS 回转成 PV 的 B 操作数；PV 的 A = V（vct 转置 cache，4 slot 一次
+// 64-bit 读），C 的行是 perm 后的维度、列是 Q 行。每 chunk 恰 2 次
+// __syncthreads()，K 描述符与 fragment 软件流水预取。
+__global__ void __launch_bounds__(256)
+    k_qsa_wmma_u(const float* __restrict__ q, const uint16_t* __restrict__ kc,
+                 const uint16_t* __restrict__ vct, float* __restrict__ out,
+                 int dh, int hkv, int hq,
+                 const uint16_t* __restrict__ ublk,
+                 const uint16_t* __restrict__ umask,
+                 const int* __restrict__ ucount, int cap, int g0, int kbase) {
+  const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, r = lane & 15,
+            hi = lane >> 4;
+  const int g = blockIdx.x, kvh = blockIdx.y;
+  __shared__ float4 part[3][8][64];
+  __shared__ uint4 ptile[3][32];
+  __shared__ float alpha_s[48];
+  __shared__ float l_s[48];
+  const uint16_t* gblk = ublk + (size_t)g * cap;
+  const uint16_t* gmsk = umask + (size_t)g * cap;
+  const int nchunks = ucount[g] >> 2;
+  const int own_blk = (g0 >> 2) + g;
+  const int tok0 = g0 + 4 * g - kbase;  // 组首 token 的 batch 行
+  const int hqk = hq / hkv;             // 12
+
+  // Q stage：warp w 负责全部 48 行的 [32w,+32) 维切片（fp32 -> bf16 RNE）
+  uint16_t* stage = reinterpret_cast<uint16_t*>(&part[0][0][0]) + w * (48 * 32);
+#pragma unroll
+  for (int c = 0; c < 12; ++c) {
+    const int row = 4 * c + (lane >> 3), dq = 4 * (lane & 7);
+    const int qi = row / 12, h = row - 12 * qi;
+    const float4 v = *(const float4*)(q + ((size_t)(tok0 + qi) * hq +
+                                           kvh * hqk + h) * dh + 32 * w + dq);
+    uint2 pk;
+    pk.x = pack_bf2(v.x, v.y);
+    pk.y = pack_bf2(v.z, v.w);
+    *(uint2*)(stage + row * 32 + dq) = pk;
+  }
+  __syncthreads();
+  qw_shortx16 qf[3][2];
+#pragma unroll
+  for (int i = 0; i < 3; ++i)
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
+      qf[i][t] = qw_ld16(stage + (16 * i + r) * 32 + 16 * t);
+  __syncthreads();
+
+  qw_floatx8 O[3][2];
+#pragma unroll
+  for (int i = 0; i < 3; ++i)
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
+#pragma unroll
+      for (int e = 0; e < 8; ++e) O[i][t][e] = 0.f;
+  float m = -1e30f, l = 0.f;  // owner 状态（w<3）：行 16w+r
+  const int own_qi = (16 * w + r) / 12;
+
+  auto load_desc = [&](const int c, uint32_t& b01, uint32_t& b23, uint32_t& m01,
+                       uint32_t& m23) {
+    const uint2 bb = *(const uint2*)(gblk + 4 * c);
+    const uint2 mm = *(const uint2*)(gmsk + 4 * c);
+    b01 = bb.x; b23 = bb.y; m01 = mm.x; m23 = mm.y;
+  };
+  auto blk_of = [&](const uint32_t b01, const uint32_t b23, const int j) -> int {
+    const uint32_t v = (j < 2 ? b01 : b23) >> (16 * (j & 1)) & 0xFFFFu;
+    return v == 0xFFFFu ? 0 : (int)v;
+  };
+  // K：行主序 bf16 cache 按键 gather；lane r 持有 chunk 内第 r 个 key 的
+  // [32w,+32) 维（硬件 A 布局实际取 lane 2r/17+2(r-8) -> key 交错
+  // 0,2,4,...,14,1,3,...,15，掩码侧按同一 perm 映射）。
+  auto load_k = [&](const uint32_t b01, const uint32_t b23, qw_shortx16* kf) {
+    const int src = 4 * blk_of(b01, b23, r >> 2) + (r & 3);
+    const uint16_t* krow = kc + ((size_t)src * hkv + kvh) * dh + w * 32;
+#pragma unroll
+    for (int t = 0; t < 2; ++t) kf[t] = qw_ld16(krow + 16 * t);
+  };
+
+  uint32_t b01 = 0, b23 = 0, m01 = 0, m23 = 0;
+  qw_shortx16 kf[2];
+  if (nchunks > 0) {
+    load_desc(0, b01, b23, m01, m23);
+    load_k(b01, b23, kf);
+  }
+
+#pragma unroll 1
+  for (int c = 0; c < nchunks; ++c) {
+    qw_floatx8 sc[3];
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+#pragma unroll
+      for (int e = 0; e < 8; ++e) sc[i][e] = 0.f;
+#pragma unroll
+      for (int t = 0; t < 2; ++t)
+        sc[i] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(kf[t], qf[i][t], sc[i]);
+    }
+    // V：vct 转置 cache，lane r 持有维 32w+16t+r 的 4 块 x 4 slot（16 key）
+    qw_shortx16 vf[2];
+    {
+      const uint16_t* vb[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        vb[j] = vct + (((size_t)blk_of(b01, b23, j) * hkv + kvh) * dh) * 4;
+#pragma unroll
+      for (int t = 0; t < 2; ++t) {
+        const int d = 32 * w + 16 * t + r;
+        uint2 pk[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) pk[j] = *(const uint2*)(vb[j] + d * 4);
+        short tmp[16];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          tmp[4 * j + 0] = (short)(pk[j].x & 0xFFFFu);
+          tmp[4 * j + 1] = (short)(pk[j].x >> 16);
+          tmp[4 * j + 2] = (short)(pk[j].y & 0xFFFFu);
+          tmp[4 * j + 3] = (short)(pk[j].y >> 16);
+        }
+        memcpy(&vf[t], tmp, 32);
+      }
+    }
+    // 预取下一 chunk 的描述符与 K fragment
+    uint32_t nb01 = 0, nb23 = 0, nm01 = 0, nm23 = 0;
+    qw_shortx16 kfn[2];
+    if (c + 1 < nchunks) {
+      load_desc(c + 1, nb01, nb23, nm01, nm23);
+      load_k(nb01, nb23, kfn);
+    } else {
+      kfn[0] = kf[0];
+      kfn[1] = kf[1];
+    }
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+      if (i != w) {
+        part[i][w][lane * 2 + 0] = make_float4(sc[i][0], sc[i][1], sc[i][2], sc[i][3]);
+        part[i][w][lane * 2 + 1] = make_float4(sc[i][4], sc[i][5], sc[i][6], sc[i][7]);
+      }
+    }
+    __syncthreads();
+    if (w < 3) {
+      // owner：归约 8 个 warp 的 32 维 partial -> 全 256 维 Sᵀ，再 softmax
+      float scf[8];
+#pragma unroll
+      for (int e = 0; e < 8; ++e) scf[e] = 0.f;
+#pragma unroll
+      for (int w2 = 0; w2 < 8; ++w2) {
+        if (w2 == w) {
+#pragma unroll
+          for (int e = 0; e < 8; ++e) scf[e] += sc[w][e];
+        } else {
+          const float4 a = part[w][w2][lane * 2 + 0], b = part[w][w2][lane * 2 + 1];
+          scf[0] += a.x; scf[1] += a.y; scf[2] += a.z; scf[3] += a.w;
+          scf[4] += b.x; scf[5] += b.y; scf[6] += b.z; scf[7] += b.w;
+        }
+      }
+      // 有效性 + 自身块因果覆盖（elem e -> 块 j=e>>1、slot cc=2*(e&1)+hi，
+      // 与硬件 A 布局的 key 交错一致）
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        scf[e] *= 0.0625f;  // 1/sqrt(256)
+        const int j = e >> 1, cc = 2 * (e & 1) + hi;
+        const uint32_t mk = ((j < 2 ? m01 : m23) >> (16 * (j & 1))) & 0xFFFFu;
+        bool kv = (mk >> (own_qi * 4 + cc)) & 1u;
+        // 自身块因果覆盖：qi<3 的 dense 尾部 = 自身块 slot 0..qi（恒可见）；
+        // qi=3 无尾部，自身块仅在真被选中（mask 0xF000）时可见
+        if (own_qi < 3 && blk_of(b01, b23, j) == own_blk && cc <= own_qi)
+          kv = true;
+        if (!kv) scf[e] = -1e30f;
+      }
+      float mloc = scf[0];
+#pragma unroll
+      for (int e = 1; e < 8; ++e) mloc = fmaxf(mloc, scf[e]);
+      mloc = fmaxf(mloc, __shfl_xor_sync(~0ull, mloc, 16));
+      const float mnew = fmaxf(m, mloc);
+      const float alpha = __expf(m - mnew);  // 全掩码 chunk：m==mnew -> 1
+      float p[8], ls = 0.f;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        p[e] = scf[e] <= -1e29f ? 0.f : __expf(scf[e] - mnew);
+        ls += p[e];
+      }
+      ls += __shfl_xor_sync(~0ull, ls, 16);
+      l = l * alpha + ls;
+      m = mnew;
+      // P 量化 bf16 并按自然 key 序摆进 ptile（WMMA C 布局回不去 A，LDS 回转）
+      uint32_t pp[4], po[4];
+#pragma unroll
+      for (int e2 = 0; e2 < 4; ++e2) {
+        pp[e2] = (uint32_t)f2bf(p[2 * e2]) | ((uint32_t)f2bf(p[2 * e2 + 1]) << 16);
+        po[e2] = (uint32_t)__shfl_xor_sync(~0ull, (int)pp[e2], 16);
+      }
+      uint16_t ph[16];
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const uint16_t mine = (e & 1) ? (uint16_t)(pp[e >> 1] >> 16)
+                                      : (uint16_t)(pp[e >> 1] & 0xffffu);
+        const uint16_t other = (e & 1) ? (uint16_t)(po[e >> 1] >> 16)
+                                       : (uint16_t)(po[e >> 1] & 0xffffu);
+        ph[2 * e] = hi ? other : mine;
+        ph[2 * e + 1] = hi ? mine : other;
+      }
+      if (hi == 0) {
+        ptile[w][r * 2 + 0] = make_uint4(
+            (uint32_t)ph[0] | ((uint32_t)ph[1] << 16),
+            (uint32_t)ph[2] | ((uint32_t)ph[3] << 16),
+            (uint32_t)ph[4] | ((uint32_t)ph[5] << 16),
+            (uint32_t)ph[6] | ((uint32_t)ph[7] << 16));
+        ptile[w][r * 2 + 1] = make_uint4(
+            (uint32_t)ph[8] | ((uint32_t)ph[9] << 16),
+            (uint32_t)ph[10] | ((uint32_t)ph[11] << 16),
+            (uint32_t)ph[12] | ((uint32_t)ph[13] << 16),
+            (uint32_t)ph[14] | ((uint32_t)ph[15] << 16));
+        alpha_s[16 * w + r] = alpha;
+      }
+    }
+    __syncthreads();
+    float al[3];
+#pragma unroll
+    for (int i = 0; i < 3; ++i) al[i] = alpha_s[16 * i + r];
+    if (__ballot_sync(~0ull, al[0] != 1.f || al[1] != 1.f || al[2] != 1.f)) {
+#pragma unroll
+      for (int i = 0; i < 3; ++i)
+#pragma unroll
+        for (int t = 0; t < 2; ++t)
+#pragma unroll
+          for (int e = 0; e < 8; ++e) O[i][t][e] *= al[i];
+    }
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+      const qw_shortx16 pf = qw_ld16((const uint16_t*)&ptile[i][0] + r * 16);
+#pragma unroll
+      for (int t = 0; t < 2; ++t)
+        O[i][t] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(vf[t], pf, O[i][t]);
+    }
+    kf[0] = kfn[0];
+    kf[1] = kfn[1];
+    b01 = nb01; b23 = nb23; m01 = nm01; m23 = nm23;
+  }
+
+  if (w < 3 && hi == 0) l_s[16 * w + r] = l;
+  __syncthreads();
+  // 输出：每 tile 先经 LDS 摆成 [16 行 x 32 维] fp32，再 float4 合并写全局
+  float* ostage = reinterpret_cast<float*>(&part[0][0][0]) + w * (16 * 32);
+#pragma unroll
+  for (int i = 0; i < 3; ++i) {
+    const float li = l_s[16 * i + r];
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
+#pragma unroll
+      for (int e = 0; e < 8; ++e)
+        ostage[r * 32 + 16 * t + 2 * e + hi] = li > 0.f ? O[i][t][e] / li : 0.f;
+    __syncthreads();
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      const int rr = 4 * c + (lane >> 3), dq = 4 * (lane & 7);
+      const int row = 16 * i + rr, qi = row / 12, h = row - 12 * qi;
+      float* dst = out + ((size_t)(tok0 + qi) * hq + kvh * hqk + h) * dh +
+                   32 * w + dq;
+      *(float4*)dst = *(const float4*)(ostage + rr * 32 + dq);
+    }
+    __syncthreads();
+  }
+}
+
 // forward decls (defined below main model code)
 template <bool Rope = false>
 __global__ void k_qsa_qsplit(const float* __restrict__ qg, const float* __restrict__ qnw,
