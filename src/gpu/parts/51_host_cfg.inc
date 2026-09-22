@@ -106,29 +106,19 @@ static void save(GpuModel& m, const std::vector<int>& toks, const Cfg& cfg) {
                ik_b = (size_t)nqsa * ik_blocks(ntok) * 128 * 4,
                kvl_b = (size_t)ntok * 512 * kvb;
   size_t stage_b = std::max({s_b, ik_b, kvl_b});
-  // Persistent pinned staging: a fresh 100+MB malloc per save is mmap/munmap
-  // churn with first-touch faults stalling for seconds, and unpinned D2H only
-  // reaches ~170 MB/s on gfx1151 (1 GiB state = 6+ s on the request path).
-  // Pinned host memory makes the D2H a plain DRAM copy on unified memory.
-  // Grow-only, so the steady state faults nothing; malloc fallback if the
-  // pinned allocation fails.
+  // Persistent staging: a fresh 100+MB malloc per save is mmap/munmap churn,
+  // and the first-touch page faults can stall for seconds (observed up to
+  // 148s D2H) when the system is under memory pressure. Grow-only, so the
+  // steady state faults nothing.
+  // NOTE: do NOT pin this buffer — hipHostMalloc'd memory makes hipMemcpy D2H
+  // collapse to ~7 MB/s on gfx1151 (measured 160 s for 1 GiB vs ~6 s
+  // unpinned); the unified-memory GPU write path hates pinned mappings.
   static void* st = nullptr;
   static size_t st_b = 0;
-  static bool st_pinned = false;
   if (st_b < stage_b) {
-    if (st) {
-      if (st_pinned) (void)hipHostFree(st);
-      else free(st);
-    }
-    st = nullptr;
-    st_b = 0;
-    if (hipHostMalloc(&st, stage_b, hipHostMallocDefault) == hipSuccess) {
-      st_pinned = true;
-      st_b = stage_b;
-    } else if ((st = malloc(stage_b))) {
-      st_pinned = false;
-      st_b = stage_b;
-    }
+    free(st);
+    st = malloc(stage_b);
+    st_b = st ? stage_b : 0;
   }
   if (!st) return;
   // one blob file per device state region; any short write aborts the save
