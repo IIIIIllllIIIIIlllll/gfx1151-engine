@@ -98,6 +98,18 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
                BP = (size_t)(eff_maxbatch(maxctx) + eff_tail_slack());
   const size_t ngdn = g_cfg.layers - g_cfg.layers / 4, nqsa = g_cfg.layers / 4;
   const size_t ib = (mc + 3) / 4, rb = (size_t)g_cfg.branches * g_cfg.d;
+  // GDEC_KV_PAGED：KV/ik（BF16 时含 d_vcbt）按整页（256 token）取整，另加页表与
+  // ik gather 缓冲。BF16 KV 的可分页条件与构造函数一致（A1c）
+  const char* kvpe = getenv("GDEC_KV_PAGED");
+  const bool kv_bf16_pg_ok =
+      qsa_dense || (getenv("GDEC_QSA_WMMA") && !(btv && getenv("GDEC_QSA_WMMA6")) &&
+                    !(btv && getenv("GDEC_QSA_UNION")));
+  const bool kv_paged = (kv_fp32 || kv_bf16_pg_ok) && kvpe && atoi(kvpe) != 0;
+  const size_t kvpg = (mc + KV_PAGE - 1) / KV_PAGE;
+  // A2：物理页池 = kvpg 页 + 1 个 guard 页；页表仍是每序列 kvpg 项
+  const size_t kv_rows = kv_paged ? (kvpg + 1) * KV_PAGE : mc;
+  const size_t ik_rows = kv_paged ? (kvpg + 1) * KV_PAGE_BLOCKS : ib;
+  if (kv_paged) add(kvpg * 4);  // d_ptab
   add((size_t)64 << 20);  // decode 单行小缓冲合计（d_R..d_logits 等）
   add(ngdn * 48 * 128 * 128 * 4);           // d_S
   add(ngdn * 3 * 10240 * 4);                // d_convst
@@ -113,20 +125,22 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   add((size_t)64 << 20);                    // d_wbf16
   add((size_t)64 << 20);                    // d_ltws
   if (!qsa_dense) {
-    add(mc * 640 * 4);                      // d_iproj
-    add(mc * 512 * 4);                      // d_iq
-    add(nqsa * ib * 128 * 4);               // d_ik
+    const size_t bc = std::min(mc, BP);     // maxbatch_cap（A1b：按 chunk 定尺寸）
+    add(bc * 640 * 4);                      // d_iproj
+    add(bc * 512 * 4);                      // d_iq
+    add(nqsa * ik_rows * 128 * 4);          // d_ik
+    if (kv_paged) add(ib * 128 * 4);        // d_ikg
     add(nqsa * 4 * 128 * 4);                // d_iraw
     add(nqsa * 256 * 4);                    // d_inorm
     if (index_f32) add(nqsa * 640 * 2560 * 4);  // d_iw
     add((size_t)std::min(mc, (size_t)INDEX_BATCH) * 4 * ib * 4);  // d_iscores
-    add(mc * INDEX_BUDGET * 4);             // d_iselected
+    add(bc * INDEX_BUDGET * 4);             // d_iselected
   }
   if (kv_fp32) {
-    add(2 * nqsa * mc * 512 * 4);           // d_kc + d_vc
+    add(2 * nqsa * kv_rows * 512 * 4);      // d_kc + d_vc
   } else {
-    add(2 * nqsa * mc * 512 * 2);           // d_kcb + d_vcb
-    if (btv) add(nqsa * ib * 2 * 256 * 4 * 2);  // d_vcbt
+    add(2 * nqsa * kv_rows * 512 * 2);      // d_kcb + d_vcb
+    if (btv) add(nqsa * ((kv_rows + 3) / 4) * 2 * 256 * 4 * 2);  // d_vcbt
     // GDEC_QSA_UNION: d_ublk + d_umask + d_ucount（按单 chunk 组数）
     if (btv && getenv("GDEC_QSA_UNION")) {
       const size_t ng = (size_t)BP / 4 + 1;

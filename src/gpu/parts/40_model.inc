@@ -45,6 +45,30 @@ struct GpuModel {
   bool index_stream_select = getenv("GDEC_INDEX_STREAM_SELECT") != nullptr;
   int* d_iselected = nullptr;
   int index_blocks = 0;
+  // Paged QSA KV (memory model Phase A1). The trunk FP32 KV cache (d_kc/d_vc)
+  // and indexer keys (d_ik) are addressed through a logical->physical page
+  // table (KV_PAGE = 256 tokens = 64 indexer blocks; one table shared by all
+  // QSA layers). GDEC_KV_PAGED=1: identity table, =2: reversed table
+  // (self-test: output must stay bitwise identical to unpaged). Unset/0: legacy
+  // addressing (ptab == nullptr in every kernel). A1c: the BF16 cache
+  // (d_kcb/d_vcb and the transposed d_vcbt) is paged too when the sparse
+  // prefill kernel is k_qsa_wmma (no WMMA6/UNION). The MTP KV
+  // (d_mkcf/d_mvcf/d_mik) stays contiguous.
+  // A2: pages are allocated on demand from a pool (KvPagePool, 10_ple_io.inc)
+  // as the live sequence grows (kv_reserve) and returned when it shrinks or
+  // resets (kv_trim). GDEC_KV_PAGED=1: lowest-free-first allocation, =2:
+  // scrambled order + FIFO reuse (self-test). Physical page kv_pool.guard()
+  // backs every unmapped logical page.
+  bool kv_paged = false;
+  int kv_lpages = 0;            // logical pages per sequence = ceil(maxctx / 256)
+  int kv_pool_pages = 0;        // allocatable physical pages (A2: == kv_lpages)
+  size_t kv_layer_rows = 0;     // per-layer KV row stride (== maxctx unpaged)
+  size_t ik_layer_blocks = 0;   // per-layer d_ik block stride (== index_blocks unpaged)
+  int* d_ptab = nullptr;        // [kv_lpages] live logical page -> physical page
+  KvPagePool kv_pool;
+  KvSeqTable kv_seq;            // live sequence; kv_seq.tab is d_ptab's host mirror
+  float* d_ikg = nullptr;       // [index_blocks][128] gathered keys (paged prefill)
+  const int* kvpt() const { return kv_paged ? d_ptab : nullptr; }
   bool qsa_dense = getenv("GDEC_QSA_DENSE") != nullptr;
   // BF16 KV cache: measured parity at 32K (QSA is latency-bound, not DRAM-bound)
   // and flips the 8192 oracle -> opt-in experiment, default stays FP32.
@@ -66,6 +90,10 @@ struct GpuModel {
   uint16_t* d_umask = nullptr; // [ngroups][QSA_UCAP] 4 query x 4 slot 掩码
   int* d_ucount = nullptr;     // [ngroups] 并集块数（含 pad，4 的倍数）
   size_t qsa_vt_blocks = 0;
+  // Per-QSA-layer base of the transposed V cache (nullptr unless BTV).
+  uint16_t* vct_layer(int qi) const {
+    return qsa_wmma_btv ? d_vcbt + (size_t)qi * qsa_vt_blocks * 2 * 256 * 4 : nullptr;
+  }
   bool prefill_fused = getenv("GDEC_PREFILL_UNFUSED") == nullptr;
   bool gr_bf16 = getenv("GDEC_GR_BF16") != nullptr && prefill_fused;
   bool gr_scatter_norm = getenv("GDEC_GR_SCATTER_NORM") != nullptr || gr_bf16;
@@ -286,26 +314,69 @@ struct GpuModel {
     DALLOC(&d_dtbias, (size_t)ngdn * 48 * 4);
     DALLOC(&d_gdnnorm, (size_t)ngdn * 128 * 4);
     int nqsa = g_cfg.layers / 4;  // 12
+    {
+      const char* pe = getenv("GDEC_KV_PAGED");
+      int mode = pe ? atoi(pe) : 0;
+      // A1c: the BF16 cache is paged on the k_qsa_flash (dense / decode) and
+      // k_qsa_wmma<*, true> (sparse prefill, with or without BTV) kernels.
+      // The union / wmma6 / k_qsa_flash_bf16 sparse kernels are not paged.
+      const bool bf16_ok = qsa_dense || (qsa_wmma && !qsa_wmma6 && !qsa_union);
+      if (mode && !qsa_kv_fp32 && !bf16_ok) {
+        fprintf(stderr, "[kvpage] GDEC_KV_PAGED ignored: with GDEC_QSA_KV_BF16, "
+                        "paging needs GDEC_QSA_WMMA (with or without _BTV) and no "
+                        "GDEC_QSA_WMMA6 / GDEC_QSA_UNION\n");
+        mode = 0;
+      }
+      kv_paged = mode != 0;
+      kv_lpages = (maxctx + KV_PAGE - 1) / KV_PAGE;
+      // A2: the pool holds exactly one full-length sequence (A3 adds shared
+      // checkpoint pages and a configurable pool); +1 physical guard page.
+      kv_pool_pages = kv_lpages;
+      kv_layer_rows =
+          kv_paged ? (size_t)(kv_pool_pages + 1) * KV_PAGE : (size_t)maxctx;
+      if (kv_paged) {
+        kv_pool.init(kv_pool_pages, mode == 2 ? 2 : 1);
+        kv_seq.init(kv_lpages, kv_pool.guard());
+        DALLOC(&d_ptab, (size_t)kv_lpages * 4);
+        CK(hipMemcpy(d_ptab, kv_seq.tab.data(), (size_t)kv_lpages * 4,
+                     hipMemcpyHostToDevice));
+        fprintf(stderr,
+                "[kvpage] paged QSA KV on: %d pages x %d tokens (+1 guard), "
+                "on-demand alloc=%s, kv=%s\n",
+                kv_pool_pages, KV_PAGE,
+                mode == 2 ? "scrambled+fifo(self-test)" : "lowest-first",
+                qsa_kv_fp32 ? "fp32" : (qsa_wmma_btv ? "bf16+btv" : "bf16"));
+      }
+    }
     if (!qsa_dense) {
       index_blocks = (maxctx + 3) / 4;
-      DALLOC(&d_iproj, (size_t)maxctx * 640 * 4);
-      DALLOC(&d_iq, (size_t)maxctx * 512 * 4);
-      DALLOC(&d_ik, (size_t)nqsa * index_blocks * 128 * 4);
+      ik_layer_blocks = kv_paged ? (size_t)(kv_pool_pages + 1) * KV_PAGE_BLOCKS
+                                 : (size_t)index_blocks;
+      // A1b: per-query indexer buffers are batch-local (row = abs - base), so
+      // they are sized by one prefill chunk (maxbatch_cap), not by maxctx.
+      // At 256K ctx / 16K chunk this is ~1.6 GB less. d_ik (per-block keys
+      // of the whole history) stays maxctx-sized.
+      DALLOC(&d_iproj, (size_t)maxbatch_cap * 640 * 4);
+      DALLOC(&d_iq, (size_t)maxbatch_cap * 512 * 4);
+      DALLOC(&d_ik, (size_t)nqsa * ik_layer_blocks * 128 * 4);
+      if (kv_paged) DALLOC(&d_ikg, (size_t)index_blocks * 128 * 4);
       DALLOC(&d_iraw, (size_t)nqsa * 4 * 128 * 4);
       CK(hipMemset(d_iraw, 0, (size_t)nqsa * 4 * 128 * 4));
       DALLOC(&d_inorm, (size_t)nqsa * 256 * 4);
       if (index_f32) DALLOC(&d_iw, (size_t)nqsa * 640 * 2560 * 4);
       DALLOC(&d_iscores, (size_t)std::min(maxctx, INDEX_BATCH) * 4 * index_blocks * 4);
-      DALLOC(&d_iselected, (size_t)maxctx * INDEX_BUDGET * 4);
+      DALLOC(&d_iselected, (size_t)maxbatch_cap * INDEX_BUDGET * 4);
     }
     if (qsa_kv_fp32) {
-      DALLOC(&d_kc, (size_t)nqsa * maxctx * 512 * 4);
-      DALLOC(&d_vc, (size_t)nqsa * maxctx * 512 * 4);
+      DALLOC(&d_kc, (size_t)nqsa * kv_layer_rows * 512 * 4);
+      DALLOC(&d_vc, (size_t)nqsa * kv_layer_rows * 512 * 4);
     } else {
-      DALLOC(&d_kcb, (size_t)nqsa * maxctx * 512 * 2);
-      DALLOC(&d_vcb, (size_t)nqsa * maxctx * 512 * 2);
+      DALLOC(&d_kcb, (size_t)nqsa * kv_layer_rows * 512 * 2);
+      DALLOC(&d_vcb, (size_t)nqsa * kv_layer_rows * 512 * 2);
       if (qsa_wmma_btv) {
-        qsa_vt_blocks = (size_t)(maxctx + 3) / 4;
+        // paged: kv_layer_rows = (pool + 1) * 256 -> (pool + 1) * 64 blocks,
+        // and physical page p owns physical blocks [p*64, p*64+64)
+        qsa_vt_blocks = (kv_layer_rows + 3) / 4;
         DALLOC(&d_vcbt, (size_t)nqsa * qsa_vt_blocks * 2 * 256 * 4 * 2);
       }
       if (qsa_union) {
@@ -316,6 +387,8 @@ struct GpuModel {
         DALLOC(&d_ucount, ng * 4);
       }
     }
+    if (kv_paged)  // A2: the guard page must read as finite data (zeros)
+      kv_guard_regions([&](void* p, size_t n) { CK(hipMemset(p, 0, n)); });
     DALLOC(&d_qg, 12288 * 4);
     DALLOC(&d_qs, 24 * 256 * 4);
     DALLOC(&d_gs, 24 * 256 * 4);
@@ -996,13 +1069,15 @@ struct GpuModel {
   // linearly with pos (rocprofv3: 55.8% of all decode kernel time), while the
   // flash split stays flat. GDEC_QSA_DENSE keeps k_qsa_step as a debug fallback.
   template <typename KVT>
-  void qsa_attn(const KVT* kc, const KVT* vc) {
+  void qsa_attn(const KVT* kc, const KVT* vc, const int* ptab = nullptr) {
     if (qsa_dense) {
-      k_qsa_step<KVT><<<24, 256, 0, g_str>>>(d_qs, kc, vc, d_attn, d_pos, 256, 2, 24);
+      k_qsa_step<KVT><<<24, 256, 0, g_str>>>(d_qs, kc, vc, d_attn, d_pos, 256, 2, 24,
+                                             nullptr, false, ptab);
       return;
     }
     k_qsa_flash<true, false, KVT, true><<<dim3(QSA_DEC_NSPLIT, 2), 128, 0, g_str>>>(
-        d_qs, kc, vc, d_attn, 1, 256, 2, 24, d_iselected, 0, d_pos, d_pacc, d_pml);
+        d_qs, kc, vc, d_attn, 1, 256, 2, 24, d_iselected, 0, d_pos, d_pacc, d_pml, 0,
+        ptab);
     k_qsa_flash_combine<<<dim3(12, 2), 64, 0, g_str>>>(d_pml, d_pacc, d_attn, 12,
                                                        256, d_pos);
   }
@@ -1012,16 +1087,17 @@ struct GpuModel {
     if (!qsa_dense) {
       snprintf(buf, sizeof buf, "layers.%d.self_attn.indexer.index_qk_proj.weight", l);
       gemv(wview(ckpt.at(buf)), x, d_iproj);
-      float* keys = d_ik + (size_t)qi * index_blocks * 128;
+      float* keys = d_ik + (size_t)qi * ik_layer_blocks * 128;
       k_index_q<<<dim3(1, 4), 128, 0, g_str>>>(d_iproj, d_inorm + qi * 256, d_iq,
                                               1, g_cfg.norm_eps, g_cfg.rope_theta, d_pos,
                                               0, nullptr, d_rdelta);
       k_index_append<<<1, 128, 0, g_str>>>(d_iproj, d_inorm + qi * 256 + 128,
                                            d_iraw + qi * 512, keys, d_pos,
                                            g_cfg.norm_eps, g_cfg.rope_theta,
-                                           d_rdelta);
+                                           d_rdelta, kvpt());
       k_index_scores<<<(index_blocks + 3) / 4, 128, 0, g_str>>>(d_iq, keys, d_iscores,
-                                                               index_blocks, d_pos);
+                                                               index_blocks, d_pos,
+                                                               kvpt());
       index_select(d_iscores, index_blocks, d_iselected, 0, 1, d_pos);
     }
     snprintf(buf, sizeof buf, "layers.%d.self_attn.q_proj.weight", l);
@@ -1044,15 +1120,18 @@ struct GpuModel {
                                                     g_cfg.rope_theta, d_rdelta);
     // append to cache at *d_pos
     if (qsa_kv_fp32) {
-      float* kc = d_kc + (size_t)qi * maxctx * 512;
-      float* vc = d_vc + (size_t)qi * maxctx * 512;
-      k_store_kv<<<2, 256, 0, g_str>>>(d_kb, d_vb, kc, vc, d_pos);
-      qsa_attn(kc, vc);
+      float* kc = d_kc + (size_t)qi * kv_layer_rows * 512;
+      float* vc = d_vc + (size_t)qi * kv_layer_rows * 512;
+      k_store_kv<<<2, 256, 0, g_str>>>(d_kb, d_vb, kc, vc, d_pos, kvpt());
+      qsa_attn(kc, vc, kvpt());
     } else {
-      uint16_t* kc = d_kcb + (size_t)qi * maxctx * 512;
-      uint16_t* vc = d_vcb + (size_t)qi * maxctx * 512;
-      k_store_kv_bf16<<<2, 256, 0, g_str>>>(d_kb, d_vb, kc, vc, d_pos);
-      qsa_attn(kc, vc);
+      uint16_t* kc = d_kcb + (size_t)qi * kv_layer_rows * 512;
+      uint16_t* vc = d_vcb + (size_t)qi * kv_layer_rows * 512;
+      // BTV: keep the transposed prefill V cache complete for decoded
+      // positions (read later by sparse prefill/verify via k_qsa_wmma<true>)
+      k_store_kv_bf16<<<2, 256, 0, g_str>>>(d_kb, d_vb, kc, vc, d_pos, vct_layer(qi),
+                                            kvpt());
+      qsa_attn(kc, vc, kvpt());
     }
     k_sigmoid_gate<<<(24 * 256 + 255) / 256, 256, 0, g_str>>>(d_attn, d_gs, d_attn, 24 * 256);
     snprintf(buf, sizeof buf, "layers.%d.self_attn.o_proj.weight", l);
@@ -1831,18 +1910,24 @@ struct GpuModel {
   // sparse queries are the absolute positions >= 2051 within the batch.
   template <typename KVT>
   void qsa_flash_b(const KVT* kc, const KVT* vc, int P, int dense_P, int base = 0,
-                   const uint16_t* vc_transposed = nullptr) {
+                   const uint16_t* vc_transposed = nullptr,
+                   const int* ptab = nullptr) {
+    // ptab (paged KV) is honoured by k_qsa_flash (all KV types) and, for the
+    // BF16 cache, by k_qsa_wmma<*, true> (A1c). The union / wmma6 /
+    // k_qsa_flash_bf16 paths are not paged: the constructor refuses paging
+    // for those configurations.
     if (dense_P > 0)
       k_qsa_flash<false, false, KVT><<<dim3((dense_P + 15) / 16, 24), 128, 0, g_str>>>(
           d_qsb, kc, vc, d_attnb, dense_P, 256, 2, 24, nullptr, 0, nullptr, nullptr,
-          nullptr, base);
+          nullptr, base, ptab);
     int first_abs = std::max(base, 2051), nsparse = base + P - first_abs;
     if (!qsa_dense && nsparse > 0) {
-      const int* sel = d_iselected + (size_t)first_abs * 512;
+      // d_iselected rows are batch-local (row = abs - base; A1b)
+      const int* sel = d_iselected + (size_t)(first_abs - base) * 512;
       if (qsa_global_v)
         k_qsa_flash<true, false, KVT><<<dim3(nsparse, 2), 128, 0, g_str>>>(
             d_qsb, kc, vc, d_attnb, P, 256, 2, 24, sel, first_abs, nullptr, nullptr,
-            nullptr, base);
+            nullptr, base, ptab);
       else if constexpr (sizeof(KVT) == 2) {
         if (qsa_union && vc_transposed) {
           // 并集路径：[ga, ge) 内的 4 对齐完整组走 merge + k_qsa_wmma_u，
@@ -1852,7 +1937,7 @@ struct GpuModel {
           if (ge - ga >= 4) {
             const int ngroups = (ge - ga) >> 2;
             k_qsa_union_merge<<<ngroups, 128, 0, g_str>>>(
-                d_iselected, ga, d_ublk, d_umask, d_ucount, QSA_UCAP);
+                d_iselected, ga, d_ublk, d_umask, d_ucount, QSA_UCAP, base);
             k_qsa_wmma_u<<<dim3(ngroups, 2), 256, 0, g_str>>>(
                 d_qsb, kc, vc_transposed, d_attnb, 256, 2, 24, d_ublk, d_umask,
                 d_ucount, QSA_UCAP, ga, base);
@@ -1870,15 +1955,25 @@ struct GpuModel {
           k_qsa_wmma6<<<dim3(nsparse, 2), 128, 0, g_str>>>(
               d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel,
               first_abs, base);
-        else if (qsa_wmma_btv && vc_transposed)
-          k_qsa_wmma<true><<<dim3(nsparse, 2), 256, 0, g_str>>>(
-              d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel, first_abs,
-              base);
-        else if (qsa_wmma)
+        else if (qsa_wmma_btv && vc_transposed) {
+          if (ptab)  // A1c paged instantiation (never taken unpaged)
+            k_qsa_wmma<true, true><<<dim3(nsparse, 2), 256, 0, g_str>>>(
+                d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel, first_abs,
+                base, ptab);
+          else
+            k_qsa_wmma<true><<<dim3(nsparse, 2), 256, 0, g_str>>>(
+                d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel, first_abs,
+                base);
+        } else if (qsa_wmma) {
           // GDEC_QSA_WMMA=1: WMMA bf16 sparse flash (256 thr), see k_qsa_wmma.
-          k_qsa_wmma<false><<<dim3(nsparse, 2), 256, 0, g_str>>>(
-              d_qsb, kc, vc, nullptr, d_attnb, P, 256, 2, 24, sel, first_abs, base);
-        else
+          if (ptab)
+            k_qsa_wmma<false, true><<<dim3(nsparse, 2), 256, 0, g_str>>>(
+                d_qsb, kc, vc, nullptr, d_attnb, P, 256, 2, 24, sel, first_abs, base,
+                ptab);
+          else
+            k_qsa_wmma<false><<<dim3(nsparse, 2), 256, 0, g_str>>>(
+                d_qsb, kc, vc, nullptr, d_attnb, P, 256, 2, 24, sel, first_abs, base);
+        } else
           // BF16 KV mode (!qsa_kv_fp32): bf16 LDS tiles + fdot2 (-61% at 32K).
           k_qsa_flash_bf16<KVT><<<dim3(nsparse, 2), 128, 0, g_str>>>(
               d_qsb, kc, vc, d_attnb, P, 256, 2, 24, sel, first_abs, base);
@@ -1886,8 +1981,126 @@ struct GpuModel {
       else
         k_qsa_flash<true, true, KVT><<<dim3(nsparse, 2), 128, 0, g_str>>>(
             d_qsb, kc, vc, d_attnb, P, 256, 2, 24, sel, first_abs, nullptr, nullptr,
-            nullptr, base);
+            nullptr, base, ptab);
     }
+  }
+
+  // Copy P rows (512 floats) for absolute positions [base, base+P) from a
+  // contiguous batch buffer into one layer of the FP32 KV cache. Unpaged: one
+  // bulk copy (legacy behaviour). Paged: one copy per physically contiguous
+  // run of pages (a single copy for the identity table).
+  void kv_rows_store(float* layer, const float* src, int base, int P) {
+    kv_runs(base, base + P, KV_PAGE, [&](int lr, size_t pr, int n) {
+      CK(hipMemcpyAsync(layer + pr * 512, src + (size_t)(lr - base) * 512,
+                        (size_t)n * 512 * 4, hipMemcpyDeviceToDevice, g_str));
+    });
+  }
+
+  // Visit logical rows [r0, r1) of one paged per-layer region as physically
+  // contiguous runs: fn(first_logical_row, first_physical_row, nrows).
+  // per_page = KV_PAGE for KV rows, KV_PAGE_BLOCKS for indexer key blocks.
+  // Unpaged: a single identity run. Paged: requires r1 <= mapped pages *
+  // per_page (A2: rows beyond the live mapping have no backing page).
+  template <typename F>
+  void kv_runs(int r0, int r1, int per_page, F&& fn) const {
+    if (r1 <= r0) return;
+    if (!kv_paged) {
+      fn(r0, (size_t)r0, r1 - r0);
+      return;
+    }
+    if ((size_t)r1 > (size_t)kv_seq.mapped * per_page) {
+      fprintf(stderr, "[kvpage] FATAL: kv_runs [%d, %d) x%d beyond the %d mapped pages\n",
+              r0, r1, per_page, kv_seq.mapped);
+      abort();
+    }
+    const std::vector<int>& h_ptab = kv_seq.tab;
+    for (int t = r0; t < r1;) {
+      const int lp = t / per_page, pp = h_ptab[lp];
+      int q = lp + 1;
+      while ((size_t)q * per_page < (size_t)r1 && h_ptab[q] == pp + (q - lp)) q++;
+      const int re = (int)std::min<size_t>((size_t)r1, (size_t)q * per_page);
+      fn(t, (size_t)pp * per_page + (size_t)(t % per_page), re - t);
+      t = re;
+    }
+  }
+
+  // ---- A2: on-demand page mapping of the live sequence ----
+  // Every device write to the trunk QSA KV / indexer keys goes through
+  // prefill_chunk (rows [base, base+P)) or forward (row pos), and both call
+  // kv_reserve first; the only other writer is kvsnap::restore, which
+  // reserves its rows itself. New entries were guard entries that no
+  // in-flight kernel reads, so the table upload needs no extra sync.
+  void kv_reserve(int end) {
+    if (!kv_paged || end <= kv_seq.rows()) return;
+    const int m0 = kv_seq.mapped;
+    if (!kv_seq.reserve(kv_pool, end)) {
+      fprintf(stderr,
+              "[kvpage] FATAL: cannot back %d tokens (pool %d pages, %d free, "
+              "table %d pages)\n",
+              end, kv_pool_pages, kv_pool.nfree(), kv_lpages);
+      exit(1);
+    }
+    CK(hipMemcpy(d_ptab + m0, kv_seq.tab.data() + m0,
+                 (size_t)(kv_seq.mapped - m0) * 4, hipMemcpyHostToDevice));
+    if (kv_pool.order == 2 && m0 == 0)
+      fprintf(stderr, "[kvpage] seq map: logical 0 -> phys %d (free %d/%d)\n",
+              kv_seq.tab[0], kv_pool.nfree(), kv_pool_pages);
+  }
+  // Release the pages that hold no row < keep_pos (reset_state: 0; RAM/SSD
+  // checkpoint restores: the restored length). Waits for the device first:
+  // in-flight work may still read the entries being reset to the guard.
+  void kv_trim(int keep_pos) {
+    if (!kv_paged) return;
+    const int m1 = kv_seq.mapped;
+    if (kv_seq.trim(kv_pool, keep_pos) == 0) return;
+    const int m0 = kv_seq.mapped;
+    CK(hipDeviceSynchronize());
+    CK(hipMemcpy(d_ptab + m0, kv_seq.tab.data() + m0, (size_t)(m1 - m0) * 4,
+                 hipMemcpyHostToDevice));
+    if (kv_pool.order == 2) {
+      fprintf(stderr, "[kvpage] released %d pages (mapped %d, free %d/%d)\n",
+              m1 - m0, m0, kv_pool.nfree(), kv_pool_pages);
+      if (kv_guard_dirty())
+        fprintf(stderr, "[kvpage] ERROR: GUARD PAGE WRITTEN — some kernel wrote "
+                        "through an unmapped logical page\n");
+    }
+  }
+  // The guard page's slice of every paged buffer: fn(device ptr, bytes).
+  template <typename F>
+  void kv_guard_regions(F&& fn) {
+    const int nqsa = g_cfg.layers / 4;
+    const size_t g = (size_t)kv_pool.guard();
+    for (int qi = 0; qi < nqsa; qi++) {
+      const size_t row0 = (size_t)qi * kv_layer_rows + g * KV_PAGE;
+      if (qsa_kv_fp32) {
+        fn(d_kc + row0 * 512, (size_t)KV_PAGE * 512 * 4);
+        fn(d_vc + row0 * 512, (size_t)KV_PAGE * 512 * 4);
+      } else {
+        fn(d_kcb + row0 * 512, (size_t)KV_PAGE * 512 * 2);
+        fn(d_vcb + row0 * 512, (size_t)KV_PAGE * 512 * 2);
+        if (qsa_wmma_btv)
+          fn(vct_layer(qi) + g * KV_PAGE_BLOCKS * 2 * 256 * 4,
+             (size_t)KV_PAGE_BLOCKS * 2 * 256 * 4 * 2);
+      }
+      if (d_ik)
+        fn(d_ik + ((size_t)qi * ik_layer_blocks + g * KV_PAGE_BLOCKS) * 128,
+           (size_t)KV_PAGE_BLOCKS * 128 * 4);
+    }
+  }
+  bool kv_guard_dirty() {
+    std::vector<uint8_t> h;
+    bool dirty = false;
+    kv_guard_regions([&](void* p, size_t n) {
+      if (dirty) return;
+      h.resize(n);
+      CK(hipMemcpy(h.data(), p, n, hipMemcpyDeviceToHost));
+      for (uint8_t b : h)
+        if (b) {
+          dirty = true;
+          break;
+        }
+    });
+    return dirty;
   }
 
   // QSA: projections batched. Flash path: qsplit/norm/rope batched, KV rows
@@ -1913,7 +2126,7 @@ struct GpuModel {
       } else {
         gemm(wview(ckpt.at(buf)), d_xb, d_iproj, P);
       }
-      float* keys = d_ik + (size_t)qi * index_blocks * 128;
+      float* keys = d_ik + (size_t)qi * ik_layer_blocks * 128;
       k_index_q<<<dim3(P, 4), 128, 0, g_str>>>(d_iproj, d_inorm + qi * 256, d_iq,
                                               P, g_cfg.norm_eps, g_cfg.rope_theta,
                                               nullptr, base, d_ropecs);
@@ -1924,11 +2137,19 @@ struct GpuModel {
         k_index_pool<<<nb - b0, 128, 0, g_str>>>(d_iproj, d_inorm + qi * 256 + 128,
                                                  keys, g_cfg.norm_eps,
                                                  g_cfg.rope_theta, base,
-                                                 d_iraw + qi * 512, d_ropecs);
+                                                 d_iraw + qi * 512, d_ropecs, kvpt());
       k_index_ring<<<min(P, 4), 128, 0, g_str>>>(d_iproj, d_iraw + qi * 512, P, base);
       if (spec_snap)
         k_iproj_snap<<<P, 128, 0, g_str>>>(
             d_iproj, d_iproj_snap + (size_t)qi * 9 * 128, P);
+      // Paged: the score sgemm / tiled kernel read keys [0, nb) contiguously;
+      // gather them into d_ikg first (same values, same sgemm shape -> the
+      // scores and selections stay bit-identical to the unpaged layout).
+      const float* skeys = keys;
+      if (kv_paged && nb > 0 && std::max(2051, base) < base + P) {
+        k_ik_gather<<<nb, 128, 0, g_str>>>(keys, d_ptab, d_ikg, nb);
+        skeys = d_ikg;
+      }
       const float one = 1.f, zero = 0.f;
       // NOTE: nb (m/ldc) is the absolute pooled-block count, matching the
       // shape a from-scratch prefill of the same total length would use —
@@ -1946,28 +2167,30 @@ struct GpuModel {
         int count = nxt - first;
         if (index_fused2 && count >= 16 && getenv("GDEC_INDEX_OLDSEL") == nullptr) {
           k_index_scores_tiled<<<dim3((nb + 31) / 32, (count + 15) / 16), 256, 0, g_str>>>(
-              d_iq + (size_t)(first - base) * 512, keys, d_iscores, nb, count, first);
+              d_iq + (size_t)(first - base) * 512, skeys, d_iscores, nb, count, first);
+          int* const selrow = d_iselected + (size_t)(first - base) * 512;  // batch-local
           if ((first + count) / 4 <= 8192)
             k_index_select_rs<true><<<count, 256, 0, g_str>>>(
-                d_iscores, nb, d_iselected + (size_t)first * 512, first);
+                d_iscores, nb, selrow, first);
           else if (index_stream_select)
             k_index_select_stream<true><<<count, 256, 0, g_str>>>(
-                d_iscores, nb, d_iselected + (size_t)first * 512, first);
+                d_iscores, nb, selrow, first);
           else
             k_index_select<16, true><<<count, 256, 0, g_str>>>(
-                d_iscores, nb, d_iselected + (size_t)first * 512, first);
+                d_iscores, nb, selrow, first);
           first = nxt;
           continue;
         }
         auto status = rocblas_sgemm(rbh, rocblas_operation_transpose, rocblas_operation_none,
-                                    nb, count * 4, 128, &one, keys, 128,
+                                    nb, count * 4, 128, &one, skeys, 128,
                                     d_iq + (size_t)(first - base) * 512, 128, &zero,
                                     d_iscores, nb);
         if (status != rocblas_status_success) {
           fprintf(stderr, "indexer sgemm failed: %d\n", (int)status);
           exit(1);
         }
-        index_select(d_iscores, nb, d_iselected + (size_t)first * 512, first, count);
+        index_select(d_iscores, nb, d_iselected + (size_t)(first - base) * 512, first,
+                     count);
         first = nxt;
       }
     }
@@ -1981,7 +2204,8 @@ struct GpuModel {
     float* qnw = ensure_norm256(buf);
     snprintf(buf, sizeof buf, "layers.%d.self_attn.k_norm.weight", l);
     float* knw = ensure_norm256(buf);
-    const size_t qsa_off = (size_t)qi * maxctx * 512;
+    // kv_layer_rows == maxctx unless paged (FP32 or BF16 cache, A1c)
+    const size_t qsa_off = (size_t)qi * kv_layer_rows * 512;
     if (!qsa_loop) {
       ensure_rope_tab(g_cfg.rope_theta, 64);
       ensure_rope_cs(base, P);
@@ -1997,31 +2221,53 @@ struct GpuModel {
         k_qsa_kprep<false><<<dim3(2, P), 256, 0, g_str>>>(d_kbb, knw, d_kbb,
                                                           nullptr, g_cfg.norm_eps,
                                                           base, d_ropecs);
-        // absolute positions base..base+P-1 are contiguous: one bulk copy
-        CK(hipMemcpyAsync(kc + (size_t)base * 512, d_kbb, (size_t)P * 512 * 4,
-                          hipMemcpyDeviceToDevice, g_str));
-        CK(hipMemcpyAsync(vc + (size_t)base * 512, d_vbb, (size_t)P * 512 * 4,
-                          hipMemcpyDeviceToDevice, g_str));
-        qsa_flash_b(kc, vc, P, dense_P, base);
+        // absolute positions base..base+P-1 are logically contiguous: one bulk
+        // copy (unpaged) or one copy per physically contiguous page run
+        kv_rows_store(kc, d_kbb, base, P);
+        kv_rows_store(vc, d_vbb, base, P);
+        qsa_flash_b(kc, vc, P, dense_P, base, nullptr, kvpt());
       } else {
         uint16_t* kc = d_kcb + qsa_off;
         uint16_t* vc = d_vcb + qsa_off;
-        k_qsa_kprep<true><<<dim3(2, P), 256, 0, g_str>>>(
-            d_kbb, knw, d_kbb, kc + (size_t)base * 512, g_cfg.norm_eps, base,
-            d_ropecs);
-        // absolute positions base..base+P-1 are contiguous: one bulk convert
-        k_f32_to_bf16_v4<<<(unsigned)(((size_t)P * 128 + 255) / 256), 256, 0,
-                           g_str>>>(d_vbb, vc + (size_t)base * 512, 512, P, 512);
-        const size_t bt_layer = qsa_vt_blocks * 2 * 256 * 4;
-        uint16_t* vct = qsa_wmma_btv
-                            ? d_vcbt + (size_t)qi * bt_layer
-                            : nullptr;
-        if (vct)
-          k_f32_to_bf16_v4_bt<<<(unsigned)(((size_t)((base + P + 3) / 4 - base / 4) *
-                                            512 + 255) /
-                                               256),
-                               256, 0, g_str>>>(d_vbb, vct, 512, P, 512, base);
-        qsa_flash_b(kc, vc, P, dense_P, base, vct);
+        uint16_t* vct = vct_layer(qi);
+        if (!kv_paged) {
+          k_qsa_kprep<true><<<dim3(2, P), 256, 0, g_str>>>(
+              d_kbb, knw, d_kbb, kc + (size_t)base * 512, g_cfg.norm_eps, base,
+              d_ropecs);
+          // absolute positions base..base+P-1 are contiguous: one bulk convert
+          k_f32_to_bf16_v4<<<(unsigned)(((size_t)P * 128 + 255) / 256), 256, 0,
+                             g_str>>>(d_vbb, vc + (size_t)base * 512, 512, P, 512);
+          if (vct)
+            k_f32_to_bf16_v4_bt<<<(unsigned)(((size_t)((base + P + 3) / 4 - base / 4) *
+                                              512 + 255) /
+                                                 256),
+                                 256, 0, g_str>>>(d_vbb, vct, 512, P, 512, base);
+        } else {
+          // A1c paged: kprep writes the fp32 K rows only (kprep<true> stores
+          // f2bf of exactly those values, so converting afterwards is the same
+          // bits), then K / V / transposed V are converted per physically
+          // contiguous page run. The transposed-V kernel is called with the
+          // run's physical base: a page holds whole 4-token blocks, so the
+          // slot (pos & 3) and the partial-edge-block masking are unchanged and
+          // block pr/4 is the physical block ik_blk(lr/4).
+          k_qsa_kprep<false><<<dim3(2, P), 256, 0, g_str>>>(
+              d_kbb, knw, d_kbb, nullptr, g_cfg.norm_eps, base, d_ropecs);
+          kv_runs(base, base + P, KV_PAGE, [&](int lr, size_t prz, int n) {
+            const int pr = (int)prz;
+            const size_t so = (size_t)(lr - base) * 512;
+            const unsigned g = (unsigned)(((size_t)n * 128 + 255) / 256);
+            k_f32_to_bf16_v4<<<g, 256, 0, g_str>>>(d_kbb + so, kc + prz * 512, 512, n,
+                                                   512);
+            k_f32_to_bf16_v4<<<g, 256, 0, g_str>>>(d_vbb + so, vc + prz * 512, 512, n,
+                                                   512);
+            if (vct)
+              k_f32_to_bf16_v4_bt<<<(unsigned)(((size_t)((pr + n + 3) / 4 - pr / 4) *
+                                                512 + 255) /
+                                                   256),
+                                   256, 0, g_str>>>(d_vbb + so, vct, 512, n, 512, pr);
+          });
+        }
+        qsa_flash_b(kc, vc, P, dense_P, base, vct, kvpt());
       }
       k_sigmoid_gate<<<(P * 6144 + 255) / 256, 256, 0, g_str>>>(d_attnb, d_gsb,
                                                                 d_attnb, P * 6144);
@@ -2043,16 +2289,19 @@ struct GpuModel {
                                                         g_cfg.rope_theta);
         if (qsa_kv_fp32) {
           k_store_kv<<<2, 256, 0, g_str>>>(kb, vb, d_kc + qsa_off, d_vc + qsa_off,
-                                           pabs);
+                                           pabs, kvpt());
           k_qsa_step<float><<<24, 256, 0, g_str>>>(
               qs, d_kc + qsa_off, d_vc + qsa_off, att, pabs, 256, 2, 24,
-              qsa_dense ? nullptr : d_iselected + (size_t)(base + t) * 512);
+              qsa_dense ? nullptr : d_iselected + (size_t)t * 512, false,
+              kvpt());
         } else {
           k_store_kv_bf16<<<2, 256, 0, g_str>>>(kb, vb, d_kcb + qsa_off,
-                                                d_vcb + qsa_off, pabs);
+                                                d_vcb + qsa_off, pabs,
+                                                vct_layer(qi), kvpt());
           k_qsa_step<uint16_t><<<24, 256, 0, g_str>>>(
               qs, d_kcb + qsa_off, d_vcb + qsa_off, att, pabs, 256, 2, 24,
-              qsa_dense ? nullptr : d_iselected + (size_t)(base + t) * 512);
+              qsa_dense ? nullptr : d_iselected + (size_t)t * 512, false,
+              kvpt());
         }
         k_sigmoid_gate<<<(6144 + 255) / 256, 256, 0, g_str>>>(att, gs, att, 6144);
       }
@@ -2704,6 +2953,7 @@ struct GpuModel {
               "(maxctx=%d maxbatch_cap=%d)\n", base, P, maxctx, maxbatch_cap);
       exit(1);
     }
+    kv_reserve(base + P);  // A2: back rows [base, base+P) before any KV write
     static const bool phase_prof = getenv("GDEC_PHASE") != nullptr;
     auto phase = [&](const char* tag, std::chrono::steady_clock::time_point& tp) {
       if (!phase_prof) return;
@@ -3324,8 +3574,8 @@ struct GpuModel {
           fprintf(stderr, "mtp indexer sgemm failed: %d\n", (int)status);
           exit(1);
         }
-        index_select(d_iscores, nb, d_iselected + (size_t)first * 512, first,
-                     count);
+        index_select(d_iscores, nb, d_iselected + (size_t)(first - base) * 512,
+                     first, count);
         first = nxt;
       }
     }
@@ -4811,9 +5061,11 @@ struct GpuModel {
     CK(hipMemsetAsync(d_convst, 0, (size_t)ngdn * 3 * 10240 * 4, 0));
     CK(hipMemsetAsync(d_ring, 0, (size_t)9 * 10240 * 4, 0));
     CK(hipDeviceSynchronize());
+    kv_trim(0);  // A2: the next sequence maps its pages from scratch
   }
 
   int forward(int token) {
+    kv_reserve(pos + 1);  // A2: back row pos (graph and direct paths)
     if (graphs_ok) {
       *p_token = token;
       auto g0 = std::chrono::steady_clock::now();

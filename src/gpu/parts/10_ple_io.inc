@@ -261,6 +261,129 @@ __device__ __forceinline__ int qsa_source_pos(int slot, int visible,
                      : (visible / 4) * 4 + slot - 2048;
 }
 
+// ---- Paged QSA KV (memory model Phase A) ----
+// The trunk's QSA K/V rows and pooled indexer keys live in per-layer page
+// pools; a page holds KV_PAGE consecutive logical tokens (= KV_PAGE/4 indexer
+// blocks) and every layer uses the same physical page id for a given logical
+// page. ptab[logical page] = physical page. ptab == nullptr is the legacy
+// contiguous layout (identity), so every kernel below keeps its old addressing
+// bit-for-bit when paging is off. Only addresses change, never values or
+// accumulation order, so paged runs are bitwise identical to contiguous ones.
+constexpr int KV_PAGE_SHIFT = 8;
+constexpr int KV_PAGE = 1 << KV_PAGE_SHIFT;          // 256 tokens
+constexpr int KV_PAGE_BLOCKS = KV_PAGE / 4;          // 64 indexer blocks
+constexpr int KV_PAGE_BLOCK_SHIFT = KV_PAGE_SHIFT - 2;
+__device__ __forceinline__ int kv_row(const int* __restrict__ ptab, int t) {
+  return ptab ? (ptab[t >> KV_PAGE_SHIFT] << KV_PAGE_SHIFT) | (t & (KV_PAGE - 1))
+              : t;
+}
+__device__ __forceinline__ int ik_blk(const int* __restrict__ ptab, int b) {
+  return ptab ? (ptab[b >> KV_PAGE_BLOCK_SHIFT] << KV_PAGE_BLOCK_SHIFT) |
+                    (b & (KV_PAGE_BLOCKS - 1))
+              : b;
+}
+
+// ---- A2: host-side page allocator + per-sequence page table ----
+// KvPagePool hands out physical pages [0, npages). Physical page `npages` is
+// the GUARD page: every unmapped logical page points at it, it is never
+// allocated and it stays zero, so a stray read sees finite data and a stray
+// write is detectable (GpuModel::kv_guard_dirty). Refcounts are 0/1 while
+// there is one live sequence (A2); A3 shares pages between the live sequence
+// and RAM checkpoints (ref > 1).
+//   order 1: lowest free page first -> a fresh sequence maps identity-like,
+//            long physically contiguous runs (production order).
+//   order 2: self-test -> scrambled initial order and FIFO reuse, so logical
+//            pages land on non-monotonic physical pages and consecutive
+//            sequences reuse pages that still hold the previous sequence's
+//            data. Output must stay bitwise identical to order 1 / unpaged.
+struct KvPagePool {
+  int npages = 0, order = 1;
+  std::deque<int> free_;
+  std::vector<uint16_t> ref;
+  void init(int n, int ord) {
+    npages = n;
+    order = ord;
+    free_.clear();
+    ref.assign((size_t)n, 0);
+    if (ord == 2) {
+      // p_i = (i * s + n / 3) mod n with gcd(s, n) == 1 -> a permutation
+      int s = n / 2 + n / 8 + 1;
+      auto gcd = [](int a, int b) { while (b) { int t = a % b; a = b; b = t; } return a; };
+      while (n > 1 && gcd(s, n) != 1) s++;
+      for (int i = 0; i < n; i++)
+        free_.push_back((int)(((long long)i * s + n / 3) % n));
+    } else {
+      for (int i = 0; i < n; i++) free_.push_back(i);
+    }
+  }
+  int guard() const { return npages; }
+  int nfree() const { return (int)free_.size(); }
+  int alloc() {  // -1 when exhausted
+    if (free_.empty()) return -1;
+    const int p = free_.front();
+    free_.pop_front();
+    ref[(size_t)p] = 1;
+    return p;
+  }
+  void addref(int p) {
+    if (p < 0 || p >= npages || ref[(size_t)p] == 0 || ref[(size_t)p] == 0xffff) {
+      fprintf(stderr, "[kvpage] FATAL: addref(%d) on a free/invalid page\n", p);
+      abort();
+    }
+    ref[(size_t)p]++;
+  }
+  // Drop one reference; true when the page went back to the free list.
+  bool unref(int p) {
+    if (p < 0 || p >= npages || ref[(size_t)p] == 0) {
+      fprintf(stderr, "[kvpage] FATAL: unref(%d) on a free/invalid page\n", p);
+      abort();
+    }
+    if (--ref[(size_t)p]) return false;
+    if (order == 2)
+      free_.push_back(p);
+    else
+      free_.insert(std::lower_bound(free_.begin(), free_.end(), p), p);
+    return true;
+  }
+};
+
+// One sequence's logical -> physical page table. Mapped logical pages are
+// always a prefix [0, mapped); tab[lp] == guard for lp >= mapped. Writes only
+// ever happen at rows >= the live pos, so growing / shrinking the tail is all
+// a single sequence needs.
+struct KvSeqTable {
+  std::vector<int> tab;
+  int mapped = 0;
+  void init(int lpages, int guard) {
+    tab.assign((size_t)lpages, guard);
+    mapped = 0;
+  }
+  int rows() const { return mapped * KV_PAGE; }
+  // Back rows [0, end). false: end beyond the table or pool exhausted (pages
+  // mapped so far stay mapped; a later trim releases them).
+  bool reserve(KvPagePool& pool, int end) {
+    const int need = (end + KV_PAGE - 1) / KV_PAGE;
+    if (need > (int)tab.size()) return false;
+    while (mapped < need) {
+      const int p = pool.alloc();
+      if (p < 0) return false;
+      tab[(size_t)mapped++] = p;
+    }
+    return true;
+  }
+  // Keep only the pages holding rows < pos; returns the number unmapped.
+  int trim(KvPagePool& pool, int pos) {
+    const int keep = std::max(0, (pos + KV_PAGE - 1) / KV_PAGE);
+    int n = 0;
+    while (mapped > keep) {
+      pool.unref(tab[(size_t)--mapped]);
+      tab[(size_t)mapped] = pool.guard();
+      n++;
+    }
+    return n;
+  }
+};
+
 // KV cache element access: FP32 caches load directly; BF16 caches expand to
 // fp32 in registers (LDS staging and arithmetic stay fp32 either way).
 __device__ __forceinline__ float kv_ld1(const float* __restrict__ p) { return *p; }
@@ -344,7 +467,8 @@ __global__ void k_index_q(const float* proj, const float* norm, float* queries,
 __global__ void k_index_pool(const float* proj, const float* norm, float* keys,
                               float eps, double theta, int base = 0,
                               const float* ring = nullptr,
-                              const float2* cs_tab = nullptr) {
+                              const float2* cs_tab = nullptr,
+                              const int* __restrict__ ptab = nullptr) {
   int b = blockIdx.x + (base / 4), d = threadIdx.x;  // absolute block id
   float v = 0.f;
   for (int j = 0; j < 4; j++) {
@@ -352,8 +476,8 @@ __global__ void k_index_pool(const float* proj, const float* norm, float* keys,
     v += lt >= 0 ? proj[(size_t)lt * 640 + 512 + d]
                  : ring[(size_t)((b * 4 + j) % 4) * 128 + d];
   }
-  index_norm_rope(v * 0.25f, norm, keys + (size_t)b * 128, b * 4, eps, theta,
-                  cs_tab, base);
+  index_norm_rope(v * 0.25f, norm, keys + (size_t)ik_blk(ptab, b) * 128, b * 4,
+                  eps, theta, cs_tab, base);
 }
 
 __global__ void k_index_ring(const float* proj, float* ring, int P, int base = 0) {
@@ -364,7 +488,8 @@ __global__ void k_index_ring(const float* proj, float* ring, int P, int base = 0
 
 __global__ void k_index_append(const float* proj, const float* norm, float* ring,
                                 float* keys, const int* pos, float eps, double theta,
-                                const int* __restrict__ d_rdelta = nullptr) {
+                                const int* __restrict__ d_rdelta = nullptr,
+                                const int* __restrict__ ptab = nullptr) {
   int t = *pos, d = threadIdx.x;
   ring[(t % 4) * 128 + d] = proj[512 + d];
   __syncthreads();
@@ -374,22 +499,36 @@ __global__ void k_index_append(const float* proj, const float* norm, float* ring
   // d_rdelta (M-RoPE decode): pooled key's rope position is its first token's
   // cache position + request rope_delta (zero for text-only).
   int position = t - 3 + (d_rdelta ? *d_rdelta : 0);
-  index_norm_rope(v * 0.25f, norm, keys + (size_t)(t / 4) * 128,
+  index_norm_rope(v * 0.25f, norm, keys + (size_t)ik_blk(ptab, t / 4) * 128,
                   position, eps, theta);
 }
 
 __global__ void k_index_scores(const float* queries, const float* keys, float* scores,
-                                int stride, const int* pos) {
+                                int stride, const int* pos,
+                                const int* __restrict__ ptab = nullptr) {
   int b = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
   int lane = threadIdx.x % warpSize;
   if (*pos < 2051 || b >= (*pos + 1) / 4) return;
+  const float* kb = keys + (size_t)ik_blk(ptab, b) * 128;
   for (int h = 0; h < 4; h++) {
     float sum = 0.f;
     for (int d = lane; d < 128; d += warpSize)
-      sum += queries[h * 128 + d] * keys[(size_t)b * 128 + d];
+      sum += queries[h * 128 + d] * kb[d];
     for (int s = warpSize / 2; s; s >>= 1) sum += __shfl_down_sync(~0ull, sum, s);
     if (!lane) scores[h * stride + b] = sum;
   }
+}
+
+// Paged prefill: gather logical blocks [0, nb) of one layer's indexer keys
+// into a contiguous scratch so the score sgemm / tiled kernel keep their
+// exact shape (bit-identical to the unpaged layout). grid = nb, block = 128.
+__global__ void k_ik_gather(const float* __restrict__ src,
+                            const int* __restrict__ ptab,
+                            float* __restrict__ dst, int nb) {
+  int b = blockIdx.x;
+  if (b >= nb) return;
+  dst[(size_t)b * 128 + threadIdx.x] =
+      src[(size_t)ik_blk(ptab, b) * 128 + threadIdx.x];
 }
 
 // Exact top-512 via bounded merges, using rocPRIM radix sort. Float scores are

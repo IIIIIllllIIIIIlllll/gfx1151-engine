@@ -819,6 +819,81 @@ int main() {
     TCK(hipFree(dpos));
   }
 
+  // ---- 9d2. BTV transposed V cache: decode store + snapshot rebuild ----
+  // k_store_kv_bf16(vct) must write slot pos%4 of block pos/4 with the same
+  // bits as the row-major cache; k_bf16_rows_to_bt must reproduce the
+  // k_f32_to_bf16_v4_bt layout from the row-major cache for [r0, r1) and
+  // leave every other slot untouched.
+  {
+    const int NT = 13, NB = (NT + 3) / 4;
+    std::vector<float> v((size_t)NT * 512), kb(512);
+    for (auto& x : v) x = frand();
+    for (auto& x : kb) x = frand();
+    std::vector<uint16_t> vrow((size_t)NT * 512);
+    for (size_t i = 0; i < vrow.size(); i++) vrow[i] = bf16_bits(v[i]);
+    float* dv = dup(v);
+    float* dkb = dup(kb);
+    uint16_t *dkc, *dvc, *dref, *dst, *dreb;
+    const size_t vt_n = (size_t)NB * 512 * 4;
+    TCK(hipMalloc(&dkc, (size_t)NT * 512 * 2));
+    TCK(hipMalloc(&dvc, (size_t)NT * 512 * 2));
+    TCK(hipMalloc(&dref, vt_n * 2));
+    TCK(hipMalloc(&dst, vt_n * 2));
+    TCK(hipMalloc(&dreb, vt_n * 2));
+    TCK(hipMemset(dref, 0xEE, vt_n * 2));
+    TCK(hipMemset(dst, 0xEE, vt_n * 2));
+    TCK(hipMemset(dreb, 0xEE, vt_n * 2));
+    // reference: the production prefill writer over all NT rows
+    k_f32_to_bf16_v4_bt<<<(unsigned)((NB * 512 + 255) / 256), 256>>>(dv, dref, 512,
+                                                                     NT, 512, 0);
+    TCK(hipGetLastError());
+    // decode path: one k_store_kv_bf16 per position
+    int* dpos;
+    TCK(hipMalloc(&dpos, 4));
+    for (int t = 0; t < NT; t++) {
+      TCK(hipMemcpy(dpos, &t, 4, hipMemcpyHostToDevice));
+      k_store_kv_bf16<<<2, 256>>>(dkb, dv + (size_t)t * 512, dkc, dvc, dpos, dst);
+      TCK(hipGetLastError());
+    }
+    auto get16 = [](const uint16_t* p, size_t n) {
+      std::vector<uint16_t> h(n);
+      TCK(hipMemcpy(h.data(), p, n * 2, hipMemcpyDeviceToHost));
+      return h;
+    };
+    std::vector<uint16_t> ref = get16(dref, vt_n), st = get16(dst, vt_n);
+    std::vector<uint16_t> vcd = get16(dvc, (size_t)NT * 512);
+    double bad_st = 0;
+    for (size_t i = 0; i < vt_n; i++) bad_st += st[i] != ref[i];
+    for (size_t i = 0; i < vcd.size(); i++) bad_st += vcd[i] != vrow[i];
+    check("qsa_store_bf16_vct_bits", bad_st, 0);
+    // rebuild a ragged sub-range [r0, r1) from the row-major cache
+    const int r0 = 2, r1 = 11;
+    uint16_t* dvrow = dup(vrow);
+    const int nb = (r1 + 3) / 4 - r0 / 4;
+    k_bf16_rows_to_bt<<<(unsigned)((nb * 512 + 255) / 256), 256>>>(dvrow, dreb, r0, r1);
+    TCK(hipGetLastError());
+    std::vector<uint16_t> reb = get16(dreb, vt_n);
+    double bad_rb = 0;
+    for (int b = 0; b < NB; b++)
+      for (int i = 0; i < 512; i++)
+        for (int s = 0; s < 4; s++) {
+          const size_t o = ((size_t)b * 512 + i) * 4 + s;
+          const int t = b * 4 + s;
+          const uint16_t e = (t >= r0 && t < r1) ? ref[o] : (uint16_t)0xEEEE;
+          bad_rb += reb[o] != e;
+        }
+    check("qsa_bt_rebuild_bits", bad_rb, 0);
+    TCK(hipFree(dv));
+    TCK(hipFree(dkb));
+    TCK(hipFree(dkc));
+    TCK(hipFree(dvc));
+    TCK(hipFree(dref));
+    TCK(hipFree(dst));
+    TCK(hipFree(dreb));
+    TCK(hipFree(dvrow));
+    TCK(hipFree(dpos));
+  }
+
   // ---- 9e. k_qsa_flash_bf16: sparse SharedV prefill over a BF16 KV cache ----
   // Mirrors the production BF16-mode launch in qsa_flash_b<uint16_t>: grid
   // (P-2051, 2), per-token top-512 block tables, 2048-slot block window plus
@@ -1015,6 +1090,50 @@ int main() {
     std::vector<float> o5 = dget(dout5, (size_t)P * HQ * DH),
                        o6 = dget(dout6, (size_t)P * HQ * DH),
                        o7 = dget(dout7, (size_t)P * HQ * DH);
+    // A1c: paged k_qsa_wmma<*, true> with a reversed page table over a
+    // physically permuted copy of kc / vc / vct must be bitwise identical to
+    // the contiguous launches above (only addresses change).
+    {
+      const int NPG = (P + KV_PAGE - 1) / KV_PAGE, PROWS = NPG * KV_PAGE;
+      std::vector<int> ptab(NPG);
+      for (int p = 0; p < NPG; p++) ptab[p] = NPG - 1 - p;
+      auto prow = [&](int t) { return ptab[t / KV_PAGE] * KV_PAGE + t % KV_PAGE; };
+      std::vector<uint16_t> kp((size_t)PROWS * HKV * DH, 0), vp(kp.size(), 0),
+          vctp((size_t)(PROWS / 4) * HKV * DH * 4, 0);
+      for (int t = 0; t < P; t++) {
+        const int r = prow(t);
+        for (int j = 0; j < HKV * DH; j++) {
+          kp[(size_t)r * HKV * DH + j] = kb[(size_t)t * HKV * DH + j];
+          vp[(size_t)r * HKV * DH + j] = vb[(size_t)t * HKV * DH + j];
+          vctp[((size_t)(r / 4) * HKV * DH + j) * 4 + t % 4] =
+              vb[(size_t)t * HKV * DH + j];
+        }
+      }
+      uint16_t *dkp = dup(kp), *dvp = dup(vp), *dvctp = dup(vctp);
+      int* dptab = dup(ptab);
+      float *dp5 = dalloc((size_t)P * HQ * DH), *dp7 = dalloc((size_t)P * HQ * DH);
+      k_qsa_wmma<true, true><<<dim3(P - FIRST, HKV), 256>>>(
+          dq, dkp, dvp, dvctp, dp5, P, DH, HKV, HQ, sel0, FIRST, 0, dptab);
+      TCK(hipGetLastError());
+      k_qsa_wmma<false, true><<<dim3(P - FIRST, HKV), 256>>>(
+          dq, dkp, dvp, nullptr, dp7, P, DH, HKV, HQ, sel0, FIRST, 0, dptab);
+      TCK(hipGetLastError());
+      std::vector<float> p5 = dget(dp5, (size_t)P * HQ * DH),
+                         p7 = dget(dp7, (size_t)P * HQ * DH);
+      size_t off = (size_t)FIRST * HQ * DH, cnt = (size_t)(P - FIRST) * HQ * DH;
+      bool ok5 = memcmp(p5.data() + off, o5.data() + off, cnt * 4) == 0;
+      bool ok7 = memcmp(p7.data() + off, o7.data() + off, cnt * 4) == 0;
+      printf("%-28s %s\n", "qsa_wmma_btv_paged_bits", ok5 ? "PASS" : "FAIL");
+      printf("%-28s %s\n", "qsa_wmma_rm_paged_bits", ok7 ? "PASS" : "FAIL");
+      fails += !ok5;
+      fails += !ok7;
+      TCK(hipFree(dkp));
+      TCK(hipFree(dvp));
+      TCK(hipFree(dvctp));
+      TCK(hipFree(dptab));
+      TCK(hipFree(dp5));
+      TCK(hipFree(dp7));
+    }
     std::vector<float> ref((size_t)P * HQ * DH, 0.f);
     float scale = 1.f / sqrtf((float)DH);
     for (int t = FIRST; t < P; t++) {
@@ -2095,6 +2214,110 @@ int main() {
       fails += !pass;
     }
     for (float* ptr : {x, w, sr, sg, yr, yg}) TCK(hipFree(ptr));
+  }
+
+  // ---- A2: host page allocator (KvPagePool) + sequence table (KvSeqTable) ----
+  {
+    bool ok = true;
+    auto expect = [&](bool c, const char* what) {
+      if (!c) {
+        printf("  kvpool: %s\n", what);
+        ok = false;
+      }
+    };
+    {  // order 1: lowest free page first
+      KvPagePool pool;
+      pool.init(10, 1);
+      for (int i = 0; i < 10; i++) expect(pool.alloc() == i, "order1 alloc order");
+      expect(pool.alloc() == -1, "order1 exhaustion");
+      pool.unref(7);
+      pool.unref(3);
+      pool.unref(5);
+      expect(pool.alloc() == 3 && pool.alloc() == 5 && pool.alloc() == 7,
+             "order1 lowest-first reuse");
+      pool.addref(4);
+      expect(!pool.unref(4) && pool.unref(4) && pool.nfree() == 1, "refcount");
+    }
+    {  // order 2: scrambled permutation, FIFO reuse
+      const int n = 160;
+      KvPagePool pool;
+      pool.init(n, 2);
+      std::vector<int> got;
+      for (int i = 0; i < n; i++) got.push_back(pool.alloc());
+      expect(pool.alloc() == -1, "order2 exhaustion");
+      std::vector<int> s = got;
+      std::sort(s.begin(), s.end());
+      bool perm = true, mono = true;
+      for (int i = 0; i < n; i++) perm = perm && s[i] == i;
+      for (int i = 1; i < n; i++) mono = mono && got[i] == got[i - 1] + 1;
+      expect(perm, "order2 not a permutation");
+      expect(!mono, "order2 not scrambled");
+      pool.unref(got[5]);
+      pool.unref(got[2]);
+      expect(pool.alloc() == got[5] && pool.alloc() == got[2], "order2 FIFO reuse");
+    }
+    {  // sequence table: prefix mapping, trim, guard entries
+      const int n = 160;
+      KvPagePool pool;
+      pool.init(n, 1);
+      KvSeqTable seq;
+      seq.init(n, pool.guard());
+      expect(seq.reserve(pool, 1) && seq.mapped == 1, "reserve 1 row");
+      expect(seq.reserve(pool, 256) && seq.mapped == 1, "reserve full page");
+      expect(seq.reserve(pool, 257) && seq.mapped == 2, "reserve page+1");
+      expect(seq.reserve(pool, n * KV_PAGE) && seq.mapped == n, "reserve all");
+      expect(!seq.reserve(pool, n * KV_PAGE + 1), "reserve beyond table");
+      bool ident = true;
+      for (int i = 0; i < n; i++) ident = ident && seq.tab[i] == i;
+      expect(ident, "order1 fresh sequence is identity");
+      expect(seq.trim(pool, 300) == n - 2 && seq.mapped == 2 && pool.nfree() == n - 2,
+             "trim keeps the page holding row pos-1");
+      bool guard = true;
+      for (int i = 2; i < n; i++) guard = guard && seq.tab[i] == pool.guard();
+      expect(guard, "trimmed entries point at the guard page");
+      expect(seq.trim(pool, 0) == 2 && seq.mapped == 0 && pool.nfree() == n, "trim to 0");
+      expect(seq.reserve(pool, 1000) && seq.tab[0] == 0 && seq.tab[3] == 3,
+             "order1 re-map after reset is identity again");
+    }
+    {  // order 2 rotation + conservation under a random reserve/trim workload
+      const int n = 64;
+      KvPagePool pool;
+      pool.init(n, 2);
+      KvSeqTable seq;
+      seq.init(n, pool.guard());
+      std::mt19937 wr(7);
+      int first_prev = -1, rotations = 0;
+      for (int it = 0; it < 500; it++) {
+        const int end = (int)(wr() % (unsigned)(n * KV_PAGE + 1));
+        if (wr() % 3 == 0) {
+          const bool had = seq.mapped > 0;
+          seq.trim(pool, 0);
+          seq.reserve(pool, std::max(1, end));
+          if (had && seq.tab[0] != first_prev) rotations++;
+          first_prev = seq.tab[0];
+        } else if (wr() % 2) {
+          seq.trim(pool, end);
+        } else {
+          expect(seq.reserve(pool, end), "random reserve failed");
+        }
+        std::vector<char> seen((size_t)n, 0);
+        bool dup = false;
+        for (int i = 0; i < seq.mapped; i++) {
+          const int p = seq.tab[i];
+          if (p < 0 || p >= n || seen[(size_t)p]) dup = true;
+          else seen[(size_t)p] = 1;
+        }
+        for (int i = seq.mapped; i < n; i++) dup = dup || seq.tab[i] != pool.guard();
+        if (dup || pool.nfree() + seq.mapped != n) {
+          expect(false, "conservation / double mapping");
+          break;
+        }
+        if (seq.mapped == 0) first_prev = -1;
+      }
+      expect(rotations > 0, "order2 never rotated physical pages");
+    }
+    printf("%-28s %s\n", "kvpool_alloc_table", ok ? "PASS" : "FAIL");
+    fails += !ok;
   }
 
   printf(fails ? "== %d FAILURES ==\n" : "== ALL PASS ==\n", fails);

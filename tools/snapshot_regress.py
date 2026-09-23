@@ -2,7 +2,7 @@
 import socket,json
 from pathlib import Path
 from qwentok import Tokenizer
-tk=Tokenizer(); sock=socket.create_connection(('127.0.0.1',8732),timeout=55)
+tk=Tokenizer(); sock=socket.create_connection(('127.0.0.1',8732),timeout=600)
 f=sock.makefile('rb'); results=[]
 def run(prompt, n):
     req=len(results)+1

@@ -181,6 +181,25 @@ __global__ void k_f32_to_bf16_v4_bt(const float* __restrict__ x,
   }
 }
 
+// Rebuild block-transposed V for absolute rows [r0, r1) from the row-major
+// BF16 cache (kvsnap restore: the snapshot stores only the row-major cache).
+// Same packing as k_f32_to_bf16_v4_bt (n = 512); bits are copied, so the
+// result equals what the live prefill/decode stores wrote. Slots outside
+// [r0, r1) are left untouched.
+__global__ void k_bf16_rows_to_bt(const uint16_t* __restrict__ vc,
+                                  uint16_t* __restrict__ vct, int r0, int r1) {
+  const int b0 = r0 / 4, b1 = (r1 + 3) / 4;
+  uint64_t gid = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+  if (gid >= (uint64_t)(b1 - b0) * 512) return;
+  const int b = b0 + (int)(gid / 512), i = (int)(gid % 512);
+  uint16_t* dst = vct + ((size_t)b * 512 + i) * 4;
+#pragma unroll
+  for (int slot = 0; slot < 4; ++slot) {
+    const int t = b * 4 + slot;
+    if (t >= r0 && t < r1) dst[slot] = vc[(size_t)t * 512 + i];
+  }
+}
+
 // --- batched GR combine: x[t*d+i] = mean_b G[t][b*d+i] * Rhat[t][b*d+i]
 template <bool Fused = false>
 __global__ void k_gr_combine_b(const float* __restrict__ G, const float* __restrict__ Rhat,
@@ -511,7 +530,8 @@ __global__ void k_qsa_flash(const float* __restrict__ q, const KVT* __restrict__
                             int dh, int hkv, int hq, const int* selected = nullptr,
                             int first = 0, const int* pos = nullptr,
                             float* pacc = nullptr, float* pml = nullptr,
-                            int kbase = 0) {
+                            int kbase = 0,
+                            const int* __restrict__ ptab = nullptr) {
   static_assert(!SharedV || Sparse, "shared V is a sparse-attention specialization");
   const int h = blockIdx.y;
   const int kvh = Sparse ? h : h / (hq / hkv);
@@ -557,7 +577,7 @@ __global__ void k_qsa_flash(const float* __restrict__ q, const KVT* __restrict__
   if (!Sparse) {
     int source = min(spi, ntok - 1);
     if (Sparse) source = qsa_source_pos(source, token + 1, blocks);
-    size_t off = (size_t)source * hkv * dh;
+    size_t off = (size_t)kv_row(ptab, source) * hkv * dh;
     st0 = kv_ld4(kg + off);
     st1 = kv_ld4(kg + off + 4);
     st2 = kv_ld4(kg + off + 8);
@@ -578,7 +598,7 @@ __global__ void k_qsa_flash(const float* __restrict__ q, const KVT* __restrict__
     // make the prefetched chunk visible, then prefetch the next one
     if (Sparse) {
       // Sparse address bookkeeping plus the 16-float prefetch spills VGPRs.
-      int source = qsa_source_pos(min(p0 + spi, ntok - 1), token + 1, blocks);
+      int source = kv_row(ptab, qsa_source_pos(min(p0 + spi, ntok - 1), token + 1, blocks));
       const KVT* src = kg + (size_t)source * hkv * dh;
       *(float4*)&kt[spi][spf] = kv_ld4(src);
       *(float4*)&kt[spi][spf + 4] = kv_ld4(src + 4);
@@ -602,7 +622,7 @@ __global__ void k_qsa_flash(const float* __restrict__ q, const KVT* __restrict__
       int pos = p0 + QSA_KT + spi;
       int source = min(pos, ntok - 1);
       if (Sparse) source = qsa_source_pos(source, token + 1, blocks);
-      size_t off = (size_t)source * hkv * dh;
+      size_t off = (size_t)kv_row(ptab, source) * hkv * dh;
       st0 = kv_ld4(kg + off);
       st1 = kv_ld4(kg + off + 4);
       st2 = kv_ld4(kg + off + 8);
@@ -666,7 +686,7 @@ __global__ void k_qsa_flash(const float* __restrict__ q, const KVT* __restrict__
         } else {
           int pr = min(p0 + p, ntok - 1);
           if (Sparse) pr = qsa_source_pos(pr, token + 1, blocks);
-          const KVT* vg = vc + ((size_t)pr * hkv + kvh) * dh + dg * 4;
+          const KVT* vg = vc + ((size_t)kv_row(ptab, pr) * hkv + kvh) * dh + dg * 4;
           for (int f = 0; f < 8; f++) {
             float4 vv = kv_ld4(vg + f * 32);
             acc[f].x += ev * vv.x;
@@ -984,14 +1004,18 @@ __device__ __forceinline__ void tr16x16_bf16(unsigned a[8]) {
 #define QW_KITER 128
 #define QW_NITER 17   // ceil(2051 / 128)
 #define QW_NKSTEP (QW_KITER / QW_KTILE)
-template <bool TransposedV = false>
+// Paged (A1c): KV rows / vct blocks go through the page table ptab
+// (kv_row / ik_blk). Compile-time switch so the unpaged production
+// instantiations keep their exact codegen (this kernel is VGPR-sensitive).
+template <bool TransposedV = false, bool Paged = false>
 __global__ void __launch_bounds__(256)
     k_qsa_wmma(const float* __restrict__ q, const uint16_t* __restrict__ kc,
                const uint16_t* __restrict__ vc, const uint16_t* __restrict__ vct,
                float* __restrict__ out, int P,
                int dh, int hkv, int hq, const int* __restrict__ selected,
-               int first, int kbase = 0) {
+               int first, int kbase = 0, const int* __restrict__ ptab = nullptr) {
   (void)P;
+  (void)ptab;
   const int token = first + (int)blockIdx.x, kvh = blockIdx.y;
   const int qrow = token - kbase;  // batch-local q/out row; token stays absolute
   const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
@@ -1043,6 +1067,7 @@ __global__ void __launch_bounds__(256)
     long src = gkey < ntok ? (gkey < 2048 ? 4L * blocks[gkey / 4] + gkey % 4
                                           : tail0 + gkey - 2048)
                            : 0;
+    if constexpr (Paged) src = kv_row(ptab, (int)src);
     const uint16_t* kp = kc + ((size_t)src * hkv + kvh) * dh;
 #pragma unroll
     for (int k4 = 0; k4 < 4; ++k4) {
@@ -1139,6 +1164,8 @@ __global__ void __launch_bounds__(256)
           long vs = vk < ntok ? (vk < 2048 ? 4L * blocks[vk / 4] + vk % 4
                                            : tail0 + vk - 2048)
                               : 0;
+          // vs is 4-aligned here (blk*4 steps, 4-aligned tail0)
+          if constexpr (Paged) vs = (long)ik_blk(ptab, (int)(vs / 4)) * 4;
           vb[blk] = vct + ((((size_t)vs / 4) * hkv + kvh) * dh + w * 32) * 4;
         }
         unsigned long long pk[2][4];
@@ -1172,6 +1199,7 @@ __global__ void __launch_bounds__(256)
         long vs = vk < ntok ? (vk < 2048 ? 4L * blocks[vk / 4] + vk % 4
                                          : tail0 + vk - 2048)
                             : 0;
+        if constexpr (Paged) vs = kv_row(ptab, (int)vs);
         const uint16_t* vp =
             vc + ((size_t)vs * hkv + kvh) * dh + w * 32 + (lane >> 4) * 16;
         unsigned va[8];
@@ -1437,14 +1465,15 @@ __global__ void __launch_bounds__(128)
 __global__ void __launch_bounds__(128)
     k_qsa_union_merge(const int* __restrict__ sel, int g0,
                       uint16_t* __restrict__ ublk, uint16_t* __restrict__ umask,
-                      int* __restrict__ ucount, int cap) {
+                      int* __restrict__ ucount, int cap, int sbase = 0) {
   __shared__ int rows_s[4][512];
   __shared__ int scan_s[128];
   const int lane = threadIdx.x, g = blockIdx.x;
   const int t0 = g0 + 4 * g;  // 组首 token（绝对，4 对齐）
 #pragma unroll
   for (int qi = 0; qi < 4; ++qi) {
-    const int* src = sel + (size_t)(t0 + qi) * 512;
+    // sel 行号 = 绝对 token - sbase（A1b：d_iselected 按 batch 局部行存放）
+    const int* src = sel + (size_t)(t0 + qi - sbase) * 512;
     for (int j = lane; j < 512; j += 128) rows_s[qi][j] = src[j];
   }
   __syncthreads();

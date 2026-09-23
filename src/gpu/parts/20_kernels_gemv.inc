@@ -791,7 +791,8 @@ template <typename KVT = float>
 __global__ void k_qsa_step(const float* __restrict__ q, const KVT* __restrict__ kc,
                            const KVT* __restrict__ vc, float* __restrict__ out,
                            const int* __restrict__ d_pos, int dh, int hkv, int hq,
-                           const int* selected = nullptr, bool skip_sparse = false) {
+                           const int* selected = nullptr, bool skip_sparse = false,
+                           const int* __restrict__ ptab = nullptr) {
   int visible = *d_pos + 1;
   bool sparse = selected && visible >= 2052;
   if (sparse && skip_sparse) return;
@@ -804,7 +805,7 @@ __global__ void k_qsa_step(const float* __restrict__ q, const KVT* __restrict__ 
   int t = threadIdx.x;
   float mx = -1e30f;
   for (int p = t; p < ntok; p += blockDim.x) {
-    const KVT* kp = kc + ((size_t)qsa_source_pos(p, visible, selected) * hkv + kvh) * dh;
+    const KVT* kp = kc + ((size_t)kv_row(ptab, qsa_source_pos(p, visible, selected)) * hkv + kvh) * dh;
     float acc = 0.f;
     for (int i = 0; i < dh; i++) acc += qh[i] * kv_ld1(kp + i);
     mx = fmaxf(mx, acc * scale);
@@ -822,7 +823,7 @@ __global__ void k_qsa_step(const float* __restrict__ q, const KVT* __restrict__ 
   // pass 2: exp sum
   float se = 0.f;
   for (int p = t; p < ntok; p += blockDim.x) {
-    const KVT* kp = kc + ((size_t)qsa_source_pos(p, visible, selected) * hkv + kvh) * dh;
+    const KVT* kp = kc + ((size_t)kv_row(ptab, qsa_source_pos(p, visible, selected)) * hkv + kvh) * dh;
     float acc = 0.f;
     for (int i = 0; i < dh; i++) acc += qh[i] * kv_ld1(kp + i);
     se += expf(acc * scale - mx);
@@ -839,7 +840,7 @@ __global__ void k_qsa_step(const float* __restrict__ q, const KVT* __restrict__ 
   if (t < dh) {
     float acc = 0.f;
     for (int p = 0; p < ntok; p++) {
-      int source = qsa_source_pos(p, visible, selected);
+      int source = kv_row(ptab, qsa_source_pos(p, visible, selected));
       const KVT* kp = kc + ((size_t)source * hkv + kvh) * dh;
       float s = 0.f;
       for (int i = 0; i < dh; i++) s += qh[i] * kv_ld1(kp + i);
@@ -1245,24 +1246,38 @@ __global__ void k_rmsnorm_zc_ring(const float* __restrict__ x, const float* __re
 // --- QSA kv cache append at *d_pos (replaces pos-dependent memcpy) ----------
 __global__ void k_store_kv(const float* __restrict__ kb, const float* __restrict__ vb,
                            float* __restrict__ kc, float* __restrict__ vc,
-                           const int* __restrict__ d_pos) {
+                           const int* __restrict__ d_pos,
+                           const int* __restrict__ ptab = nullptr) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= 512) return;
-  size_t off = (size_t)(*d_pos) * 512 + i;
+  size_t off = (size_t)kv_row(ptab, *d_pos) * 512 + i;
   kc[off] = kb[i];
   vc[off] = vb[i];
 }
 
 // BF16 variant of the above: same layout, values rounded RNE via f2bf.
+// vct (optional, GDEC_QSA_WMMA_BTV): also write V into the block-transposed
+// prefill cache [block][kvh][dim][slot] (layout of k_f32_to_bf16_v4_bt, with
+// i = kvh*256 + dim), so later sparse prefill / verify reads of decoded
+// positions see the same bits as the row-major cache.
+// ptab (A1c, optional): paged addressing. The physical row is kv_row(pos) and
+// the physical vct block is kv_row(pos) >> 2 == ik_blk(pos >> 2) (a page holds
+// whole 4-token blocks), slot pos & 3 unchanged.
 __global__ void k_store_kv_bf16(const float* __restrict__ kb,
                                 const float* __restrict__ vb,
                                 uint16_t* __restrict__ kc, uint16_t* __restrict__ vc,
-                                const int* __restrict__ d_pos) {
+                                const int* __restrict__ d_pos,
+                                uint16_t* __restrict__ vct = nullptr,
+                                const int* __restrict__ ptab = nullptr) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= 512) return;
-  size_t off = (size_t)(*d_pos) * 512 + i;
+  const int pos = *d_pos;
+  const int row = kv_row(ptab, pos);
+  size_t off = (size_t)row * 512 + i;
   kc[off] = f2bf(kb[i]);
-  vc[off] = f2bf(vb[i]);
+  const uint16_t v = f2bf(vb[i]);
+  vc[off] = v;
+  if (vct) vct[((size_t)(row >> 2) * 512 + i) * 4 + (pos & 3)] = v;
 }
 
 // --- end-of-step: pos++, ringpos = (ringpos+1)%9 ----------------------------

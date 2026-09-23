@@ -138,6 +138,9 @@ bool restore(GpuModel& m, int idx, std::vector<int>* toks_out) {
   if (!ok) return false;
   m.pos = ck.pos;
   m.ple_ringpos = ck.ringpos;
+  // A2: the KV prefix [0, ck.pos) is still mapped (prefix_of(chist) guard);
+  // pages past it return to the pool and the continuation maps fresh ones.
+  m.kv_trim(ck.pos);
   CK(hipMemcpy(m.d_pos, &m.pos, 4, hipMemcpyHostToDevice));
   CK(hipMemcpy(m.d_ringpos, &m.ple_ringpos, 4, hipMemcpyHostToDevice));
   m.chist.assign(ck.toks.begin(), ck.toks.end());
