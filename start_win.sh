@@ -45,6 +45,7 @@ API_PORT="${API_PORT:-8731}"
 MAX_CONTEXT="${MAX_CONTEXT:-262144}"
 MTP_GAMMA="${MTP_GAMMA:-3}"
 KVSNAP_MAX_GB="${KVSNAP_MAX_GB:-20}"
+RCKPT_MAX="${RCKPT_MAX:-8}"
 # 本机 68 GiB 权重 cold-load 实测 ~9 分钟（NVMe 弱盘），超时给足。
 START_TIMEOUT="${START_TIMEOUT:-1800}"
 
@@ -52,7 +53,8 @@ START_TIMEOUT="${START_TIMEOUT:-1800}"
 [[ "$API_PORT" =~ ^[1-9][0-9]*$ && "$API_PORT" -le 65535 ]] || fail 'API_PORT 必须为 1–65535'
 [[ "$ENGINE_PORT" != "$API_PORT" ]] || fail 'ENGINE_PORT 与 API_PORT 必须不同'
 [[ "$MTP_GAMMA" =~ ^[1-8]$ ]] || fail 'MTP_GAMMA 范围为 1–8'
-[[ "$KVSNAP_MAX_GB" =~ ^[1-9][0-9]*$ ]] || fail 'KVSNAP_MAX_GB 必须为正整数'
+[[ "$KVSNAP_MAX_GB" =~ ^(0|[1-9][0-9]*)$ ]] || fail 'KVSNAP_MAX_GB 必须为非负整数'
+[[ "$RCKPT_MAX" =~ ^(0|[1-9][0-9]*)$ ]] || fail 'RCKPT_MAX 必须为非负整数'
 [[ -f build/gdec-win.exe ]] || fail '缺少 build/gdec-win.exe，请先运行 bash build_win.sh'
 [[ -f build/gdec-api-win.exe ]] || fail '缺少 build/gdec-api-win.exe，请先运行 bash build_win.sh api'
 [[ -r "$MODEL_FILE" ]] || fail "找不到模型：$MODEL_FILE"
@@ -81,7 +83,8 @@ export GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1
 export GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1
 export GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 GDEC_NOWARMUP=1
 export GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1
-export GDEC_KVSNAP=1 GDEC_KVSNAP_MAX_GB="$KVSNAP_MAX_GB"
+if (( KVSNAP_MAX_GB )); then export GDEC_KVSNAP=1; else export GDEC_KVSNAP=0; fi
+export GDEC_KVSNAP_MAX_GB="$KVSNAP_MAX_GB" GDEC_RCKPT_MAX="$RCKPT_MAX"
 export GDEC_SPEC_GAMMA="$MTP_GAMMA"
 
 mkdir -p logs

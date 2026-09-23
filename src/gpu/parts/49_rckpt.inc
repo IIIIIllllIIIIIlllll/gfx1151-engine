@@ -21,13 +21,13 @@ struct Ck {
   std::vector<std::array<int, 3>> grids;
 };
 
-static const bool g_on = [] {
-  const char* v = getenv("GDEC_RCKPT");
-  return !v || atoi(v) != 0;
-}();
 static const size_t g_cap = [] {
   const char* v = getenv("GDEC_RCKPT_MAX");
-  return v ? (size_t)std::max(1, atoi(v)) : 8;
+  return v ? (size_t)std::max(0, atoi(v)) : 8;
+}();
+static const bool g_on = [] {
+  const char* v = getenv("GDEC_RCKPT");
+  return g_cap != 0 && (!v || atoi(v) != 0);
 }();
 static const size_t g_min_tokens = [] {
   const char* v = getenv("GDEC_RCKPT_MIN");

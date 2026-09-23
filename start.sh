@@ -25,9 +25,13 @@ if [[ -f "$ROOT/build/bundled-runtime.conf" ]]; then
       fail "缺少随包运行库：$pattern，请重新运行 bash build.sh --bundle"
   done
 fi
-for key in ENGINE_PORT API_PORT MAX_CONTEXT MTP_GAMMA MEMORY_CAP_GB MIN_AVAILABLE_GB START_TIMEOUT STALL_TIMEOUT KVSNAP_MAX_GB RCKPT_MAX; do
+for key in ENGINE_PORT API_PORT MAX_CONTEXT MTP_GAMMA MEMORY_CAP_GB MIN_AVAILABLE_GB START_TIMEOUT STALL_TIMEOUT; do
   value="${!key}"
   [[ "$value" =~ ^[1-9][0-9]*$ && ${#value} -le 8 ]] || fail "$key 必须为正整数"
+done
+for key in KVSNAP_MAX_GB RCKPT_MAX; do
+  value="${!key}"
+  [[ "$value" =~ ^(0|[1-9][0-9]*)$ && ${#value} -le 8 ]] || fail "$key 必须为非负整数"
 done
 [[ "$PLE_URING" =~ ^[01]$ ]] || fail 'PLE_URING 必须为 0 或 1'
 (( ENGINE_PORT <= 65535 && API_PORT <= 65535 && ENGINE_PORT != API_PORT )) || fail '端口必须为不同的 1–65535 整数'
@@ -109,7 +113,7 @@ export GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 GDEC_NOWARMUP=1
 # 32768性能最佳但是吃的显存太多，8192吃的最少但是性能最差，16384折中一下，性能损失不大，吃的显存更少
 export GDEC_PREFILL_CHUNK=16384
 export GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1
-export GDEC_KVSNAP=1
+if (( KVSNAP_MAX_GB )); then export GDEC_KVSNAP=1; else export GDEC_KVSNAP=0; fi
 # PLE io_uring 聚集由 service.conf 的 PLE_URING 控制；引擎只查 GDEC_PLE_URING
 # 的存在性（设 0 也会开），故 0 时必须不导出。
 if (( PLE_URING )); then export GDEC_PLE_URING=1; fi

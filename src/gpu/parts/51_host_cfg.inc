@@ -776,6 +776,7 @@ static int run(GpuModel& m, int port) {
     if (!strcmp(v, "0")) kvs.dir.clear();
   if (const char* v = getenv("GDEC_KVSNAP_MAX_GB"))
     kvs.cap_bytes = (uint64_t)(atof(v) * 1073741824.0);
+  if (!kvs.cap_bytes) kvs.dir.clear();
   if (const char* v = getenv("GDEC_KVSNAP_MIN")) kvs.min_tokens = (size_t)atol(v);
   if (!kvs.dir.empty())
     fprintf(stderr, "kvsnap: dir %s, cap %.1f GB, min %zu tokens\n",
