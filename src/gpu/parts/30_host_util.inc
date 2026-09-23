@@ -106,9 +106,11 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
                     !(btv && getenv("GDEC_QSA_UNION")));
   const bool kv_paged = (kv_fp32 || kv_bf16_pg_ok) && kvpe && atoi(kvpe) != 0;
   const size_t kvpg = (mc + KV_PAGE - 1) / KV_PAGE;
-  // A2：物理页池 = kvpg 页 + 1 个 guard 页；页表仍是每序列 kvpg 项
-  const size_t kv_rows = kv_paged ? (kvpg + 1) * KV_PAGE : mc;
-  const size_t ik_rows = kv_paged ? (kvpg + 1) * KV_PAGE_BLOCKS : ib;
+  // A2/A3：物理页池 = kv_pool_pages_for(mc) 页（默认 kvpg，GDEC_KV_POOL_TOKENS 可加大）
+  // + 1 个 guard 页；页表仍是每序列 kvpg 项
+  const size_t kvpool = (size_t)kv_pool_pages_for((int)mc);
+  const size_t kv_rows = kv_paged ? (kvpool + 1) * KV_PAGE : mc;
+  const size_t ik_rows = kv_paged ? (kvpool + 1) * KV_PAGE_BLOCKS : ib;
   if (kv_paged) add(kvpg * 4);  // d_ptab
   add((size_t)64 << 20);  // decode 单行小缓冲合计（d_R..d_logits 等）
   add(ngdn * 48 * 128 * 128 * 4);           // d_S

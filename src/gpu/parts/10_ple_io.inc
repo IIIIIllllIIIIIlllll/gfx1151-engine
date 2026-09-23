@@ -382,7 +382,43 @@ struct KvSeqTable {
     }
     return n;
   }
+  // A3: take a reference on the pages holding rows [0, pos) (a checkpoint).
+  std::vector<int> pin(KvPagePool& pool, int pos) const {
+    const int n = std::min(mapped, std::max(0, (pos + KV_PAGE - 1) / KV_PAGE));
+    std::vector<int> v(tab.begin(), tab.begin() + n);
+    for (int p : v) pool.addref(p);
+    return v;
+  }
+  static void unpin(KvPagePool& pool, const std::vector<int>& pages) {
+    for (size_t i = pages.size(); i-- > 0;) pool.unref(pages[i]);
+  }
+  // A3: map exactly `pages` (a pinned checkpoint prefix). The new references
+  // are taken before the old mapping drops, so shared pages never hit the
+  // free list in between.
+  void adopt(KvPagePool& pool, const std::vector<int>& pages) {
+    for (int p : pages) pool.addref(p);
+    trim(pool, 0);
+    for (size_t i = 0; i < pages.size(); i++) tab[i] = pages[i];
+    mapped = (int)pages.size();
+  }
+  // A3 copy-on-write: logical page lp now maps fresh page p (already holding
+  // a copy); the shared original loses the live reference.
+  void replace(KvPagePool& pool, int lp, int p) {
+    const int old = tab[(size_t)lp];
+    tab[(size_t)lp] = p;
+    pool.unref(old);
+  }
 };
+
+// A3: physical pool size in pages. Default: one full-length sequence — pinned
+// RAM checkpoints share it and are LRU-evicted when the live sequence needs
+// pages. GDEC_KV_POOL_TOKENS=<n> enlarges it (never below one sequence).
+static inline int kv_pool_pages_for(int maxctx) {
+  const long long lp = (maxctx + KV_PAGE - 1) / KV_PAGE;
+  const char* v = getenv("GDEC_KV_POOL_TOKENS");
+  const long long t = v ? atoll(v) : 0;
+  return (int)std::max(lp, (t + KV_PAGE - 1) / KV_PAGE);
+}
 
 // KV cache element access: FP32 caches load directly; BF16 caches expand to
 // fp32 in registers (LDS staging and arithmetic stay fp32 either way).

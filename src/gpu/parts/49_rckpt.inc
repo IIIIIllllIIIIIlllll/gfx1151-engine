@@ -6,6 +6,12 @@
 // a prefix of the live token stream (m.chist) — that prefix check is the
 // validity guard. kvsnap (51_host_cfg.inc) is the self-contained SSD tier:
 // slower and sparse, but survives restarts and KV clobbering.
+//
+// A3 (GDEC_KV_PAGED): a checkpoint also pins the physical KV pages of its
+// prefix (refcount), so it stays valid after the live stream diverges —
+// switching back to an earlier conversation remaps its pages instead of
+// re-prefilling. Live writes into a shared page copy it first (kv_cow).
+// When the page pool runs dry the LRU checkpoint is evicted (evict_one).
 
 namespace rckpt {
 
@@ -13,6 +19,7 @@ struct Ck {
   std::vector<int> toks;  // tokens covered; restore sets hist/chist to this
   int pos = 0, ringpos = 0;
   std::vector<float> s, convst, ring, iraw;  // host copies, ~118 MB total
+  std::vector<int> pages;  // A3: pinned KV pages for rows [0, pos) (paged only)
   // M-RoPE guard (KVS2 meta semantics): placeholder ids are pixel-agnostic,
   // so a vision checkpoint only matches the same grids and patch hash.
   bool mrope = false;
@@ -34,6 +41,26 @@ static const size_t g_min_tokens = [] {
   return v ? (size_t)atol(v) : 4096;
 }();
 static std::deque<Ck> g_list;  // front = oldest
+static GpuModel* g_m = nullptr;  // set on the first save
+static bool g_pin = false;       // A3: checkpoints own their KV pages
+
+static void release(Ck& ck) {
+  if (g_m && !ck.pages.empty()) g_m->kv_unpin(ck.pages);
+  ck.pages.clear();
+}
+static void drop_front() {
+  release(g_list.front());
+  g_list.pop_front();
+}
+// Pool pressure (called from GpuModel::kv_reserve / kv_cow): drop the LRU
+// checkpoint. Its GDN state goes too — a checkpoint without KV is useless.
+static bool evict_one(GpuModel&) {
+  if (g_list.empty()) return false;
+  fprintf(stderr, "[kvpage] rckpt evicted (%zu tokens, %zu pages) for pool space\n",
+          g_list.front().toks.size(), g_list.front().pages.size());
+  drop_front();
+  return true;
+}
 
 static uint64_t hash_toks(const std::vector<int>& t) {
   uint64_t h = 1469598103934665603ULL;
@@ -54,8 +81,10 @@ static bool prefix_of(const std::vector<int>& t,
 
 bool enabled() { return g_on; }
 
-// Drop checkpoints whose KV prefix the live state no longer holds.
+// Drop checkpoints whose KV prefix the live state no longer holds. A3: pinned
+// checkpoints own their KV, so nothing to prune.
 void prune(const std::vector<int64_t>& chist) {
+  if (g_pin) return;
   for (auto it = g_list.begin(); it != g_list.end();)
     it = prefix_of(it->toks, chist) ? std::next(it) : g_list.erase(it);
 }
@@ -63,6 +92,11 @@ void prune(const std::vector<int64_t>& chist) {
 void save(GpuModel& m, const std::vector<int>& toks) {
   if (!g_on || toks.size() < g_min_tokens || toks.size() != (size_t)m.pos)
     return;
+  if (!g_m) {
+    g_m = &m;
+    g_pin = m.kv_paged;
+    if (g_pin) m.kv_evict_fn = &evict_one;
+  }
   const uint64_t h = hash_toks(toks);
   for (auto it = g_list.begin(); it != g_list.end(); ++it)
     if (it->toks.size() == toks.size() && hash_toks(it->toks) == h &&
@@ -96,8 +130,9 @@ void save(GpuModel& m, const std::vector<int>& toks) {
   ck.img_hash = m.img_hash_;
   ck.grids = m.mrope_grids_;
   prune(m.chist);
+  if (g_pin) ck.pages = m.kv_pin(m.pos);
   g_list.push_back(std::move(ck));
-  while (g_list.size() > g_cap) g_list.pop_front();
+  while (g_list.size() > g_cap) drop_front();
 }
 
 // Longest checkpoint whose tokens are a strict prefix of `prompt` (strictly
@@ -138,9 +173,16 @@ bool restore(GpuModel& m, int idx, std::vector<int>* toks_out) {
   if (!ok) return false;
   m.pos = ck.pos;
   m.ple_ringpos = ck.ringpos;
-  // A2: the KV prefix [0, ck.pos) is still mapped (prefix_of(chist) guard);
-  // pages past it return to the pool and the continuation maps fresh ones.
-  m.kv_trim(ck.pos);
+  if (g_pin) {
+    // A3: map the checkpoint's own pages; the live pages not shared with it
+    // return to the pool. The shared partial tail page is copied on the
+    // first write past ck.pos (kv_prepare).
+    m.kv_adopt(ck.pages);
+  } else {
+    // A2: the KV prefix [0, ck.pos) is still mapped (prefix_of(chist) guard);
+    // pages past it return to the pool and the continuation maps fresh ones.
+    m.kv_trim(ck.pos);
+  }
   CK(hipMemcpy(m.d_pos, &m.pos, 4, hipMemcpyHostToDevice));
   CK(hipMemcpy(m.d_ringpos, &m.ple_ringpos, 4, hipMemcpyHostToDevice));
   m.chist.assign(ck.toks.begin(), ck.toks.end());

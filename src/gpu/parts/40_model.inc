@@ -59,9 +59,16 @@ struct GpuModel {
   // resets (kv_trim). GDEC_KV_PAGED=1: lowest-free-first allocation, =2:
   // scrambled order + FIFO reuse (self-test). Physical page kv_pool.guard()
   // backs every unmapped logical page.
+  // A3: RAM checkpoints (49_rckpt.inc) pin their prefix pages by refcount
+  // (kv_pin / kv_unpin) and are restored by remapping (kv_adopt) instead of
+  // requiring their tokens to be a prefix of the live stream. A write into a
+  // page still shared with a checkpoint copies it first (kv_prepare -> kv_cow).
+  // When the pool runs dry, kv_evict_fn drops the LRU checkpoint.
   bool kv_paged = false;
   int kv_lpages = 0;            // logical pages per sequence = ceil(maxctx / 256)
-  int kv_pool_pages = 0;        // allocatable physical pages (A2: == kv_lpages)
+  int kv_pool_pages = 0;        // allocatable physical pages (kv_pool_pages_for)
+  int kv_mode = 0;              // GDEC_KV_PAGED value (2 = self-test logging)
+  bool (*kv_evict_fn)(GpuModel&) = nullptr;  // A3: drop one pinned checkpoint
   size_t kv_layer_rows = 0;     // per-layer KV row stride (== maxctx unpaged)
   size_t ik_layer_blocks = 0;   // per-layer d_ik block stride (== index_blocks unpaged)
   int* d_ptab = nullptr;        // [kv_lpages] live logical page -> physical page
@@ -328,10 +335,11 @@ struct GpuModel {
         mode = 0;
       }
       kv_paged = mode != 0;
+      kv_mode = mode;
       kv_lpages = (maxctx + KV_PAGE - 1) / KV_PAGE;
-      // A2: the pool holds exactly one full-length sequence (A3 adds shared
-      // checkpoint pages and a configurable pool); +1 physical guard page.
-      kv_pool_pages = kv_lpages;
+      // A3: at least one full-length sequence; pinned checkpoints share the
+      // pool (GDEC_KV_POOL_TOKENS enlarges it); +1 physical guard page.
+      kv_pool_pages = kv_pool_pages_for(maxctx);
       kv_layer_rows =
           kv_paged ? (size_t)(kv_pool_pages + 1) * KV_PAGE : (size_t)maxctx;
       if (kv_paged) {
@@ -346,6 +354,10 @@ struct GpuModel {
                 kv_pool_pages, KV_PAGE,
                 mode == 2 ? "scrambled+fifo(self-test)" : "lowest-first",
                 qsa_kv_fp32 ? "fp32" : (qsa_wmma_btv ? "bf16+btv" : "bf16"));
+        if (kv_pool_pages > kv_lpages)
+          fprintf(stderr, "[kvpage] pool enlarged: %d pages = %.2fx one sequence "
+                          "(GDEC_KV_POOL_TOKENS)\n",
+                  kv_pool_pages, (double)kv_pool_pages / kv_lpages);
       }
     }
     if (!qsa_dense) {
@@ -2027,24 +2039,94 @@ struct GpuModel {
   // ---- A2: on-demand page mapping of the live sequence ----
   // Every device write to the trunk QSA KV / indexer keys goes through
   // prefill_chunk (rows [base, base+P)) or forward (row pos), and both call
-  // kv_reserve first; the only other writer is kvsnap::restore, which
-  // reserves its rows itself. New entries were guard entries that no
+  // kv_prepare first; the only other writer is kvsnap::restore, which
+  // reserves fresh rows itself. New entries were guard entries that no
   // in-flight kernel reads, so the table upload needs no extra sync.
+  // A3: drop the LRU pinned checkpoint; false when there is none left.
+  bool kv_evict_one() { return kv_evict_fn && kv_evict_fn(*this); }
+  [[noreturn]] void kv_fatal(const char* what, int end) {
+    fprintf(stderr,
+            "[kvpage] FATAL: %s (%d tokens; pool %d pages, %d free, table %d "
+            "pages, mapped %d)\n",
+            what, end, kv_pool_pages, kv_pool.nfree(), kv_lpages, kv_seq.mapped);
+    exit(1);
+  }
   void kv_reserve(int end) {
     if (!kv_paged || end <= kv_seq.rows()) return;
+    if ((end + KV_PAGE - 1) / KV_PAGE > kv_lpages) kv_fatal("beyond maxctx", end);
     const int m0 = kv_seq.mapped;
-    if (!kv_seq.reserve(kv_pool, end)) {
-      fprintf(stderr,
-              "[kvpage] FATAL: cannot back %d tokens (pool %d pages, %d free, "
-              "table %d pages)\n",
-              end, kv_pool_pages, kv_pool.nfree(), kv_lpages);
-      exit(1);
-    }
+    // pool dry: evict pinned checkpoints (LRU first) until the rows fit
+    while (!kv_seq.reserve(kv_pool, end))
+      if (!kv_evict_one()) kv_fatal("pool exhausted", end);
     CK(hipMemcpy(d_ptab + m0, kv_seq.tab.data() + m0,
                  (size_t)(kv_seq.mapped - m0) * 4, hipMemcpyHostToDevice));
-    if (kv_pool.order == 2 && m0 == 0)
+    if (kv_mode == 2 && m0 == 0)
       fprintf(stderr, "[kvpage] seq map: logical 0 -> phys %d (free %d/%d)\n",
               kv_seq.tab[0], kv_pool.nfree(), kv_pool_pages);
+  }
+  // A3: rows [start, end) are about to be written. Pages there that a pinned
+  // checkpoint shares are copied first (in practice only the partial page
+  // holding `start`), then the tail is mapped. Cheap host check otherwise.
+  void kv_prepare(int start, int end) {
+    if (!kv_paged) return;
+    const int lp1 = std::min(kv_seq.mapped, (end + KV_PAGE - 1) / KV_PAGE);
+    for (int lp = std::max(0, start) / KV_PAGE; lp < lp1; lp++)
+      if (kv_pool.ref[(size_t)kv_seq.tab[(size_t)lp]] > 1) kv_cow(lp);
+    kv_reserve(end);
+  }
+  void kv_cow(int lp) {
+    const int old = kv_seq.tab[(size_t)lp];
+    int p;
+    while ((p = kv_pool.alloc()) < 0) {
+      if (!kv_evict_one()) kv_fatal("pool exhausted (copy-on-write)", lp * KV_PAGE);
+      if (kv_pool.ref[(size_t)old] == 1) return;  // the other holder was evicted
+    }
+    CK(hipDeviceSynchronize());  // no in-flight kernel may still write `old`
+    std::vector<std::pair<void*, size_t>> src, dst;
+    kv_page_regions(old, [&](void* q, size_t n) { src.emplace_back(q, n); });
+    kv_page_regions(p, [&](void* q, size_t n) { dst.emplace_back(q, n); });
+    for (size_t i = 0; i < src.size(); i++)
+      CK(hipMemcpy(dst[i].first, src[i].first, src[i].second, hipMemcpyDeviceToDevice));
+    kv_seq.replace(kv_pool, lp, p);
+    CK(hipMemcpy(d_ptab + lp, &p, 4, hipMemcpyHostToDevice));
+    kv_cow_count++;
+    if (kv_mode == 2)
+      fprintf(stderr, "[kvpage] cow logical %d: phys %d -> %d (free %d/%d)\n", lp,
+              old, p, kv_pool.nfree(), kv_pool_pages);
+  }
+  long long kv_cow_count = 0;
+  // A3: pin / unpin / adopt the live prefix for RAM checkpoints.
+  std::vector<int> kv_pin(int pos) {
+    if (!kv_paged) return {};
+    if ((pos + KV_PAGE - 1) / KV_PAGE > kv_seq.mapped) kv_fatal("pin beyond mapped", pos);
+    std::vector<int> v = kv_seq.pin(kv_pool, pos);
+    if (kv_mode == 2)
+      fprintf(stderr, "[kvpage] pin %zu pages for %d tokens (free %d/%d)\n", v.size(),
+              pos, kv_pool.nfree(), kv_pool_pages);
+    return v;
+  }
+  void kv_unpin(const std::vector<int>& pages) {
+    if (!kv_paged || pages.empty()) return;
+    KvSeqTable::unpin(kv_pool, pages);
+    if (kv_mode == 2)
+      fprintf(stderr, "[kvpage] unpin %zu pages (free %d/%d)\n", pages.size(),
+              kv_pool.nfree(), kv_pool_pages);
+  }
+  void kv_adopt(const std::vector<int>& pages) {
+    if (!kv_paged) return;
+    CK(hipDeviceSynchronize());  // entries about to change may still be read
+    const int m1 = kv_seq.mapped;
+    kv_seq.adopt(kv_pool, pages);
+    const int n = std::max(m1, kv_seq.mapped);
+    if (n > 0)
+      CK(hipMemcpy(d_ptab, kv_seq.tab.data(), (size_t)n * 4, hipMemcpyHostToDevice));
+    if (kv_mode == 2) {
+      fprintf(stderr, "[kvpage] adopt %d pages (was %d mapped, free %d/%d)\n",
+              kv_seq.mapped, m1, kv_pool.nfree(), kv_pool_pages);
+      if (kv_guard_dirty())
+        fprintf(stderr, "[kvpage] ERROR: GUARD PAGE WRITTEN — some kernel wrote "
+                        "through an unmapped logical page\n");
+    }
   }
   // Release the pages that hold no row < keep_pos (reset_state: 0; RAM/SSD
   // checkpoint restores: the restored length). Waits for the device first:
@@ -2057,7 +2139,7 @@ struct GpuModel {
     CK(hipDeviceSynchronize());
     CK(hipMemcpy(d_ptab + m0, kv_seq.tab.data() + m0, (size_t)(m1 - m0) * 4,
                  hipMemcpyHostToDevice));
-    if (kv_pool.order == 2) {
+    if (kv_mode == 2) {
       fprintf(stderr, "[kvpage] released %d pages (mapped %d, free %d/%d)\n",
               m1 - m0, m0, kv_pool.nfree(), kv_pool_pages);
       if (kv_guard_dirty())
@@ -2068,8 +2150,13 @@ struct GpuModel {
   // The guard page's slice of every paged buffer: fn(device ptr, bytes).
   template <typename F>
   void kv_guard_regions(F&& fn) {
+    kv_page_regions(kv_pool.guard(), fn);
+  }
+  // Physical page `page`'s slice of every paged buffer, in a fixed order.
+  template <typename F>
+  void kv_page_regions(int page, F&& fn) {
     const int nqsa = g_cfg.layers / 4;
-    const size_t g = (size_t)kv_pool.guard();
+    const size_t g = (size_t)page;
     for (int qi = 0; qi < nqsa; qi++) {
       const size_t row0 = (size_t)qi * kv_layer_rows + g * KV_PAGE;
       if (qsa_kv_fp32) {
@@ -2953,7 +3040,7 @@ struct GpuModel {
               "(maxctx=%d maxbatch_cap=%d)\n", base, P, maxctx, maxbatch_cap);
       exit(1);
     }
-    kv_reserve(base + P);  // A2: back rows [base, base+P) before any KV write
+    kv_prepare(base, base + P);  // A2/A3: back (and unshare) rows [base, base+P)
     static const bool phase_prof = getenv("GDEC_PHASE") != nullptr;
     auto phase = [&](const char* tag, std::chrono::steady_clock::time_point& tp) {
       if (!phase_prof) return;
@@ -5065,7 +5152,7 @@ struct GpuModel {
   }
 
   int forward(int token) {
-    kv_reserve(pos + 1);  // A2: back row pos (graph and direct paths)
+    kv_prepare(pos, pos + 1);  // A2/A3: back (and unshare) row pos, both paths
     if (graphs_ok) {
       *p_token = token;
       auto g0 = std::chrono::steady_clock::now();

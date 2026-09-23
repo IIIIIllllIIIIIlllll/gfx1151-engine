@@ -2318,6 +2318,36 @@ int main() {
     }
     printf("%-28s %s\n", "kvpool_alloc_table", ok ? "PASS" : "FAIL");
     fails += !ok;
+    // A3: checkpoint pin / adopt / copy-on-write bookkeeping
+    ok = true;
+    {
+      const int n = 16;
+      KvPagePool pool;
+      pool.init(n, 1);
+      KvSeqTable seq;
+      seq.init(n, pool.guard());
+      expect(seq.reserve(pool, 1000) && seq.mapped == 4, "a3 reserve");
+      std::vector<int> ck = seq.pin(pool, 900);  // ceil(900/256) = 4 pages
+      expect(ck.size() == 4 && pool.ref[3] == 2, "a3 pin takes a reference");
+      seq.trim(pool, 0);  // reset_state: the pinned pages stay allocated
+      expect(pool.nfree() == n - 4, "a3 pinned pages survive reset");
+      expect(seq.reserve(pool, 600) && seq.tab[0] == 4, "a3 next sequence gets fresh pages");
+      seq.adopt(pool, ck);  // rckpt restore
+      expect(seq.mapped == 4 && seq.tab[3] == 3 && pool.nfree() == n - 4 &&
+                 pool.ref[3] == 2 && seq.tab[4] == pool.guard(),
+             "a3 adopt maps the checkpoint pages");
+      const int p = pool.alloc();  // copy-on-write of the tail page
+      seq.replace(pool, 3, p);
+      expect(seq.tab[3] == p && pool.ref[3] == 1 && pool.ref[(size_t)p] == 1, "a3 replace");
+      KvSeqTable::unpin(pool, ck);  // checkpoint evicted
+      expect(pool.ref[3] == 0 && pool.ref[0] == 1 && pool.nfree() == n - 4, "a3 unpin");
+      seq.trim(pool, 0);
+      expect(pool.nfree() == n, "a3 conservation");
+      std::vector<int> e = seq.pin(pool, 0);
+      expect(e.empty(), "a3 pin of an empty prefix");
+    }
+    printf("%-28s %s\n", "kvpool_pin_cow", ok ? "PASS" : "FAIL");
+    fails += !ok;
   }
 
   printf(fails ? "== %d FAILURES ==\n" : "== ALL PASS ==\n", fails);
