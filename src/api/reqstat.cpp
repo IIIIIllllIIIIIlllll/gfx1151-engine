@@ -6,6 +6,7 @@
 #include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <string>
 
 namespace reqstat {
 namespace {
@@ -169,8 +170,11 @@ class Recorder {
     std::error_code ec;
     for (auto& de : std::filesystem::directory_iterator(dir, ec)) {
       uint64_t v = 0;
-      if (sscanf(de.path().filename().c_str(), "reqstat-%llu.bin",
-                 (unsigned long long*)&v) == 1 && v > best)
+      // 经 .string() 取窄字符：MSVC 头下 path::value_type 是 wchar_t，
+      // filename().c_str() 不能直接喂 sscanf。本目录文件名均为 ASCII。
+      const std::string name = de.path().filename().string();
+      if (sscanf(name.c_str(), "reqstat-%llu.bin", (unsigned long long*)&v) == 1 &&
+          v > best)
         best = (uint32_t)v;
     }
     return best + 1;
