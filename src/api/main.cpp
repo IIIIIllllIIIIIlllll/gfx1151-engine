@@ -967,12 +967,23 @@ void handle_memory(const http::Request&, http::Response* r, http::Stream*) {
     r->body = json_py::dumps(j, /*spaced=*/false);
 }
 
+// GET / 和 GET /dashboard — static monitoring page (see dashboard_html.inc).
+// 页面加载后用同源 fetch 轮询 /health 与 /memory，这里只负责回 HTML。
+#include "dashboard_html.inc"
+
+void handle_dashboard(const http::Request&, http::Response* r, http::Stream*) {
+    r->content_type = "text/html; charset=utf-8";
+    r->set("Cache-Control", "no-store");
+    r->body = kDashboardHtml;
+}
+
 void handle_health(const http::Request&, http::Response* r, http::Stream*) {
     json j;
     j["status"] = "ok";
     j["model"] = g_cfg.model;
     j["endpoints"] = json::array(
-        {"/v1/chat/completions", "/v1/completions", "/v1/models", "/v1/responses"});
+        {"/v1/chat/completions", "/v1/completions", "/v1/models", "/v1/responses",
+         "/dashboard"});
     j["context"] = g_cfg.context;
     j["rope_scaling"] = nullptr;
     {
@@ -1866,6 +1877,8 @@ int main(int argc, char** argv) {
     fprintf(stderr, "gdec-api: listening on :%d model=%s ctx=%d slots=1\n", srv.port(),
             g_cfg.model.c_str(), g_cfg.context);
 
+    srv.on("GET", "/", handle_dashboard);
+    srv.on("GET", "/dashboard", handle_dashboard);
     srv.on("GET", "/v1/models", handle_models);
     srv.on("GET", "/health", handle_health);
     srv.on("GET", "/memory", handle_memory);
