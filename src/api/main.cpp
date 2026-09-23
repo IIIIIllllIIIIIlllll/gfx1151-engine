@@ -1370,7 +1370,9 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
         j["created"] = created;
         j["model"] = g_cfg.model;
         j["object"] = "chat.completion";
-        const std::string finish = parser.calls().empty() ? o.reason : "tool_calls";
+        const std::string finish = (o.reason == "length" || parser.has_partial_call())
+                                       ? "length"
+                                       : (parser.calls().empty() ? o.reason : "tool_calls");
         json choice{{"index", 0}, {"finish_reason", finish}, {"message", msg}};
         if (spec.logprobs) choice["logprobs"] = logprobs_json(o.logprobs);
         j["choices"] = json::array({std::move(choice)});
@@ -1432,7 +1434,9 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
         if (!dispatch_tool_events(parser.feed(ct))) return;
     }
     if (!dispatch_tool_events(parser.finish())) return;
-    const std::string finish = parser.calls().empty() ? o.reason : "tool_calls";
+    const std::string finish = (o.reason == "length" || parser.has_partial_call())
+                                   ? "length"
+                                   : (parser.calls().empty() ? o.reason : "tool_calls");
     send_frame(st, chunk(json::object(), finish.c_str()));
     if (include_usage) {
         json u;
@@ -1554,7 +1558,9 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
                                  {"output_tokens", outcome->n_gen},
                                  {"total_tokens", pt + outcome->n_gen}};
             if (status == "incomplete")
-                response["incomplete_details"] = {{"reason", "max_output_tokens"}};
+                response["incomplete_details"] = {
+                    {"reason", outcome->reason == "length" ? "max_output_tokens"
+                                                              : "invalid_tool_call"}};
         }
         return response;
     };
@@ -1574,7 +1580,7 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
         parser.feed(answer);
         parser.finish();
 
-        const bool incomplete = o.reason == "length" && parser.calls().empty();
+        const bool incomplete = o.reason == "length" || parser.has_partial_call();
         json output = json::array();
         if (!parser.content().empty() || (!incomplete && parser.calls().empty())) {
             output.push_back(message_item(make_id("msg_"),

@@ -79,6 +79,70 @@ int main() {
     check(bytewise.calls().size() == 1 && streamed_args == bytewise.calls()[0].arguments,
           "streamed arguments equal final JSON");
 
+    const std::string code = "    if (ready) {\n        write();\n    }  \n\n";
+    const std::string code_call =
+        "<tool_call>\n<function=write_file>\n<parameter=content>\n" + code +
+        "\n</parameter>\n</function>\n</tool_call>";
+    toolparse::StreamParser code_whole(tools(), make_id);
+    code_whole.feed(code_call);
+    code_whole.finish();
+    check(code_whole.calls().size() == 1 &&
+              json::parse(code_whole.calls()[0].arguments)["content"] == code,
+          "code indentation and trailing whitespace preserved");
+    toolparse::StreamParser code_stream(tools(), make_id);
+    std::string code_deltas;
+    for (char character : code_call)
+        for (const auto& event : code_stream.feed(std::string(1, character)))
+            if (event.type == toolparse::EventType::ArgumentsDelta) code_deltas += event.data;
+    for (const auto& event : code_stream.finish())
+        if (event.type == toolparse::EventType::ArgumentsDelta) code_deltas += event.data;
+    check(code_stream.calls().size() == 1 &&
+              code_deltas == code_stream.calls()[0].arguments &&
+              json::parse(code_deltas)["content"] == code,
+          "bytewise code arguments match final content");
+
+    json union_tools = tools();
+    union_tools[0]["function"]["parameters"]["properties"]["content"]["type"] =
+        json::array({"integer", "string"});
+    toolparse::StreamParser union_parser(union_tools, make_id);
+    union_parser.feed("<tool_call>\n<function=write_file>\n"
+                      "<parameter=content>\n  text  \n</parameter>\n"
+                      "</function>\n</tool_call>");
+    union_parser.finish();
+    check(union_parser.calls().size() == 1 &&
+              json::parse(union_parser.calls()[0].arguments)["content"] == "  text  ",
+          "union string argument retains whitespace");
+
+    const std::string inline_tag =
+        "<tool_call>\n<function=write_file>\n<parameter=content>\n"
+        "const tag = \"</parameter>\";\n</parameter>\n</function>\n</tool_call>";
+    toolparse::StreamParser inline_parser(tools(), make_id);
+    inline_parser.feed(inline_tag);
+    inline_parser.finish();
+    check(inline_parser.calls().size() == 1 &&
+              json::parse(inline_parser.calls()[0].arguments)["content"] ==
+                  "const tag = \"</parameter>\";",
+          "inline closing tag remains file content");
+
+    const std::string ambiguous_tag =
+        "<tool_call>\n<function=write_file>\n<parameter=content>\n"
+        "before\n</parameter>\nafter\n</parameter>\n</function>\n</tool_call>";
+    toolparse::StreamParser ambiguous(tools(), make_id);
+    ambiguous.feed(ambiguous_tag);
+    ambiguous.finish();
+    check(ambiguous.has_partial_call() && ambiguous.calls().empty(),
+          "ambiguous closing line does not return a truncated call");
+
+    const std::string crlf_call =
+        "<tool_call>\r\n<function=write_file>\r\n<parameter=content>\r\n"
+        "  line\r\n\r\n</parameter>\r\n</function>\r\n</tool_call>";
+    toolparse::StreamParser crlf(tools(), make_id);
+    for (char character : crlf_call) crlf.feed(std::string(1, character));
+    crlf.finish();
+    check(crlf.calls().size() == 1 &&
+              json::parse(crlf.calls()[0].arguments)["content"] == "  line\r\n",
+          "CRLF framing preserves content");
+
     ids = 0;
     toolparse::StreamParser partial(tools(), make_id);
     std::string partial_args;
@@ -91,6 +155,42 @@ int main() {
         if (event.type == toolparse::EventType::ArgumentsDelta) partial_args += event.data;
     check(partial.has_partial_call() && partial.calls().empty(), "incomplete call state");
     check(partial_args.size() > 150, "incomplete string streams early");
+
+    toolparse::StreamParser empty_partial(tools(), make_id);
+    empty_partial.feed("<tool_call>\n<function=write_file>\n<parameter=content>\n");
+    empty_partial.finish();
+    check(empty_partial.has_partial_call() && empty_partial.calls().empty(),
+          "empty unfinished parameter is incomplete");
+
+    toolparse::StreamParser missing_tail(tools(), make_id);
+    missing_tail.feed("<tool_call>\n<function=read_file>\n</function>\n");
+    missing_tail.finish();
+    check(missing_tail.has_partial_call() && missing_tail.calls().empty(),
+          "missing tool close is incomplete");
+
+    toolparse::StreamParser partial_second(tools(), make_id);
+    partial_second.feed("<tool_call>\n<function=read_file>\n</function>\n</tool_call>"
+                        "<tool_call>\n<function=write_file>\n<parameter=content>\npartial");
+    partial_second.finish();
+    check(partial_second.calls().size() == 1 && partial_second.has_partial_call(),
+          "later incomplete call does not hide a partial result");
+
+    json required_tools = tools();
+    required_tools[0]["function"]["parameters"]["required"] =
+        json::array({"path", "content"});
+    toolparse::StreamParser missing_required(required_tools, make_id);
+    missing_required.feed("<tool_call>\n<function=write_file>\n"
+                          "<parameter=path>\n/tmp/a\n</parameter>\n"
+                          "</function>\n</tool_call>");
+    missing_required.finish();
+    check(missing_required.has_partial_call() && missing_required.calls().empty(),
+          "missing required argument is not returned as a complete call");
+
+    toolparse::StreamParser unknown_tool(tools(), make_id);
+    unknown_tool.feed("<tool_call>\n<function=delete_file>\n</function>\n</tool_call>");
+    unknown_tool.finish();
+    check(unknown_tool.has_partial_call() && unknown_tool.calls().empty(),
+          "unknown function is not returned as a complete call");
 
     json messages = json::array(
         {{{"role", "assistant"},

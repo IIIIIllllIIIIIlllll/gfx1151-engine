@@ -19,7 +19,8 @@ namespace {
 constexpr const char* kToolOpen = "<tool_call>";
 constexpr const char* kFunctionOpen = "<function=";
 constexpr const char* kParameterOpen = "<parameter=";
-constexpr const char* kParameterClose = "</parameter>";
+constexpr const char* kParameterClose = "\n</parameter>\n";
+constexpr const char* kParameterCloseCrlf = "\r\n</parameter>\r\n";
 constexpr const char* kFunctionClose = "</function>";
 constexpr const char* kToolClose = "</tool_call>";
 
@@ -418,14 +419,17 @@ void StreamParser::start_parameter(std::string key, std::vector<Event>* events) 
 }
 
 void StreamParser::finish_parameter(std::string raw, std::vector<Event>* events) {
-    trim_ascii(&raw);
     if (stream_parameter_) {
         emit_arguments(escape_json_fragment(raw), events);
         emit_arguments("\"", events);
     } else {
+        std::string trimmed = raw;
+        trim_ascii(&trimmed);
+        json value = coerce_value(trimmed, parameter_types_);
+        if (value.is_string()) value = raw;
         std::string encoded = argument_count_++ == 0 ? "{" : ",";
         encoded += quote_json(parameter_key_) + ":";
-        encoded += json_py::dumps(coerce_value(raw, parameter_types_), /*spaced=*/false);
+        encoded += json_py::dumps(value, /*spaced=*/false);
         emit_arguments(std::move(encoded), events);
     }
     parameter_key_.clear();
@@ -434,13 +438,34 @@ void StreamParser::finish_parameter(std::string raw, std::vector<Event>* events)
     value_started_ = false;
 }
 
-void StreamParser::finish_call(std::vector<Event>* events) {
+bool StreamParser::valid_call() const {
+    json args = json::parse(current_.arguments + (argument_count_ == 0 ? "{}" : "}"),
+                            nullptr, false);
+    if (!args.is_object()) return false;
+    for (const auto& tool : tools_) {
+        const json& function = tool["function"];
+        if (function["name"] != current_.name) continue;
+        if (!function.contains("parameters") || !function["parameters"].is_object())
+            return true;
+        const json& schema = function["parameters"];
+        if (!schema.contains("required") || !schema["required"].is_array()) return true;
+        for (const auto& key : schema["required"])
+            if (key.is_string() && !args.contains(key.get_ref<const std::string&>()))
+                return false;
+        return true;
+    }
+    return false;
+}
+
+bool StreamParser::finish_call(std::vector<Event>* events) {
+    if (!valid_call()) return false;
     emit_arguments(argument_count_ == 0 ? "{}" : "}", events);
     calls_.push_back(current_);
     events->push_back(Event{EventType::CallEnd, current_.index, current_.id,
                             current_.name, current_.arguments});
     current_ = ToolCall{};
     argument_count_ = 0;
+    return true;
 }
 
 std::vector<std::string> StreamParser::schema_types(
@@ -505,13 +530,11 @@ std::vector<Event> StreamParser::pump(bool final) {
             const std::string_view rest(buffer_.data() + at, buffer_.size() - at);
             if (rest.size() < std::char_traits<char>::length(kFunctionOpen)) {
                 if (!final && is_prefix_of(rest, kFunctionOpen)) break;
-                emit_content(buffer_.substr(0, open_at + 1), &events);
-                buffer_.erase(0, open_at + 1);
+                state_ = State::Broken;
                 continue;
             }
             if (rest.substr(0, std::char_traits<char>::length(kFunctionOpen)) != kFunctionOpen) {
-                emit_content(buffer_.substr(0, open_at + 1), &events);
-                buffer_.erase(0, open_at + 1);
+                state_ = State::Broken;
                 continue;
             }
             at += std::char_traits<char>::length(kFunctionOpen);
@@ -519,13 +542,15 @@ std::vector<Event> StreamParser::pump(bool final) {
             const size_t newline = buffer_.find_first_of("\r\n", at);
             if (close == std::string::npos) {
                 if (!final && newline == std::string::npos) break;
-                emit_content(buffer_.substr(0, open_at + 1), &events);
-                buffer_.erase(0, open_at + 1);
+                state_ = State::Broken;
                 continue;
             }
             if (close == at || (newline != std::string::npos && newline < close)) {
-                emit_content(buffer_.substr(0, open_at + 1), &events);
-                buffer_.erase(0, open_at + 1);
+                state_ = State::Broken;
+                continue;
+            }
+            if (!function_exists(tools_, buffer_.substr(at, close - at))) {
+                state_ = State::Broken;
                 continue;
             }
             start_call(buffer_.substr(at, close - at), &events);
@@ -574,10 +599,28 @@ std::vector<Event> StreamParser::pump(bool final) {
         }
 
         if (state_ == State::Parameter) {
-            const size_t close = buffer_.find(kParameterClose);
+            if (!value_started_) {
+                if (buffer_.empty() || (buffer_[0] == '\r' && buffer_.size() == 1))
+                    break;
+                if (buffer_.rfind("\r\n", 0) == 0) buffer_.erase(0, 2);
+                else if (buffer_[0] == '\n') buffer_.erase(0, 1);
+                else {
+                    state_ = State::Broken;
+                    continue;
+                }
+                value_started_ = true;
+            }
+            size_t close = buffer_.find(kParameterClose);
+            size_t close_len = std::char_traits<char>::length(kParameterClose);
+            const size_t crlf_close = buffer_.find(kParameterCloseCrlf);
+            if (crlf_close != std::string::npos &&
+                (close == std::string::npos || crlf_close < close)) {
+                close = crlf_close;
+                close_len = std::char_traits<char>::length(kParameterCloseCrlf);
+            }
             if (close != std::string::npos) {
                 std::string raw = buffer_.substr(0, close);
-                buffer_.erase(0, close + std::char_traits<char>::length(kParameterClose));
+                buffer_.erase(0, close + close_len);
                 finish_parameter(std::move(raw), &events);
                 state_ = State::Between;
                 continue;
@@ -587,22 +630,15 @@ std::vector<Event> StreamParser::pump(bool final) {
                 break;
             }
 
-            if (!value_started_) {
-                size_t begin = 0;
-                while (begin < buffer_.size() && ascii_space(buffer_[begin])) ++begin;
-                if (begin == buffer_.size()) break;
-                buffer_.erase(0, begin);
-                value_started_ = true;
-            }
             if (final) {
                 emit_arguments(escape_json_fragment(buffer_), &events);
                 buffer_.clear();
                 partial_ = true;
                 break;
             }
-            const size_t partial = suffix_prefix_len(buffer_, kParameterClose);
-            size_t safe = buffer_.size() - partial;
-            while (safe > 0 && ascii_space(buffer_[safe - 1])) --safe;
+            const size_t partial = std::max(suffix_prefix_len(buffer_, kParameterClose),
+                                            suffix_prefix_len(buffer_, kParameterCloseCrlf));
+            const size_t safe = buffer_.size() - partial;
             if (safe == 0) break;
             emit_arguments(escape_json_fragment(buffer_.substr(0, safe)), &events);
             buffer_.erase(0, safe);
@@ -615,8 +651,7 @@ std::vector<Event> StreamParser::pump(bool final) {
             buffer_.erase(0, ws);
             if (buffer_.rfind(kToolClose, 0) == 0) {
                 buffer_.erase(0, std::char_traits<char>::length(kToolClose));
-                finish_call(&events);
-                state_ = State::Text;
+                state_ = finish_call(&events) ? State::Text : State::Broken;
                 continue;
             }
             if (!final && is_prefix_of(buffer_, kToolClose)) break;
@@ -624,7 +659,7 @@ std::vector<Event> StreamParser::pump(bool final) {
             continue;
         }
     }
-    if (state_ == State::Broken) partial_ = true;
+    if (state_ == State::Broken || (final && state_ != State::Text)) partial_ = true;
     return events;
 }
 

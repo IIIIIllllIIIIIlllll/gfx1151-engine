@@ -53,8 +53,9 @@ struct Event {
 };
 
 // Incremental parser for Qwen's
-// <tool_call><function=name><parameter=key>value...</parameter>...</function>
-// format. Declared string parameters stream before their closing tag arrives;
+// <tool_call><function=name><parameter=key>\nvalue\n</parameter>...</function>
+// format. The framing newlines are removed, but string values are not trimmed.
+// Declared string parameters stream before their closing tag arrives;
 // structured values wait for closure so schema coercion cannot change bytes
 // that were already sent to a client.
 class StreamParser {
@@ -79,7 +80,8 @@ class StreamParser {
     void start_call(std::string name, std::vector<Event>* events);
     void start_parameter(std::string key, std::vector<Event>* events);
     void finish_parameter(std::string raw, std::vector<Event>* events);
-    void finish_call(std::vector<Event>* events);
+    bool finish_call(std::vector<Event>* events);
+    bool valid_call() const;
     std::vector<std::string> schema_types(const std::string& function,
                                           const std::string& parameter) const;
 
