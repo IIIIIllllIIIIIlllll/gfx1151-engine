@@ -114,6 +114,35 @@ __global__ void k_argmax(const float* __restrict__ x, int n, int* __restrict__ o
   if (t == 0) out[0] = bi[0];
 }
 
+__global__ void k_batch_nll(const float* __restrict__ logits, int vocab,
+                            const int* __restrict__ targets,
+                            float* __restrict__ losses) {
+  __shared__ float reduction[256];
+  int row = blockIdx.x;
+  int lane = threadIdx.x;
+  const float* x = logits + (size_t)row * vocab;
+  float maximum = -INFINITY;
+  for (int i = lane; i < vocab; i += blockDim.x)
+    maximum = fmaxf(maximum, x[i]);
+  reduction[lane] = maximum;
+  __syncthreads();
+  for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+    if (lane < offset) reduction[lane] = fmaxf(reduction[lane], reduction[lane + offset]);
+    __syncthreads();
+  }
+  maximum = reduction[0];
+  float total = 0.0f;
+  for (int i = lane; i < vocab; i += blockDim.x)
+    total += expf(x[i] - maximum);
+  reduction[lane] = total;
+  __syncthreads();
+  for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+    if (lane < offset) reduction[lane] += reduction[lane + offset];
+    __syncthreads();
+  }
+  if (lane == 0) losses[row] = maximum + logf(reduction[0]) - x[targets[row]];
+}
+
 // vector copy / fill helpers
 __global__ void k_repeat4(const float* __restrict__ x, float* __restrict__ R, int d) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -164,4 +193,3 @@ __global__ void k_repeat4_b(const float* __restrict__ x, float* __restrict__ R, 
   R[base + 2 * d] = v;
   R[base + 3 * d] = v;
 }
-

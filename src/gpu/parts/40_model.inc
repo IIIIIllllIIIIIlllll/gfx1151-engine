@@ -3531,6 +3531,33 @@ struct GpuModel {
                  hipMemcpyDeviceToHost));
   }
 
+  void batch_nll(int P, int scored, const int* targets, std::vector<float>& losses) {
+    losses.resize(scored);
+    if (!scored) return;
+    gr_read_b("hyper_connection_mixer", P);
+    const WView& lw = wview(ckpt.at("lm_head.weight"));
+    float* d_losses = d_logits_b + (size_t)64 * g_cfg.vocab;
+    for (int off = 0; off < scored; off += 64) {
+      int rows = std::min(64, scored - off);
+      for (int group = 0; group < rows; group += 8) {
+        int count = std::min(8, rows - group);
+        if (!gemv_multi_q4cp(lw, d_xb + (size_t)(off + group) * 2560,
+                              d_logits_b + (size_t)group * g_cfg.vocab,
+                              count, 2560)) {
+          for (int row = 0; row < count; row++)
+            gemv(lw, d_xb + (size_t)(off + group + row) * 2560,
+                 d_logits_b + (size_t)(group + row) * g_cfg.vocab);
+        }
+      }
+      CK(hipMemcpyAsync(d_argmax_arr, targets + off, rows * sizeof(int),
+                        hipMemcpyHostToDevice, g_str));
+      k_batch_nll<<<rows, 256, 0, g_str>>>(d_logits_b, g_cfg.vocab,
+                                           d_argmax_arr, d_losses);
+      CK(hipMemcpy(losses.data() + off, d_losses, rows * sizeof(float),
+                   hipMemcpyDeviceToHost));
+    }
+  }
+
   // Greedy reduction of the same batched logits.
   void batch_argmax(int P, int* host) {
     batch_logits_device(P);

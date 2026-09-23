@@ -10,6 +10,8 @@ int main(int argc, char** argv) {
     fprintf(stderr,
             "usage: gdec <base.hgn> [overlay.hgn ...] --tokens 1,2,3 [--gen N] [--dump] "
             "[--no-ple] [--maxctx N]\n"
+            "       gdec <base.hgn> [overlay.hgn ...] --tokens-file IDS --ppl "
+            "[--maxctx N] (teacher-forced per-token NLL)\n"
             "       gdec <base.hgn> [overlay.hgn ...] --serve [--port N] [--maxctx N] "
             "[--no-ple]\n"
             "       M-RoPE: [--mrope-grid t,h,w ...] with --tokens; "
@@ -26,7 +28,7 @@ int main(int argc, char** argv) {
   std::vector<int> tokens;
   int gen = 8, argi = 2, maxctx = 4096;
   std::vector<int> splits;  // --split K1,K2: KV-continuation self-test
-  bool dump = false, ple_on = true, show_top = false;
+  bool dump = false, ple_on = true, show_top = false, ppl = false;
   bool serve_mode = false, maxctx_set = false;
   int port = 8730, mtp_test = 0, spec_gen = 0, gamma = 7;
   // M-RoPE: per-image grid triples (repeatable), rope-only test mode.
@@ -61,6 +63,8 @@ int main(int argc, char** argv) {
       free(s);
     } else if (a == "--dump")
       dump = true;
+    else if (a == "--ppl")
+      ppl = true;
     else if (a == "--no-ple")
       ple_on = false;
     else if (a == "--show")
@@ -98,6 +102,12 @@ int main(int argc, char** argv) {
       vision_test = next();
     else if (a == "--patches")
       vision_patches = next();
+  }
+  if (ppl && (serve_mode || !vision_test.empty() || mtp_test > 0 || spec_gen > 0 ||
+              !mrope_grids.empty() || dump || !splits.empty())) {
+    fprintf(stderr, "--ppl is text-only and cannot be combined with serve, vision, "
+                    "MTP, M-RoPE, dump or split modes\n");
+    return 2;
   }
   if (!vision_test.empty()) {
     // Offline ViT parity mode (stage 4a): runs the INTEGRATED vision tower
@@ -225,11 +235,11 @@ int main(int argc, char** argv) {
     memstats_log("ready");
     return serve::run(m, port);
   }
-  if (tokens.empty()) {
-    fprintf(stderr, "need --tokens\n");
+  if (tokens.size() < (ppl ? 2u : 1u)) {
+    fprintf(stderr, ppl ? "--ppl needs at least two tokens\n" : "need --tokens\n");
     return 2;
   }
-  int need = mtp_test > 0 ? mtp_test : spec_gen > 0 ? spec_gen + gamma : gen;
+  int need = ppl ? 0 : mtp_test > 0 ? mtp_test : spec_gen > 0 ? spec_gen + gamma : gen;
   if (gamma < 1) gamma = 1;
   if (gamma > 8) gamma = 8;  // spec workspace holds at most 8 draft rows
   if ((int)tokens.size() + need > maxctx) {
@@ -243,6 +253,14 @@ int main(int argc, char** argv) {
   fprintf(stderr, "loaded %zu tensors (base+%zu overlay)\n", ckpt.tensor_count(),
           overlays.size());
   g_cfg.vocab = (int)ckpt.at("lm_head.weight").dims[0];
+  if (ppl) {
+    for (size_t i = 0; i < tokens.size(); i++) {
+      if (tokens[i] < 0 || tokens[i] >= g_cfg.vocab) {
+        fprintf(stderr, "--ppl token %zu is out of vocabulary: %d\n", i, tokens[i]);
+        return 2;
+      }
+    }
+  }
 
   memstats_capture_hip_baseline();
   devarena_init(ckpt, maxctx);
@@ -277,6 +295,49 @@ int main(int argc, char** argv) {
   if (!mrope_grids.empty() && !m.set_mrope(tokens, mrope_grids)) {
     fprintf(stderr, "mrope: grids do not match the image token runs\n");
     return 1;
+  }
+
+  if (ppl) {
+    double total_nll = 0.0;
+    printf("ppl_token\tpos\tnext_id\tnll\n");
+    auto report = [&](size_t pos, double nll) {
+      if (!std::isfinite(nll)) {
+        fprintf(stderr, "--ppl non-finite NLL at pos %zu\n", pos);
+        exit(1);
+      }
+      total_nll += nll;
+      printf("ppl_token\t%zu\t%d\t%.9g\n", pos, tokens[pos + 1], nll);
+    };
+    if (getenv("GDEC_NOPREFILLBATCH")) {
+      for (size_t pos = 0; pos < tokens.size(); pos++) {
+        m.forward(tokens[pos]);
+        if (pos + 1 == tokens.size()) break;
+        std::vector<float> row;
+        m.get_logits(row);
+        double maximum = *std::max_element(row.begin(), row.end());
+        double sum = 0.0;
+        for (float logit : row) sum += std::exp((double)logit - maximum);
+        report(pos, maximum + std::log(sum) - row[tokens[pos + 1]]);
+      }
+    } else {
+      for (size_t off = 0; off < tokens.size();) {
+        int remaining = (int)(tokens.size() - off);
+        int count = std::min(m.maxbatch, remaining);
+        if (remaining > m.maxbatch && remaining <= m.maxbatch_cap)
+          count = remaining;
+        m.prefill_chunk(std::vector<int>(tokens.begin() + off,
+                                         tokens.begin() + off + count), (int)off);
+        std::vector<float> losses;
+        m.batch_nll(count, std::min(count, (int)tokens.size() - 1 - (int)off),
+                    tokens.data() + off + 1, losses);
+        for (size_t row = 0; row < losses.size(); row++) report(off + row, losses[row]);
+        off += count;
+      }
+    }
+    double mean_nll = total_nll / (tokens.size() - 1);
+    printf("ppl_summary\tcount=%zu\tmean_nll=%.10f\tppl=%.10f\n",
+           tokens.size() - 1, mean_nll, std::exp(mean_nll));
+    return 0;
   }
 
   auto dump_pos = [&](const std::vector<float>& lg, int i, int next_tok) {
