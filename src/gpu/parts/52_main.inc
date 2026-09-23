@@ -11,7 +11,7 @@ int main(int argc, char** argv) {
             "usage: gdec <base.hgn> [overlay.hgn ...] --tokens 1,2,3 [--gen N] [--dump] "
             "[--no-ple] [--maxctx N]\n"
             "       gdec <base.hgn> [overlay.hgn ...] --tokens-file IDS --ppl "
-            "[--maxctx N] (teacher-forced per-token NLL)\n"
+            "[--ppl-window N --ppl-stride N] [--maxctx N]\n"
             "       gdec <base.hgn> [overlay.hgn ...] --serve [--port N] [--maxctx N] "
             "[--no-ple]\n"
             "       M-RoPE: [--mrope-grid t,h,w ...] with --tokens; "
@@ -29,8 +29,10 @@ int main(int argc, char** argv) {
   int gen = 8, argi = 2, maxctx = 4096;
   std::vector<int> splits;  // --split K1,K2: KV-continuation self-test
   bool dump = false, ple_on = true, show_top = false, ppl = false;
+  bool ppl_window_set = false, ppl_stride_set = false;
   bool serve_mode = false, maxctx_set = false;
   int port = 8730, mtp_test = 0, spec_gen = 0, gamma = 7;
+  int ppl_window = 0, ppl_stride = 0;
   // M-RoPE: per-image grid triples (repeatable), rope-only test mode.
   std::vector<std::array<int, 3>> mrope_grids;
   int mrope_test = -1;  // -1 off; else number of decode steps to dump
@@ -65,6 +67,13 @@ int main(int argc, char** argv) {
       dump = true;
     else if (a == "--ppl")
       ppl = true;
+    else if (a == "--ppl-window") {
+      ppl_window = atoi(next());
+      ppl_window_set = true;
+    } else if (a == "--ppl-stride") {
+      ppl_stride = atoi(next());
+      ppl_stride_set = true;
+    }
     else if (a == "--no-ple")
       ple_on = false;
     else if (a == "--show")
@@ -107,6 +116,13 @@ int main(int argc, char** argv) {
               !mrope_grids.empty() || dump || !splits.empty())) {
     fprintf(stderr, "--ppl is text-only and cannot be combined with serve, vision, "
                     "MTP, M-RoPE, dump or split modes\n");
+    return 2;
+  }
+  if ((ppl_window_set || ppl_stride_set) &&
+      (!ppl || !ppl_window_set || !ppl_stride_set || ppl_window < 2 ||
+       ppl_stride < 1 || ppl_stride >= ppl_window || ppl_window > maxctx)) {
+    fprintf(stderr, "--ppl-window and --ppl-stride require --ppl and "
+                    "1 <= stride < window <= maxctx\n");
     return 2;
   }
   if (!vision_test.empty()) {
@@ -242,7 +258,7 @@ int main(int argc, char** argv) {
   int need = ppl ? 0 : mtp_test > 0 ? mtp_test : spec_gen > 0 ? spec_gen + gamma : gen;
   if (gamma < 1) gamma = 1;
   if (gamma > 8) gamma = 8;  // spec workspace holds at most 8 draft rows
-  if ((int)tokens.size() + need > maxctx) {
+  if (ppl_window == 0 && tokens.size() + (size_t)need > (size_t)maxctx) {
     fprintf(stderr, "tokens+gen exceed maxctx\n");
     return 2;
   }
@@ -299,6 +315,7 @@ int main(int argc, char** argv) {
 
   if (ppl) {
     double total_nll = 0.0;
+    size_t total_scored = 0;
     printf("ppl_token\tpos\tnext_id\tnll\n");
     auto report = [&](size_t pos, double nll) {
       if (!std::isfinite(nll)) {
@@ -306,9 +323,10 @@ int main(int argc, char** argv) {
         exit(1);
       }
       total_nll += nll;
+      total_scored++;
       printf("ppl_token\t%zu\t%d\t%.9g\n", pos, tokens[pos + 1], nll);
     };
-    if (getenv("GDEC_NOPREFILLBATCH")) {
+    if (getenv("GDEC_NOPREFILLBATCH") && ppl_window == 0) {
       for (size_t pos = 0; pos < tokens.size(); pos++) {
         m.forward(tokens[pos]);
         if (pos + 1 == tokens.size()) break;
@@ -320,23 +338,52 @@ int main(int argc, char** argv) {
         report(pos, maximum + std::log(sum) - row[tokens[pos + 1]]);
       }
     } else {
-      for (size_t off = 0; off < tokens.size();) {
-        int remaining = (int)(tokens.size() - off);
-        int count = std::min(m.maxbatch, remaining);
-        if (remaining > m.maxbatch && remaining <= m.maxbatch_cap)
-          count = remaining;
-        m.prefill_chunk(std::vector<int>(tokens.begin() + off,
-                                         tokens.begin() + off + count), (int)off);
-        std::vector<float> losses;
-        m.batch_nll(count, std::min(count, (int)tokens.size() - 1 - (int)off),
-                    tokens.data() + off + 1, losses);
-        for (size_t row = 0; row < losses.size(); row++) report(off + row, losses[row]);
-        off += count;
+      if (ppl_window && getenv("GDEC_NOPREFILLBATCH")) {
+        fprintf(stderr, "--ppl-window does not support GDEC_NOPREFILLBATCH\n");
+        return 2;
+      }
+      size_t previous_end = 0;
+      size_t end = ppl_window ? std::min(tokens.size(), (size_t)ppl_window)
+                              : tokens.size();
+      while (previous_end < tokens.size()) {
+        size_t begin = ppl_window && end > (size_t)ppl_window
+                           ? end - ppl_window : 0;
+        if (previous_end) m.reset_state();
+        int window_size = (int)(end - begin);
+        for (int off = 0; off < window_size;) {
+          int remaining = window_size - off;
+          int count = std::min(m.maxbatch, remaining);
+          if (remaining > m.maxbatch && remaining <= m.maxbatch_cap)
+            count = remaining;
+          m.prefill_chunk(std::vector<int>(tokens.begin() + begin + off,
+                                           tokens.begin() + begin + off + count), off);
+          size_t first_target = std::max((size_t)1, previous_end);
+          int first = first_target > begin + off + 1
+                          ? (int)(first_target - begin - off - 1) : 0;
+          int last = std::min(count, window_size - off - 1);
+          int scored = std::max(0, last - first);
+          if (scored) {
+            std::vector<float> losses;
+            m.batch_nll(count, first, scored,
+                        tokens.data() + begin + off + first + 1, losses);
+            for (size_t row = 0; row < losses.size(); row++)
+              report(begin + off + first + row, losses[row]);
+          }
+          off += count;
+        }
+        previous_end = end;
+        if (!ppl_window) break;
+        end = std::min(tokens.size(), end + (size_t)ppl_stride);
       }
     }
-    double mean_nll = total_nll / (tokens.size() - 1);
+    if (total_scored != tokens.size() - 1) {
+      fprintf(stderr, "--ppl scored %zu of %zu target tokens\n",
+              total_scored, tokens.size() - 1);
+      return 1;
+    }
+    double mean_nll = total_nll / total_scored;
     printf("ppl_summary\tcount=%zu\tmean_nll=%.10f\tppl=%.10f\n",
-           tokens.size() - 1, mean_nll, std::exp(mean_nll));
+           total_scored, mean_nll, std::exp(mean_nll));
     return 0;
   }
 

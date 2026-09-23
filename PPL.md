@@ -1,62 +1,79 @@
-# Prefill 困惑度诊断
+# WikiText-2 困惑度测试
 
-`--ppl` 离线模式对固定 token 序列进行 teacher forcing：位置 `p` 的原始
-logits 预测 `token[p+1]`，计算 `NLL = logsumexp(logits) - logits[next]`；
-输出每个位置的 NLL 和 `PPL = exp(mean(NLL))`，不采样、不生成。至少两个 token，
-最后一个 token 没有下一个目标，因此不计分。只支持纯文本；不要把 API 生成
-token 的 `logprobs` 当成这个指标。
+## 评测口径
 
-先用同一份 token ID 做数值对拍，再用**未参与训练的自然文本**比较绝对 PPL。
-仓库的 `data/qsa-oracle/*.tokens` 主要用来诊断边界，不是质量基准。必须保持
-模型文件、tokenizer、序列、量化和其他算子开关一致；关闭尾包合并后再比较
-chunk 大小。`--maxctx` 至少等于输入长度，离线默认只有 4096。
-自然文本先用与模型匹配的 `tools/qwentok.py` 的 `Tokenizer.encode()` 转成
-token ID，逐行写入 `.tokens`；不同文档应分别计分，避免跨文档拼接改变上下文。
+使用 WikiText-2 **raw-v1 的 test split**，不使用 train/valid 作为最终报告。
+`tools/prepare_wikitext2.py` 直接从 `wikitext-2.zip` 中读取
+`wikitext-2-raw/wiki.test.raw`；仿照 Hugging Face 固定长度模型困惑度示例，
+按官方 WikiText 加载器规则将纯空白行变成空字符串、非空行保留结尾的
+换行符，再以两个换行符拼接；之后用**当前模型自己的** `tokenizer.json`
+（`tokenizers` 快速实现）一次性编码，禁用自动 special tokens，不加入聊天模板。
+这和简单地对 `.raw` 文件去掉换行、逐行独立分词或原样全文分词都不是同一个协议。
+脚本额外写入 `.tokens.json`，记录数据和 tokenizer 的 SHA-256、计分 token 数。
 
-Windows PowerShell 示例（先执行 `bash build_win.sh`）：
+`--ppl` 进行 teacher forcing，不生成/采样：位置 `p` 的原始 logits 预测
+`token[p+1]`，`NLL = logsumexp(logits[p]) - logits[p][token[p+1]]`，
+`PPL = exp(sum(NLL) / 计分 token 数)`。第一个 token 没有左侧上下文，不计分。
+`--ppl-window W --ppl-stride S` 以不超过 `W` 的重叠上下文覆盖**整个**
+test split（`1 <= S < W <= maxctx`）；每个窗口重置模型状态，重算重叠的
+上下文，但只计首次进入窗口的目标 token。即使目标位于 prefill chunk
+边界，也使用前一行 logits 计分；总分按 token 加权，绝不平均各窗口 PPL。
 
-```powershell
-$model = 'models/qwen38-flash-next-w4b.hgn'
-$overlay = 'models/qwen38-flash-next-w4b.overlay.hgn'
-$tokens = 'data/qsa-oracle/8192.tokens'
-$env:GDEC_PREFILL_TAIL_SLACK = '0'
-$env:GDEC_PREFILL_CHUNK = '1024'
-./build/gdec-win.exe $model $overlay --tokens-file $tokens --maxctx 8192 --ppl > ppl-1024.tsv
-$env:GDEC_PREFILL_CHUNK = '8192'
-./build/gdec-win.exe $model $overlay --tokens-file $tokens --maxctx 8192 --ppl > ppl-8192.tsv
-python tools/ppl_compare.py ppl-8192.tsv ppl-1024.tsv --chunk 1024
-```
+WikiText-2 的数字只能在相同 raw/非 raw 版本、文本拼接、tokenizer、
+是否加入 BOS、窗口和 stride、模型权重/量化下直接比较。WikiText 语料
+也不能单凭 PPL 判断指令遵循或 agent 工作能力。对照
+`data/qsa-oracle/*.tokens` 可排查 batch/chunk 数值，但它们不是质量基准。
 
-Linux 示例（在项目根目录执行）：
+## Linux 运行
+
+将你本机的 `wikitext-2.zip` 拷贝到 Linux 上的任意路径；不要把数据集或生成的
+大型 `.tokens`、`.tsv` 文件提交到仓库。停掉服务后，在项目根目录运行：
+若在 `/home/mark/Workspace/test` 测试，可先设
+`MODEL_DIR=/home/mark/Workspace/gfx1151-engine/models`。
 
 ```bash
+MODEL_DIR=${MODEL_DIR:-models}
+python3 -m pip install --target .ppldeps tokenizers
+export PYTHONPATH="${PWD}/.ppldeps${PYTHONPATH:+:$PYTHONPATH}"
+python3 tools/prepare_wikitext2.py --zip /path/to/wikitext-2.zip \
+  --tokenizer-json "$MODEL_DIR/tokenizer/tokenizer.json" --output wiki-test.tokens
 bash build.sh engine
 export GDEC_PREFILL_TAIL_SLACK=0
-BASE=models/qwen38-flash-next-w4b.hgn
-OVL=models/qwen38-flash-next-w4b.overlay.hgn
-IDS=data/qsa-oracle/8192.tokens
-GDEC_PREFILL_CHUNK=1024 build/gdec "$BASE" "$OVL" --tokens-file "$IDS" --maxctx 8192 --ppl > ppl-1024.tsv
-GDEC_PREFILL_CHUNK=8192 build/gdec "$BASE" "$OVL" --tokens-file "$IDS" --maxctx 8192 --ppl > ppl-8192.tsv
-python3 tools/ppl_compare.py ppl-8192.tsv ppl-1024.tsv --chunk 1024
+BASE="$MODEL_DIR/qwen38-flash-next-w4b.hgn"
+OVL="$MODEL_DIR/qwen38-flash-next-w4b.overlay.hgn"
+head -n 1024 wiki-test.tokens > wiki-smoke.tokens
+GDEC_PREFILL_CHUNK=512 build/gdec "$BASE" "$OVL" \
+  --tokens-file wiki-smoke.tokens --maxctx 512 --ppl \
+  --ppl-window 512 --ppl-stride 128 > wiki-smoke.tsv
+tail -1 wiki-smoke.tsv  # count 应为 1023；这只是烟测，不是正式 PPL
+GDEC_PREFILL_CHUNK=2048 build/gdec "$BASE" "$OVL" \
+  --tokens-file wiki-test.tokens --maxctx 2048 --ppl \
+  --ppl-window 2048 --ppl-stride 512 > wiki-2048.tsv
+GDEC_PREFILL_CHUNK=512 build/gdec "$BASE" "$OVL" \
+  --tokens-file wiki-test.tokens --maxctx 2048 --ppl \
+  --ppl-window 2048 --ppl-stride 512 > wiki-512.tsv
+python3 tools/ppl_compare.py wiki-2048.tsv wiki-512.tsv --chunk 512
+tail -1 wiki-2048.tsv
 ```
 
-先用 256 个相同 token 做串行基线：
+首个运行是一个窗口对应一个 prefill chunk；第二个运行在同样 2048-token
+上下文中按 512-token chunk 分批。比较工具显示整体 PPL、每 token NLL
+偏差及 chunk 边界附近的偏差。如果短序列串行与 batch 即不一致，应先排查
+批量算子/精度；若仅 chunk 边界有尖峰，则检查跨 chunk 状态衔接。
 
-```powershell
-Get-Content $tokens -TotalCount 256 | Set-Content ppl-short.tokens
-$env:GDEC_NOPREFILLBATCH = '1'
-./build/gdec-win.exe $model $overlay --tokens-file ppl-short.tokens --maxctx 256 --ppl > ppl-serial.tsv
-Remove-Item Env:GDEC_NOPREFILLBATCH
-$env:GDEC_PREFILL_CHUNK = '64'
-./build/gdec-win.exe $model $overlay --tokens-file ppl-short.tokens --maxctx 256 --ppl > ppl-batch.tsv
-python tools/ppl_compare.py ppl-serial.tsv ppl-batch.tsv --chunk 64
-```
+## Windows 与短序列对拍
 
-若短序列都不一致，优先排查批处理算子或量化精度；短序列一致但长序列在
-`seam=1024,2048,...` 附近出现明显尖峰，重点检查 chunk 之间的状态衔接。
-若逐位置 NLL 基本一致，总 PPL 也一致，优先排查 tokenizer/chat template、
-采样参数、模型权重量化与 API/tool-call 链路，而不是 `PREFILL_CHUNK`。
+Windows 也可用同一脚本，把 `--zip` 设为
+`C:\Users\Mark\Workspace\CProject\my\wikitext-2.zip`，执行
+`bash build_win.sh`，引擎路径改为 `build/gdec-win.exe`；其余参数相同。
+为避免串行全量测试过慢，先从 `wiki-test.tokens` 截取 256 个 ID，分别用
+`GDEC_NOPREFILLBATCH=1`（串行）和 `GDEC_PREFILL_CHUNK=64`
+（批量）运行 `--ppl --maxctx 256`，再运行
+`python3 tools/ppl_compare.py serial.tsv batch.tsv --chunk 64`。
+不设置 `--ppl-window/--ppl-stride` 时仍是旧的单段数值对拍模式，
+要求序列长度不超过 `--maxctx`。
 
-输出数据以 `ppl_token<TAB>pos<TAB>next_id<TAB>nll` 开头，位置从 0 开始；
-`ppl_summary` 包含计分 token 数、平均 NLL 与 PPL。不同 chunk 的整体均值
-可能掩盖局部问题，因此比较工具会列出最大差异和每个边界两侧的差异。
+输出 `ppl_token<TAB>pos<TAB>next_id<TAB>nll`（原序列绝对位置从 0 起）
+及一行 `ppl_summary`。比较工具会校验 token 顺序和 summary 总数，
+防止截断结果被误判为完整评测。完整 test split 可能比较慢：
+重叠窗口必须反复处理上下文，且每个计分位置都需要 lm_head。
