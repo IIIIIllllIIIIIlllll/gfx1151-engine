@@ -4114,6 +4114,30 @@ struct GpuModel {
     }
   }
 
+  // Full logits of rows [first, first+n) of the last prefill chunk (P rows),
+  // row-major [n][vocab] on the host; same 64-row lm_head passes as batch_nll.
+  void batch_logits_rows(int P, int first, int n, std::vector<float>& host) {
+    host.resize((size_t)n * g_cfg.vocab);
+    if (!n) return;
+    gr_read_b("hyper_connection_mixer", P);
+    const WView& lw = wview(ckpt.at("lm_head.weight"));
+    for (int off = first; off < first + n; off += 64) {
+      int rows = std::min(64, first + n - off);
+      for (int group = 0; group < rows; group += 8) {
+        int count = std::min(8, rows - group);
+        if (!gemv_multi_q4cp(lw, d_xb + (size_t)(off + group) * 2560,
+                              d_logits_b + (size_t)group * g_cfg.vocab,
+                              count, 2560)) {
+          for (int row = 0; row < count; row++)
+            gemv(lw, d_xb + (size_t)(off + group + row) * 2560,
+                 d_logits_b + (size_t)(group + row) * g_cfg.vocab);
+        }
+      }
+      CK(hipMemcpy(host.data() + (size_t)(off - first) * g_cfg.vocab, d_logits_b,
+                   (size_t)rows * g_cfg.vocab * sizeof(float), hipMemcpyDeviceToHost));
+    }
+  }
+
   // Greedy reduction of the same batched logits.
   void batch_argmax(int P, int* host) {
     batch_logits_device(P);

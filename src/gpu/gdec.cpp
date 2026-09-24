@@ -51,6 +51,8 @@
 // (GDEC_GEMM_NO_K64=1 reverts); fp32 indexer projection runs a timed-pick
 // rocBLAS solution index (GDEC_IPROJ_SGEMM=1 reverts); MTP indexer scores use
 // the trunk's tiled kernel (GDEC_MTP_INDEX_SGEMM=1 reverts). PREFILL.md §11.9.
+// --kld-base/--kld-save: llama-perplexity-compatible KL divergence against a
+// llama.cpp logits file (parts/48_kld.inc, KLD.md).
 // M-RoPE (vision, stage 1b/1c): requests may carry image grid_thw triples
 // (CLI --mrope-grid t,h,w / serve GEN suffix MROPE k t h w ...); the host
 // expands them to per-token 3-row positions (reference get_rope_index
@@ -142,6 +144,7 @@
 #include "parts/30_host_util.inc"
 #include "parts/31_vision.inc"
 #include "parts/40_model.inc"
+#include "parts/48_kld.inc"
 #include "parts/49_rckpt.inc"
 #include "parts/50_serve.inc"
 #include "parts/51_host_cfg.inc"

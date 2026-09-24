@@ -12,6 +12,10 @@ int main(int argc, char** argv) {
             "[--no-ple] [--maxctx N]\n"
             "       gdec <base.hgn> [overlay.hgn ...] --tokens-file IDS --ppl "
             "[--ppl-window N --ppl-stride N] [--maxctx N]\n"
+            "       gdec <base.hgn> [overlay.hgn ...] --kld-base REF.kld "
+            "[--kld-chunks N] [--kld-save OUT]   (llama.cpp KLD file)\n"
+            "       gdec <base.hgn> [overlay.hgn ...] --tokens-file IDS --kld-save OUT "
+            "[--kld-ctx 512] [--kld-chunks N]\n"
             "       gdec <base.hgn> [overlay.hgn ...] --serve [--port N] [--maxctx N] "
             "[--no-ple]\n"
             "       M-RoPE: [--mrope-grid t,h,w ...] with --tokens; "
@@ -33,6 +37,7 @@ int main(int argc, char** argv) {
   bool serve_mode = false, maxctx_set = false;
   int port = 8730, mtp_test = 0, spec_gen = 0, gamma = 7;
   int ppl_window = 0, ppl_stride = 0;
+  kld::Opts kld_opts;  // --kld-*: KL divergence vs a llama.cpp logits file
   // M-RoPE: per-image grid triples (repeatable), rope-only test mode.
   std::vector<std::array<int, 3>> mrope_grids;
   int mrope_test = -1;  // -1 off; else number of decode steps to dump
@@ -73,7 +78,14 @@ int main(int argc, char** argv) {
     } else if (a == "--ppl-stride") {
       ppl_stride = atoi(next());
       ppl_stride_set = true;
-    }
+    } else if (a == "--kld-base")
+      kld_opts.base = next();
+    else if (a == "--kld-save")
+      kld_opts.save = next();
+    else if (a == "--kld-chunks")
+      kld_opts.chunks = atoi(next());
+    else if (a == "--kld-ctx")
+      kld_opts.ctx = atoi(next());
     else if (a == "--no-ple")
       ple_on = false;
     else if (a == "--show")
@@ -116,6 +128,18 @@ int main(int argc, char** argv) {
               !mrope_grids.empty() || dump || !splits.empty())) {
     fprintf(stderr, "--ppl is text-only and cannot be combined with serve, vision, "
                     "MTP, M-RoPE, dump or split modes\n");
+    return 2;
+  }
+  const bool kld_mode = !kld_opts.base.empty() || !kld_opts.save.empty();
+  if (kld_mode && (ppl || serve_mode || !vision_test.empty() || mtp_test > 0 ||
+                   spec_gen > 0 || !mrope_grids.empty() || dump || !splits.empty() ||
+                   mrope_test >= 0)) {
+    fprintf(stderr, "--kld-* is text-only and cannot be combined with ppl, serve, "
+                    "vision, MTP, M-RoPE, dump or split modes\n");
+    return 2;
+  }
+  if (kld_mode && kld_opts.base.empty() && tokens.empty()) {
+    fprintf(stderr, "--kld-save without --kld-base needs --tokens-file\n");
     return 2;
   }
   if ((ppl_window_set || ppl_stride_set) &&
@@ -251,14 +275,14 @@ int main(int argc, char** argv) {
     memstats_log("ready");
     return serve::run(m, port);
   }
-  if (tokens.size() < (ppl ? 2u : 1u)) {
+  if (!kld_mode && tokens.size() < (ppl ? 2u : 1u)) {
     fprintf(stderr, ppl ? "--ppl needs at least two tokens\n" : "need --tokens\n");
     return 2;
   }
   int need = ppl ? 0 : mtp_test > 0 ? mtp_test : spec_gen > 0 ? spec_gen + gamma : gen;
   if (gamma < 1) gamma = 1;
   if (gamma > 8) gamma = 8;  // spec workspace holds at most 8 draft rows
-  if (ppl_window == 0 && tokens.size() + (size_t)need > (size_t)maxctx) {
+  if (!kld_mode && ppl_window == 0 && tokens.size() + (size_t)need > (size_t)maxctx) {
     fprintf(stderr, "tokens+gen exceed maxctx\n");
     return 2;
   }
@@ -312,6 +336,8 @@ int main(int argc, char** argv) {
     fprintf(stderr, "mrope: grids do not match the image token runs\n");
     return 1;
   }
+
+  if (kld_mode) return kld::run(m, tokens, kld_opts);
 
   if (ppl) {
     double total_nll = 0.0;
