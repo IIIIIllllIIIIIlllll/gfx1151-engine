@@ -23,7 +23,7 @@ case "$1" in
 esac
 LABEL="${2:-pp_${LEN}_$(date +%H%M%S)}"
 
-TOK="data/ppbench/tok${LEN}.txt"
+TOK="data/qsa-oracle/${LEN}.tokens"
 
 if [[ ! -f "$TOK" ]]; then
     echo "没有对应长度的 token 文件: $TOK" >&2
