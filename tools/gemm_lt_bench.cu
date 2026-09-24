@@ -7,7 +7,7 @@
 // Usage: gemm_lt_bench [N K P ...]  (triples; default = the five 32K narrow
 // shapes at P=16384 and P=32821). Env: GM=<list, comma> (default 2,4,16),
 // CFG=<substring filter>.
-// Build: hipcc -O2 -o /tmp/gemm_lt_bench tools/gemm_lt_bench.cu -lrocblas -lhipblaslt
+// Build: hipcc -O2 --offload-arch=gfx1151 -o /tmp/gemm_lt_bench tools/gemm_lt_bench.cu -lrocblas -lhipblaslt
 #include <hipblaslt/hipblaslt.h>
 #include <rocblas/rocblas.h>
 #include <hip/hip_runtime.h>
@@ -91,6 +91,21 @@ static const KCfg kCfgs[] = {
      launch_cfg<128, 64, 2, 4, 4, 1, 32, 256>},
     {"n64w 128t 128x64 f4x2", 128, 64, 128,
      launch_cfg<128, 64, 2, 2, 4, 2, 32, 128>},
+    // KST=64 family (128B contiguous per row per staging step; the
+    // gr320_proto lesson). LDS = 2*BM*(KST+8)*2 + 2*(BP/8)*(8*(KST+8)+8)*2;
+    // the staging map needs 32/(KST/8) even, so KST is 32/64/128 only.
+    {"h1 128t 64x160 f2x5 k64", 64, 160, 128,
+     launch_cfg<64, 160, 2, 2, 2, 5, 64, 128>},
+    {"k1 128t 64x128 f2x4 k64", 64, 128, 128,
+     launch_cfg<64, 128, 2, 2, 2, 4, 64, 128>},
+    {"k2 256t 64x128 f2x2 k64", 64, 128, 256,
+     launch_cfg<64, 128, 2, 4, 2, 2, 64, 256>},
+    {"k3 128t 128x64 f4x2 k64", 128, 64, 128,
+     launch_cfg<128, 64, 2, 2, 4, 2, 64, 128>},
+    {"k4 256t 128x64 f2x2 k64", 128, 64, 256,
+     launch_cfg<128, 64, 4, 2, 2, 2, 64, 256>},
+    {"k5 256t 64x160 f2x5 k64", 64, 160, 256,
+     launch_cfg<64, 160, 4, 2, 1, 5, 64, 256>},
 };
 
 int main(int argc, char** argv) {
@@ -270,6 +285,8 @@ int main(int argc, char** argv) {
 
     for (int c = 0; c < ncfg; ++c) {
       if (cfgfilt && !strstr(kCfgs[c].name, cfgfilt)) continue;
+      if (strstr(kCfgs[c].name, " k64") && K % 64)
+        continue;  // kernel hard requirement K % KST == 0
       // correctness once at gm=4, then bench the gm list
       kCfgs[c].fn(B, A, C, P, K, N, 4, st);
       if (hipStreamSynchronize(st) != hipSuccess) {

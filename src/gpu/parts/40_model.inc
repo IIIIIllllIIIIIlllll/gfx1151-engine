@@ -1522,11 +1522,36 @@ struct GpuModel {
     // state fall through to hipBLASLt unchanged. Purely async. The kernel
     // requires K % 32 == 0; P and N tails are handled inside the kernel
     // (staging row clamps + predicated epilogue; the grid must be ceiled to
-    // match). (320,10240) and (640,2560) were measured and stay on Lt —
-    // 0.94x/1.08x, under the 1.15x bar. GDEC_GEMM_RB above takes precedence
-    // if both are set.
+    // match). (640,2560) was measured and stays on Lt — 1.08-1.13x, under
+    // the 1.15x bar. KST=64 family (128B per row per staging step, the
+    // tools/gr320_proto.cu lesson; re-swept 2026-09-24 with
+    // tools/gemm_lt_bench.cu at P=8192/16384, gm=1 best for both):
+    //  - (320,10240) GR mix: h1 BM=64 BP=160 (num_n=2 exact), 3.9 ms vs
+    //    5.3 ms Lt idx4 (x1.35); LDS 65,152B of 65,536 — any layout growth
+    //    in the kernel breaks it.
+    //  - (2560,6144) out-proj: k1 BM=64 BP=128, 16.4 ms vs 21.1-21.6 ms for
+    //    the old d3 512t config and Lt (x1.3).
+    // The K=2560 d9 shapes and (2560,640) stay on d9 (KST=64 configs lose
+    // there). GDEC_GEMM_NO_K64 restores the old routing (Lt / d3) for A/B.
+    // GDEC_GEMM_RB above takes precedence if both are set.
     static const bool gemm_wmma = getenv("GDEC_GEMM_WMMA") != nullptr;
+    static const bool gemm_k64 = getenv("GDEC_GEMM_NO_K64") == nullptr;
     if (gemm_wmma && P >= 1024) {
+      if (gemm_k64 && ((N == 320 && K == 10240) || (N == 2560 && K == 6144))) {
+        if (N == 320)
+          k_gemm_wmma<64, 160, 2, 2, 2, 5, 64, 128>
+              <<<(unsigned)(((P + 63) / 64) * 2), 128, 0, g_str>>>(
+                  xp, wp, y, P, (int)K, (int)N, 1);
+        else
+          k_gemm_wmma<64, 128, 2, 2, 2, 4, 64, 128>
+              <<<(unsigned)(((P + 63) / 64) * 20), 128, 0, g_str>>>(
+                  xp, wp, y, P, (int)K, (int)N, 1);
+        if (prof)
+          p_gemm += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - pt0)
+                        .count();
+        return;
+      }
       const bool gw_d3 = (N == 2560 && K == 6144);
       const bool gw_d9 = (K == 2560 && (N == 6144 || N == 10240 || N == 12288));
       const bool gw_d9n = (N == 10240 && K == 320) ||
@@ -2250,6 +2275,101 @@ struct GpuModel {
     return dirty;
   }
 
+  // FP32 indexer projection y[640,P] = w[640,2560] . x[P,2560]^T (index_f32).
+  // rocblas_sgemm's own pick for this shape is a MT32x32x8 kernel at ~2.7
+  // TFLOPS; the rocBLAS solution list for the same fp32 problem (hipBLASLt-
+  // backed, negative indices) holds kernels at 6.2-7.4 TFLOPS (x2.35-2.7 for
+  // P >= 1024, slower at P=53). tools/sgemm_iproj_check.cu: deterministic
+  // run-to-run, maxrel ~7e-6 vs sgemm — the same order as sgemm's own error vs
+  // fp64 (~4.5e-6); still fp32 in/accumulate, only the K order differs. For
+  // P >= 1024 the fastest listed solution is timed once (first such call,
+  // one ~0.1 s sync stall) and reused for every P; it is only adopted if it
+  // beats sgemm, and any non-success launch falls back to sgemm.
+  // GDEC_IPROJ_SGEMM=1 keeps plain rocblas_sgemm (A/B).
+  int iproj_sol = INT_MIN;  // INT_MIN = not picked yet, INT_MAX = use sgemm
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"  // beta API
+  void iproj_sgemm(const float* w, const float* x, float* y, int P) {
+    const float one = 1.f, zero = 0.f;
+    static const bool plain = getenv("GDEC_IPROJ_SGEMM") != nullptr;
+    auto sol_run = [&](int idx) {
+      return rocblas_gemm_ex(
+          rbh, rocblas_operation_transpose, rocblas_operation_none, 640, P,
+          2560, &one, w, rocblas_datatype_f32_r, 2560, x,
+          rocblas_datatype_f32_r, 2560, &zero, y, rocblas_datatype_f32_r, 640,
+          y, rocblas_datatype_f32_r, 640, rocblas_datatype_f32_r,
+          rocblas_gemm_algo_solution_index, idx, 0);
+    };
+    auto sgemm_run = [&]() {
+      return rocblas_sgemm(rbh, rocblas_operation_transpose,
+                           rocblas_operation_none, 640, P, 2560, &one, w, 2560,
+                           x, 2560, &zero, y, 640);
+    };
+    if (!plain && P >= 1024) {
+      if (iproj_sol == INT_MIN) {
+        iproj_sol = INT_MAX;
+        rocblas_int n = 0;
+        rocblas_gemm_ex_get_solutions(
+            rbh, rocblas_operation_transpose, rocblas_operation_none, 640, P,
+            2560, &one, w, rocblas_datatype_f32_r, 2560, x,
+            rocblas_datatype_f32_r, 2560, &zero, y, rocblas_datatype_f32_r,
+            640, y, rocblas_datatype_f32_r, 640, rocblas_datatype_f32_r,
+            rocblas_gemm_algo_solution_index, 0, nullptr, &n);
+        std::vector<rocblas_int> sols(std::max<rocblas_int>(n, 1));
+        if (n > 0)
+          rocblas_gemm_ex_get_solutions(
+              rbh, rocblas_operation_transpose, rocblas_operation_none, 640, P,
+              2560, &one, w, rocblas_datatype_f32_r, 2560, x,
+              rocblas_datatype_f32_r, 2560, &zero, y, rocblas_datatype_f32_r,
+              640, y, rocblas_datatype_f32_r, 640, rocblas_datatype_f32_r,
+              rocblas_gemm_algo_solution_index, 0, sols.data(), &n);
+        hipEvent_t e0, e1;
+        CK(hipEventCreate(&e0));
+        CK(hipEventCreate(&e1));
+        auto time2 = [&](auto&& fn) {  // validate once, then time 2 runs
+          if (fn() != rocblas_status_success ||
+              hipStreamSynchronize(g_str) != hipSuccess) {
+            (void)hipGetLastError();
+            return 1e30f;
+          }
+          float ms = 0;
+          CK(hipEventRecord(e0, g_str));
+          fn();
+          fn();
+          CK(hipEventRecord(e1, g_str));
+          CK(hipEventSynchronize(e1));
+          CK(hipEventElapsedTime(&ms, e0, e1));
+          return ms;
+        };
+        const float t_sgemm = time2(sgemm_run);
+        float best = t_sgemm;
+        for (int i = 0; i < (int)n; i++) {
+          const float t = time2([&] { return sol_run(sols[i]); });
+          if (t < best * 0.95f) {
+            best = t;
+            iproj_sol = sols[i];
+          }
+        }
+        CK(hipEventDestroy(e0));
+        CK(hipEventDestroy(e1));
+        fprintf(stderr, "iproj: fp32 indexer projection P=%d sgemm %.2f ms, %s\n",
+                P, t_sgemm / 2,
+                iproj_sol == INT_MAX
+                    ? "keeping sgemm"
+                    : ("solution " + std::to_string(iproj_sol) + " " +
+                       std::to_string(best / 2) + " ms")
+                          .c_str());
+      }
+      if (iproj_sol != INT_MAX && sol_run(iproj_sol) == rocblas_status_success)
+        return;
+    }
+    if (sgemm_run() != rocblas_status_success) {
+      fprintf(stderr, "indexer fp32 projection failed (P=%d)\n", P);
+      exit(1);
+    }
+  }
+#pragma clang diagnostic pop
+
   // QSA: projections batched. Flash path: qsplit/norm/rope batched, KV rows
   // bulk-copied to cache slots 0..P-1, one causal flash kernel over all
   // positions. GDEC_QSA_LOOP=1 falls back to the per-token loop (debug).
@@ -2262,14 +2382,7 @@ struct GpuModel {
       ensure_rope_cs(base, P);
       snprintf(buf, sizeof buf, "layers.%d.self_attn.indexer.index_qk_proj.weight", l);
       if (index_f32) {
-        float one = 1, zero = 0;
-        auto status = rocblas_sgemm(rbh, rocblas_operation_transpose, rocblas_operation_none,
-                                    640, P, 2560, &one, d_iw + (size_t)qi * 640 * 2560,
-                                    2560, d_xb, 2560, &zero, d_iproj, 640);
-        if (status != rocblas_status_success) {
-          fprintf(stderr, "indexer fp32 projection failed: %d\n", (int)status);
-          exit(1);
-        }
+        iproj_sgemm(d_iw + (size_t)qi * 640 * 2560, d_xb, d_iproj, P);
       } else {
         gemm(wview(ckpt.at(buf)), d_xb, d_iproj, P);
       }
@@ -3712,15 +3825,7 @@ struct GpuModel {
     ensure_rope_cs(base, P);
     if (!qsa_dense) {
       if (index_f32) {
-        float one = 1, zero = 0;
-        auto status =
-            rocblas_sgemm(rbh, rocblas_operation_transpose,
-                          rocblas_operation_none, 640, P, 2560, &one, d_miw,
-                          2560, d_xb, 2560, &zero, d_iproj, 640);
-        if (status != rocblas_status_success) {
-          fprintf(stderr, "mtp indexer fp32 projection failed: %d\n", (int)status);
-          exit(1);
-        }
+        iproj_sgemm(d_miw, d_xb, d_iproj, P);
       } else {
         snprintf(buf, sizeof buf, "%s.indexer.index_qk_proj.weight", pfx);
         gemm(wview(ckpt.at(buf)), d_xb, d_iproj, P);
@@ -3743,6 +3848,28 @@ struct GpuModel {
         int nxt = first < grid ? min(grid, base + P)
                                : min(first + INDEX_BATCH, base + P);
         int count = nxt - first;
+        // Same fused tiled scores + select as the trunk qsa_b path (the MTP
+        // sgemm alone was ~0.23 s per 32K prompt, the tiled kernel ~0.03 s).
+        // Only the MTP draft path sees these selections.
+        // GDEC_MTP_INDEX_SGEMM=1 keeps the old sgemm + index_select.
+        static const bool mtp_sgemm = getenv("GDEC_MTP_INDEX_SGEMM") != nullptr;
+        if (index_fused2 && !mtp_sgemm && count >= 16 &&
+            getenv("GDEC_INDEX_OLDSEL") == nullptr) {
+          k_index_scores_tiled<<<dim3((nb + 31) / 32, (count + 15) / 16), 256, 0, g_str>>>(
+              d_iq + (size_t)(first - base) * 512, d_mik, d_iscores, nb, count, first);
+          int* const selrow = d_iselected + (size_t)(first - base) * 512;
+          if ((first + count) / 4 <= 8192)
+            k_index_select_rs<true><<<count, 256, 0, g_str>>>(
+                d_iscores, nb, selrow, first);
+          else if (index_stream_select)
+            k_index_select_stream<true><<<count, 256, 0, g_str>>>(
+                d_iscores, nb, selrow, first);
+          else
+            k_index_select<16, true><<<count, 256, 0, g_str>>>(
+                d_iscores, nb, selrow, first);
+          first = nxt;
+          continue;
+        }
         auto status = rocblas_sgemm(rbh, rocblas_operation_transpose,
                                     rocblas_operation_none, nb, count * 4, 128,
                                     &one, d_mik, 128,

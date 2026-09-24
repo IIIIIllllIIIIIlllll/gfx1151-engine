@@ -1,7 +1,9 @@
 // gemm_sol_scan.cu — rocBLAS solution-index autotune for prefill dense GEMM shapes.
 // Mirrors Model::gemm() (src/gpu/gdec.cpp:8899): C[N,P]f32 = A[N,K]bf16^T * B[K,P]bf16.
 // Usage: gemm_sol_scan [N K P ...]  (triples; defaults to the slow prefill shapes)
-// Build: hipcc -O2 -o build/gemm_sol_scan tools/gemm_sol_scan.cu -lrocblas
+// Env F32=1: A/B in fp32 instead of bf16 (the fp32 indexer projection,
+// rocblas_sgemm 640 x P x 2560 in Model::qsa_b).
+// Build: hipcc -O2 --offload-arch=gfx1151 -o build/gemm_sol_scan tools/gemm_sol_scan.cu -lrocblas
 #define ROCBLAS_BETA_FEATURES_API
 #include <rocblas/rocblas.h>
 #include <hip/hip_runtime.h>
@@ -30,6 +32,10 @@ int main(int argc, char** argv) {
   if (shp.empty()) shp = {8192, 2560, 6144,  8192, 6144, 2560,
                           8192, 12288, 2560, 8192, 10240, 2560,
                           320,  8192, 10240, 8192, 320, 2560};
+  const bool f32 = getenv("F32") != nullptr;
+  const rocblas_datatype abt =
+      f32 ? rocblas_datatype_f32_r : rocblas_datatype_bf16_r;
+  const size_t esz = f32 ? 4 : 2;
   rocblas_handle h;
   rocblas_create_handle(&h);
   hipStream_t st;
@@ -38,20 +44,20 @@ int main(int argc, char** argv) {
 
   for (size_t s = 0; s < shp.size(); s += 3) {
     int N = shp[s], K = shp[s + 1], P = shp[s + 2];
-    __hip_bfloat16 *A, *B;
+    void *A, *B;
     float* C;
-    CK(hipMalloc(&A, (size_t)N * K * 2));
-    CK(hipMalloc(&B, (size_t)K * P * 2));
+    CK(hipMalloc(&A, (size_t)N * K * esz));
+    CK(hipMalloc(&B, (size_t)K * P * esz));
     CK(hipMalloc(&C, (size_t)N * P * 4));
-    CK(hipMemset(A, 0x3c, (size_t)N * K * 2));
-    CK(hipMemset(B, 0x3c, (size_t)K * P * 2));
+    CK(hipMemset(A, 0x3c, (size_t)N * K * esz));
+    CK(hipMemset(B, 0x3c, (size_t)K * P * esz));
     float one = 1.f, zero = 0.f;
     double gflop = 2.0 * N * K * P / 1e9;
 
     rocblas_int nsol = 0;
     rocblas_status qs = rocblas_gemm_ex_get_solutions(
         h, rocblas_operation_transpose, rocblas_operation_none, N, P, K, &one,
-        A, rocblas_datatype_bf16_r, K, B, rocblas_datatype_bf16_r, K, &zero, C,
+        A, abt, K, B, abt, K, &zero, C,
         rocblas_datatype_f32_r, N, C, rocblas_datatype_f32_r, N,
         rocblas_datatype_f32_r, rocblas_gemm_algo_solution_index, 0, nullptr,
         &nsol);
@@ -65,7 +71,7 @@ int main(int argc, char** argv) {
     rocblas_int ngot = nsol;  // list_size is IN when list_array != NULL
     rocblas_status gs = rocblas_gemm_ex_get_solutions(
         h, rocblas_operation_transpose, rocblas_operation_none, N, P, K, &one,
-        A, rocblas_datatype_bf16_r, K, B, rocblas_datatype_bf16_r, K, &zero, C,
+        A, abt, K, B, abt, K, &zero, C,
         rocblas_datatype_f32_r, N, C, rocblas_datatype_f32_r, N,
         rocblas_datatype_f32_r, rocblas_gemm_algo_solution_index, 0,
         sols.data(), &ngot);
@@ -78,7 +84,7 @@ int main(int argc, char** argv) {
       auto run = [&]() {
         return rocblas_gemm_ex(
             h, rocblas_operation_transpose, rocblas_operation_none, N, P, K,
-            &one, A, rocblas_datatype_bf16_r, K, B, rocblas_datatype_bf16_r, K,
+            &one, A, abt, K, B, abt, K,
             &zero, C, rocblas_datatype_f32_r, N, C, rocblas_datatype_f32_r, N,
             rocblas_datatype_f32_r, rocblas_gemm_algo_solution_index, idx, 0);
       };
@@ -109,7 +115,7 @@ int main(int argc, char** argv) {
     auto run0 = [&]() {
       return rocblas_gemm_ex(
           h, rocblas_operation_transpose, rocblas_operation_none, N, P, K, &one,
-          A, rocblas_datatype_bf16_r, K, B, rocblas_datatype_bf16_r, K, &zero, C,
+          A, abt, K, B, abt, K, &zero, C,
           rocblas_datatype_f32_r, N, C, rocblas_datatype_f32_r, N,
           rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
     };

@@ -47,6 +47,10 @@
 // allocated at maxbatch_cap = maxbatch + slack. GDEC_GDN_WINDOW_CHUNKS now
 // also sizes d_gdn_split_ws (was hardcoded 4; window>4 used to be an
 // illegal-memory-access bug).
+// 2026-09-24: KST=64 k_gemm_wmma variants for (2560,6144)/(320,10240)
+// (GDEC_GEMM_NO_K64=1 reverts); fp32 indexer projection runs a timed-pick
+// rocBLAS solution index (GDEC_IPROJ_SGEMM=1 reverts); MTP indexer scores use
+// the trunk's tiled kernel (GDEC_MTP_INDEX_SGEMM=1 reverts). PREFILL.md §11.9.
 // M-RoPE (vision, stage 1b/1c): requests may carry image grid_thw triples
 // (CLI --mrope-grid t,h,w / serve GEN suffix MROPE k t h w ...); the host
 // expands them to per-token 3-row positions (reference get_rope_index
@@ -78,6 +82,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
+#define ROCBLAS_BETA_FEATURES_API  // rocblas_gemm_ex_get_solutions (iproj_sgemm)
 #include <rocblas/rocblas.h>
 #include <hipblaslt/hipblaslt.h>
 #include <rocprim/block/block_radix_sort.hpp>

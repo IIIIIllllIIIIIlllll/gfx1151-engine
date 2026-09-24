@@ -13,8 +13,9 @@ prefill 时请同步更新该注释与本文档。
 8K 单 chunk ~963 tok/s，32K ~1086 tok/s。要点：`amd_iommu=off` 带来
 +5%（BIOS 开关可能不生效，需内核 cmdline 确认 `iommu_groups` 为空）；
 chunk 16384→32768 对 32K prompt +7.4%（单 chunk 摊薄每 chunk 固定开销），
-65536 触发内存 PSI 看门狗不可行；生产 chunk 现为 **32768**
-（start.sh GDEC_PREFILL_CHUNK）。§3/§10 中 WMMA、bf16 KV、MoE Lt 当时为
+65536 触发内存 PSI 看门狗不可行；当时生产 chunk 改为 32768，
+**2026-09-24 核对 start.sh 默认 PREFILL_CHUNK 已是 16384**（§11.9 的数据
+都按 16384）。§3/§10 中 WMMA、bf16 KV、MoE Lt 当时为
 opt-in，现均已是 start.sh 生产默认；这些开关两两 A/B 均 ±1% 打平。
 `GDEC_MOE_ATOMIC`（scatter 免 pairs）实测 -16%，方向已否决。
 
@@ -197,6 +198,9 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
 | `GDEC_GDN_PIPE=1` | GDN intra/strip 双流窗口流水实验（实测 -1%，勿开） |
 | `GDEC_GDN_PIPE2=1` | GDN intra fp16 驻留+WMMA+64-chunk 循环（kernel 2.81×，8K +1.7%；被 FUSED 取代） |
 | `GDEC_GDN_FUSED=1` | GDN intra+strip 融合持久化 kernel（start.sh 已开：kernel 3.34×，8K +5.7%、32K +4.4%，ids 0 分歧） |
+| `GDEC_GEMM_NO_K64=1` | 关闭 2026-09-24 的 KST=64 GEMM 分流（(2560,6144) 回 d3、(320,10240) 回 Lt） |
+| `GDEC_IPROJ_SGEMM=1` | fp32 indexer 投影回退普通 rocblas_sgemm（不挑 solution index） |
+| `GDEC_MTP_INDEX_SGEMM=1` | MTP 层 indexer 打分回退 sgemm + index_select（不用 tiled 融合 kernel） |
 
 ## 10. PP 优化切入点（2026-09-20 实测刷新）
 
@@ -387,7 +391,40 @@ kernel 链演进（头注释 gdec.cpp:6-15）：
    去重：combine 依赖两个 gemm 的输出，跨 gemm 融合是大改且收益上限
    ~0.1s/8K。GR 维度关闭。
 8. **PLE gather 与 GPU 计算的更深重叠**：ple_host 冷态 410-870ms 可见，
-   热态已被重叠掩盖；低优先级。
+   热态已被重叠掩盖；低优先级。2026-09-24 复核：不开 rocprof 时
+   ple 90-98 ms、ple_wait 0-1 ms，与 09-21 相同；rocprofv3 trace 下
+   ple_wait 变大是 trace 开销，不是回退。
+9. **2026-09-24 一轮（生产 env，chunk=16384，32K prompt 取第 2 个 chunk
+   稳态 tok/s；工具 tools/pp_prod.sh，kernel 排行 KTRACE=1 →
+   tools/ktrace_top.py）**。三项均已默认开启，各有 opt-out（§9），
+   GEN=48 贪心 ids 与改动前逐 token 一致，SPEC=256 投机生成 ids 与
+   depth acc 完全一致。一键验证 `bash tools/pp_opt_verify.sh`。
+   - **KST=64 GEMM 分流**（Model::gemm）：tools/gemm_lt_bench.cu 加了
+     KST=64 配置（KST 只能 32/64/128：RPW=32/(KST/8) 须为偶数）。
+     (2560,6144) d3 → `<64,128,2,2,2,4,64,128>` gm=1：P=16384 21.5 →
+     16.4 ms；(320,10240) Lt → `<64,160,2,2,2,5,64,128>`：5.3 → 3.9 ms。
+     K=2560 的 d9 形状 KST=64 全部更慢，保持不变；(640,2560) k1 仅
+     1.48 vs 1.68 ms，未采用。端到端 8K 1061 → 1093（+3.1%），32K
+     1225 → 1258（+2.7%）。
+   - **iproj_sgemm**（fp32 indexer 投影 640×P×2560）：rocblas_sgemm
+     自选的 MT32x32x8 仅 ~2.7 TFLOPS。首次 P≥1024 调用时用
+     rocblas_gemm_ex_get_solutions 现场计时挑选（快于 0.95× 才换），
+     gfx1151 上选中 -607（hipBLASLt 后端，≈2.4×，确定性，maxrel 7e-6，
+     与 sgemm 对 fp64 的 4.5e-6 同级；tools/sgemm_iproj_check.cu 全 P
+     ALL OK）。32K 省 ~0.28 s kernel 时间，端到端 +0.3%；首个 chunk
+     付一次 ~0.17 s 挑选开销，所以 8K 单 chunk 打平。需要
+     `ROCBLAS_BETA_FEATURES_API`（gdec.cpp）和 -Wdeprecated pragma。
+   - **MTP indexer 打分走 tiled**（mtp_qsa_b）：MTP 层原先用
+     rocblas_sgemm（SB MT128x64x12，单层 0.23 s/32K，比 12 个主干层的
+     k_index_scores_tiled 合计还多一半），改为与主干相同的 tiled 融合
+     kernel + select。32K 第 2 chunk 1266 → 1272（+0.5%）。
+   - 合计 32K：1225 → ~1270 tok/s（+3.7%），8K：1061 → ~1092（+2.9%）。
+   - 剩余 kernel 排行（32K，新二进制）：k_gemm_wmma 6.9 s（已是自写
+     峰值附近）、MoE Lt（Cijk MT128x128x32 1.9 s + MT32x96x32 1.1 s +
+     deq 1.4 s + gather/reduce/silu 1.4 s，§11.2 已否决）、k_qsa_wmma
+     1.76 s、GDN fused 1.26 s、GR combine/scatter 2.3 s（§11.7 已关闭）。
+     还没做的方向只剩 k_qsa_wmma 调优（大工程）以及 MoE 小形状 Lt
+     solution 挑选（每个形状收益 <0.3 s，需逐形状确认确定性）。
 
 ## 附：本文档的未复核项
 
