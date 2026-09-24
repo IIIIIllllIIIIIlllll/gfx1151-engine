@@ -82,7 +82,7 @@ echo "模型：$MODEL_FILE"
 echo "配置：${MAX_CONTEXT} 上下文，MTP gamma=${MTP_GAMMA}，API ${API_HOST}:${API_PORT}"
 if (( KV_PAGED )); then
   echo "KV：分页，页池 $(( (KV_POOL_TOKENS > MAX_CONTEXT ? KV_POOL_TOKENS : MAX_CONTEXT) )) token（${PARALLEL} 路并发共享），RAM 检查点 ${RCKPT_MAX} 个"
-  (( PARALLEL == 1 )) || echo "提示：每多一路并发约多占 1.1 GiB 设备内存（256K 下），arena（95 GiB 上限）放不下的部分会回退 hipMalloc" >&2
+  (( PARALLEL == 1 )) || echo "提示：每多一路并发约多占 0.12 GiB 设备内存，arena（95 GiB 上限）放不下的部分会回退 hipMalloc" >&2
   (( KV_POOL_TOKENS <= MAX_CONTEXT )) || echo "警告：KV_POOL_TOKENS 大于 MAX_CONTEXT，Windows arena（95 GiB 上限）可能放不下，超出部分会回退 hipMalloc" >&2
 else
   echo "KV：不分页（KV_PAGED=0）"

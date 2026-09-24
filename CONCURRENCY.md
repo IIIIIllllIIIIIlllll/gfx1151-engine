@@ -15,8 +15,10 @@
 | `KV_POOL_TOKENS` | 0 | 共享 KV 页池大小，取 `max(KV_POOL_TOKENS, MAX_CONTEXT)`；默认即一条 256K |
 
 引擎读 `GDEC_PARALLEL`，API 启动时从引擎 `INFO` 的 `kv_slots` 字段得知路数并开同样
-多的引擎连接。每多一路约多占 1.1 GiB 显存（256K、默认 FP32 KV 下：MTP KV 按 MAX_CONTEXT 预分配
-约 1 GiB，GDN 状态 113 MB，MTP indexer keys 34 MB；MTP KV 随 MAX_CONTEXT 缩放）。
+多的引擎连接。每多一路约多占 0.12 GiB 显存（GDN 状态 113 MB 加少量 MTP 流状态）。
+MTP 层的 KV/indexer keys 是共享页池里的一层（B0），和主干 KV 一样按页取用，不再每路按
+MAX_CONTEXT 预分配（旧版每路多 0.5 GiB（BF16）/ 1 GiB（FP32）；PARALLEL=4 实测省 1.63 GiB）。
+rckpt 检查点连同 MTP 层的页一起钉住，恢复后继续 MTP 投机（`tools/b0_verify.sh` 验证）。
 
 ## 语义
 

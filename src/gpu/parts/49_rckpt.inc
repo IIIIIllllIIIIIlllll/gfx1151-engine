@@ -12,6 +12,12 @@
 // switching back to an earlier conversation remaps its pages instead of
 // re-prefilling. Live writes into a shared page copy it first (kv_cow).
 // When the page pool runs dry the LRU checkpoint is evicted (evict_one).
+//
+// B0: the MTP KV/keys are pool layer nqsa, so the pinned pages carry them
+// too. A checkpoint taken while the MTP layer is in lockstep (mtp_pos ==
+// pos-1, rows [0, pos-1) ingested) also stores the MTP stream state (d_R =
+// h_{pos-1}, d_miraw, mtp_pos); restoring it keeps speculation available
+// (the cont boundary step pairs d_R with the first new token).
 
 namespace rckpt {
 
@@ -20,6 +26,9 @@ struct Ck {
   int pos = 0, ringpos = 0;
   std::vector<float> s, convst, ring, iraw;  // host copies, ~118 MB total
   std::vector<int> pages;  // A3: pinned KV pages for rows [0, pos) (paged only)
+  bool mtp_ok = false;     // B0: MTP state below is valid (lockstep at save)
+  int mtp_pos = 0;
+  std::vector<float> mR, miraw;  // d_R (h_{pos-1}), d_miraw
   // M-RoPE guard (KVS2 meta semantics): placeholder ids are pixel-agnostic,
   // so a vision checkpoint only matches the same grids and patch hash.
   bool mrope = false;
@@ -89,7 +98,8 @@ void prune(const std::vector<int64_t>& chist) {
     it = prefix_of(it->toks, chist) ? std::next(it) : g_list.erase(it);
 }
 
-void save(GpuModel& m, const std::vector<int>& toks) {
+// `mtp`: the caller ingested the MTP layer in lockstep with this prefix.
+void save(GpuModel& m, const std::vector<int>& toks, bool mtp = false) {
   if (!g_on || toks.size() < g_min_tokens || toks.size() != (size_t)m.pos)
     return;
   if (!g_m) {
@@ -97,16 +107,24 @@ void save(GpuModel& m, const std::vector<int>& toks) {
     g_pin = m.kv_paged;
     if (g_pin) m.kv_evict_fn = &evict_one;
   }
+  const int nqsa = g_cfg.layers / 4, ngdn = g_cfg.layers - nqsa;
+  const bool mtp_ok = mtp && m.kv_nl > nqsa && m.mtp_pos == m.pos - 1;
   const uint64_t h = hash_toks(toks);
   for (auto it = g_list.begin(); it != g_list.end(); ++it)
     if (it->toks.size() == toks.size() && hash_toks(it->toks) == h &&
-        it->toks == toks) {  // same state already cached: bump LRU
-      Ck mv = std::move(*it);
+        it->toks == toks) {
+      if (it->mtp_ok || !mtp_ok) {  // same state already cached: bump LRU
+        Ck mv = std::move(*it);
+        g_list.erase(it);
+        g_list.push_back(std::move(mv));
+        return;
+      }
+      // The cached copy lacks MTP state and its pinned pages hold stale MTP
+      // rows: replace it with a fresh checkpoint.
+      release(*it);
       g_list.erase(it);
-      g_list.push_back(std::move(mv));
-      return;
+      break;
     }
-  const int nqsa = g_cfg.layers / 4, ngdn = g_cfg.layers - nqsa;
   Ck ck;
   ck.toks = toks;
   ck.pos = m.pos;
@@ -125,6 +143,18 @@ void save(GpuModel& m, const std::vector<int>& toks) {
       hipMemcpy(ck.iraw.data(), m.d_iraw, ck.iraw.size() * 4,
                 hipMemcpyDeviceToHost) == hipSuccess;
   if (!ok) return;
+  if (mtp_ok) {
+    ck.mR.resize((size_t)g_cfg.branches * g_cfg.d);
+    ck.mtp_ok =
+        hipMemcpy(ck.mR.data(), m.d_R, ck.mR.size() * 4,
+                  hipMemcpyDeviceToHost) == hipSuccess;
+    if (ck.mtp_ok && m.d_miraw) {
+      ck.miraw.resize(4 * 128);
+      ck.mtp_ok = hipMemcpy(ck.miraw.data(), m.d_miraw, ck.miraw.size() * 4,
+                            hipMemcpyDeviceToHost) == hipSuccess;
+    }
+    ck.mtp_pos = m.mtp_pos;
+  }
   ck.mrope = m.mrope_active_;
   ck.rope_delta = m.rope_delta_;
   ck.img_hash = m.img_hash_;
@@ -159,9 +189,12 @@ int match(const std::vector<int>& prompt, const std::vector<int64_t>& chist,
   return best;
 }
 
-bool restore(GpuModel& m, int idx, std::vector<int>* toks_out) {
+// *mtp_out: the MTP layer is back in lockstep (speculation may continue).
+bool restore(GpuModel& m, int idx, std::vector<int>* toks_out,
+             bool* mtp_out) {
   Ck& ck = g_list[(size_t)idx];
-  const bool ok =
+  *mtp_out = false;
+  bool ok =
       hipMemcpy(m.d_S, ck.s.data(), ck.s.size() * 4,
                 hipMemcpyHostToDevice) == hipSuccess &&
       hipMemcpy(m.d_convst, ck.convst.data(), ck.convst.size() * 4,
@@ -171,6 +204,18 @@ bool restore(GpuModel& m, int idx, std::vector<int>* toks_out) {
       hipMemcpy(m.d_iraw, ck.iraw.data(), ck.iraw.size() * 4,
                 hipMemcpyHostToDevice) == hipSuccess;
   if (!ok) return false;
+  if (ck.mtp_ok) {
+    ok = hipMemcpy(m.d_R, ck.mR.data(), ck.mR.size() * 4,
+                   hipMemcpyHostToDevice) == hipSuccess &&
+         (ck.miraw.empty() ||
+          hipMemcpy(m.d_miraw, ck.miraw.data(), ck.miraw.size() * 4,
+                    hipMemcpyHostToDevice) == hipSuccess);
+    if (ok) {
+      m.mtp_pos = ck.mtp_pos;
+      CK(hipMemcpy(m.d_mpos, &m.mtp_pos, 4, hipMemcpyHostToDevice));
+      *mtp_out = true;
+    }
+  }
   m.pos = ck.pos;
   m.ple_ringpos = ck.ringpos;
   if (g_pin) {

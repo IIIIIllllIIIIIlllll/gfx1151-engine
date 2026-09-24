@@ -4,6 +4,7 @@
 #   bash tools/a5_verify.sh
 #   SKIP_BUILD=1 bash tools/a5_verify.sh     # 已经编译过，跳过 ktest + 编译
 #   A5_CTX=65536 bash tools/a5_verify.sh     # 用更小的 maxctx 快速跑（默认 = service.conf 的 MAX_CONTEXT）
+#   A5_BIN=build/gdec.conc SKIP_BUILD=1 bash tools/a5_verify.sh   # 测另一个引擎二进制
 # 之前 A1–A3 的分页测试全是串行解码。生产实际走的是 chain/MTP 投机 + 验证回滚、
 # 采样、多轮续写、SNAPS 切点、kvsnap + rckpt 同时开、MTP 权重和视觉塔都加载、
 # maxctx 256K。本脚本用 start.sh 的真实环境变量和命令行（只换端口 8732）跑三个引擎：
@@ -85,6 +86,7 @@ else
   die "生产环境默认 GDEC_KV_PAGED=1" "start.sh 没有导出 GDEC_KV_PAGED=1，检查 service.conf 里的 KV_PAGED"
 fi
 eval "ENGINE=($CMDLINE)"
+[[ -n "${A5_BIN:-}" ]] && ENGINE[0]="$A5_BIN"   # 测试其他引擎二进制（如 build/gdec.conc）
 CTX="${A5_CTX:-}"
 for i in "${!ENGINE[@]}"; do
   case "${ENGINE[$i]}" in
@@ -108,6 +110,9 @@ set_env() {  # <off|p1|p2>
   for v in $(compgen -e | grep '^GDEC_'); do unset "$v"; done
   for v in "${PENV[@]}"; do export "$v"; done
   export GDEC_KVSNAP_DIR="$SNAPDIR"     # 不碰生产的 data/kvsnap
+  # 单槽：off（不分页）只能跑 1 个槽；多槽时切回对话 A 会被派到还留着 A 的槽（cont），
+  # 不走 rckpt 恢复，缓存命中也和 off 不同。并发由 tools/conc_verify.sh 覆盖。
+  export GDEC_PARALLEL=1
   case "$1" in
     off) unset GDEC_KV_PAGED GDEC_KV_POOL_TOKENS ;;
     p2) export GDEC_KV_PAGED=2 ;;

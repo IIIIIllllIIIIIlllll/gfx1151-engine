@@ -118,6 +118,14 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   const size_t kvpool = (size_t)kv_pool_pages_for((int)mc);
   const size_t kv_rows = kv_paged ? (kvpool + 1) * KV_PAGE : mc;
   const size_t ik_rows = kv_paged ? (kvpool + 1) * KV_PAGE_BLOCKS : ib;
+  // MTP draft head（构造函数同款开启条件）
+  const bool moe_default = moe_det && !getenv("GDEC_MOE_ORDERED") &&
+                           !getenv("GDEC_MOE_HOST_ROUTE") &&
+                           !getenv("GDEC_MOE_UNTILED") &&
+                           !getenv("GDEC_MOE_FP32_IO");
+  const bool mtp_on = ck.find("mtp.fc_hidden.weight") && moe_default;
+  // B0：MTP 层是 KV/ik 数组的第 nqsa 层（与 trunk 共用页池，无 d_vcbt）
+  const size_t nkv = nqsa + (mtp_on ? 1 : 0);
   if (kv_paged) add(kvpg * 4);  // d_ptab
   add((size_t)64 << 20);  // decode 单行小缓冲合计（d_R..d_logits 等）
   add(ngdn * 48 * 128 * 128 * 4);           // d_S
@@ -137,7 +145,7 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
     const size_t bc = std::min(mc, BP);     // maxbatch_cap（A1b：按 chunk 定尺寸）
     add(bc * 640 * 4);                      // d_iproj
     add(bc * 512 * 4);                      // d_iq
-    add(nqsa * ik_rows * 128 * 4);          // d_ik
+    add(nkv * ik_rows * 128 * 4);           // d_ik（含 MTP 层）
     if (kv_paged) add(ib * 128 * 4);        // d_ikg
     add(nqsa * 4 * 128 * 4);                // d_iraw
     add(nqsa * 256 * 4);                    // d_inorm
@@ -146,9 +154,9 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
     add(bc * INDEX_BUDGET * 4);             // d_iselected
   }
   if (kv_fp32) {
-    add(2 * nqsa * kv_rows * 512 * 4);      // d_kc + d_vc
+    add(2 * nkv * kv_rows * 512 * 4);       // d_kc + d_vc（含 MTP 层）
   } else {
-    add(2 * nqsa * kv_rows * 512 * 2);      // d_kcb + d_vcb
+    add(2 * nkv * kv_rows * 512 * 2);       // d_kcb + d_vcb（含 MTP 层）
     if (btv) add(nqsa * ((kv_rows + 3) / 4) * 2 * 256 * 4 * 2);  // d_vcbt
     // GDEC_QSA_UNION: d_ublk + d_umask + d_ucount（按单 chunk 组数）
     if (btv && getenv("GDEC_QSA_UNION")) {
@@ -188,12 +196,6 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
     }
   }
   add(BP * 4 + BP * sizeof(int2));            // tokarr img_inj
-  // MTP draft head（构造函数同款开启条件）
-  const bool moe_default = moe_det && !getenv("GDEC_MOE_ORDERED") &&
-                           !getenv("GDEC_MOE_HOST_ROUTE") &&
-                           !getenv("GDEC_MOE_UNTILED") &&
-                           !getenv("GDEC_MOE_FP32_IO");
-  const bool mtp_on = ck.find("mtp.fc_hidden.weight") && moe_default;
   // 额外序列槽（GpuModel::slots_init，仅分页 KV）：每槽一份序列状态
   if (kv_paged)
     for (int i = 1; i < eff_parallel(); i++) {
@@ -206,20 +208,18 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
       add(kvpg * 4);                                   // d_ptab
       if (mtp_on) {
         add(4);                                        // d_mpos
-        add(mc * 512 * (kv_fp32 ? 4 : 2)); add(mc * 512 * (kv_fp32 ? 4 : 2));  // MTP KV
-        if (!qsa_dense) { add(ib * 128 * 4); add(4 * 128 * 4); }  // mik miraw
+        if (!qsa_dense) add(4 * 128 * 4);              // d_miraw（MTP KV/ik 在页池里）
       }
     }
   if (mtp_on) {
     add(rb * 4 * 3 + (size_t)g_cfg.d * 4 * 5 + 8);  // mR mRhat mh me meo mt mnorm_*
-    add(2 * mc * 512 * (kv_fp32 ? 4 : 2));          // MTP KV
     add(3 * BP * 10240 * 4);                        // mRb mRhatb mtap
     add(512 * 4);                                   // mring_ckpt
     add(9 * ngdn * 48 * 128 * 128 * 4);             // Ssnap
     add(9 * ngdn * 3 * 10240 * 4);                  // csnap
     add(nqsa * 9 * 128 * 4);                        // iproj_snap
     if (!qsa_dense) {
-      add(ib * 128 * 4 + 4 * 128 * 4 + 256 * 4);    // mik miraw minorm
+      add(4 * 128 * 4 + 256 * 4);                   // miraw minorm
       if (index_f32) add((size_t)640 * 2560 * 4);   // miw
     }
   }

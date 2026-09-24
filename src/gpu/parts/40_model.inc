@@ -60,8 +60,10 @@ struct GpuModel {
   // (self-test: output must stay bitwise identical to unpaged). Unset/0: legacy
   // addressing (ptab == nullptr in every kernel). A1c: the BF16 cache
   // (d_kcb/d_vcb and the transposed d_vcbt) is paged too when the sparse
-  // prefill kernel is k_qsa_wmma (no WMMA6/UNION). The MTP KV
-  // (d_mkcf/d_mvcf/d_mik) stays contiguous.
+  // prefill kernel is k_qsa_wmma (no WMMA6/UNION). B0: the MTP layer's KV and
+  // indexer keys are layer nqsa of the same arrays (kv_nl = nqsa + 1), so
+  // they share the page table, the pool, checkpoint pins and COW; d_mkcf/
+  // d_mvcf/d_mkcb/d_mvcb/d_mik are views of that slice (no transposed V).
   // A2: pages are allocated on demand from a pool (KvPagePool, 10_ple_io.inc)
   // as the live sequence grows (kv_reserve) and returned when it shrinks or
   // resets (kv_trim). GDEC_KV_PAGED=1: lowest-free-first allocation, =2:
@@ -87,6 +89,7 @@ struct GpuModel {
   void yield_point() {
     if (yield_fn) yield_fn(*this);
   }
+  int kv_nl = 0;                // layers in d_kc/d_vc/d_kcb/d_vcb/d_ik (+1 = MTP)
   size_t kv_layer_rows = 0;     // per-layer KV row stride (== maxctx unpaged)
   size_t ik_layer_blocks = 0;   // per-layer d_ik block stride (== index_blocks unpaged)
   int* d_ptab = nullptr;        // [kv_lpages] live logical page -> physical page
@@ -248,6 +251,15 @@ struct GpuModel {
   // t_{p+2} from (trunk h_p, emb(t_{p+1})) (DeepSeek-style wiring). Owns its
   // stream/KV/indexer state; reuses trunk scratch (strictly serial use).
   bool mtp_avail = false;      // checkpoint has mtp.* tensors and env is default
+  // mtp_avail's condition, known before the KV pool is sized (B0: the MTP
+  // layer is pool layer nqsa).
+  bool mtp_moe_default() const {
+    return moe_deterministic && !moe_ordered && !moe_host_route && !moe_untiled &&
+           !moe_fp32_io;
+  }
+  bool mtp_kv_wanted() const {
+    return ckpt.find("mtp.fc_hidden.weight") && mtp_moe_default();
+  }
   bool ngram_verify_active = false;
   bool ngram_legacy_gdn = getenv("GDEC_NGRAM_LEGACY_GDN") != nullptr;
   bool ngram_legacy_final = getenv("GDEC_NGRAM_LEGACY_FINAL") != nullptr;
@@ -265,11 +277,12 @@ struct GpuModel {
   float* d_mnorm_h = nullptr;  // mtp.pre_fc_norm_hidden [10240] fp32
   int* d_mtok = nullptr;       // device scalar: draft input token
   int* d_mpos = nullptr;       // device scalar: MTP position
-  float* d_mkcf = nullptr;     // MTP KV, FP32 mode (maxctx, 512)
+  // MTP KV / indexer keys: views of pool layer nqsa (B0), not allocations
+  float* d_mkcf = nullptr;     // FP32 mode (kv_layer_rows, 512)
   float* d_mvcf = nullptr;
-  uint16_t* d_mkcb = nullptr;  // MTP KV, BF16 mode
+  uint16_t* d_mkcb = nullptr;  // BF16 mode
   uint16_t* d_mvcb = nullptr;
-  float* d_mik = nullptr;      // MTP indexer pooled keys (index_blocks, 128)
+  float* d_mik = nullptr;      // pooled keys (ik_layer_blocks, 128)
   float* d_miraw = nullptr;    // MTP indexer raw ring (4, 128)
   float* d_minorm = nullptr;   // MTP indexer norms q[128] + k[128]
   float* d_miw = nullptr;      // MTP indexer fp32 proj (640, 2560)
@@ -339,6 +352,7 @@ struct GpuModel {
     DALLOC(&d_dtbias, (size_t)ngdn * 48 * 4);
     DALLOC(&d_gdnnorm, (size_t)ngdn * 128 * 4);
     int nqsa = g_cfg.layers / 4;  // 12
+    kv_nl = nqsa + (mtp_kv_wanted() ? 1 : 0);
     {
       const char* pe = getenv("GDEC_KV_PAGED");
       int mode = pe ? atoi(pe) : 0;
@@ -388,7 +402,7 @@ struct GpuModel {
       // of the whole history) stays maxctx-sized.
       DALLOC(&d_iproj, (size_t)maxbatch_cap * 640 * 4);
       DALLOC(&d_iq, (size_t)maxbatch_cap * 512 * 4);
-      DALLOC(&d_ik, (size_t)nqsa * ik_layer_blocks * 128 * 4);
+      DALLOC(&d_ik, (size_t)kv_nl * ik_layer_blocks * 128 * 4);
       if (kv_paged) DALLOC(&d_ikg, (size_t)index_blocks * 128 * 4);
       DALLOC(&d_iraw, (size_t)nqsa * 4 * 128 * 4);
       CK(hipMemset(d_iraw, 0, (size_t)nqsa * 4 * 128 * 4));
@@ -398,11 +412,11 @@ struct GpuModel {
       DALLOC(&d_iselected, (size_t)maxbatch_cap * INDEX_BUDGET * 4);
     }
     if (qsa_kv_fp32) {
-      DALLOC(&d_kc, (size_t)nqsa * kv_layer_rows * 512 * 4);
-      DALLOC(&d_vc, (size_t)nqsa * kv_layer_rows * 512 * 4);
+      DALLOC(&d_kc, (size_t)kv_nl * kv_layer_rows * 512 * 4);
+      DALLOC(&d_vc, (size_t)kv_nl * kv_layer_rows * 512 * 4);
     } else {
-      DALLOC(&d_kcb, (size_t)nqsa * kv_layer_rows * 512 * 2);
-      DALLOC(&d_vcb, (size_t)nqsa * kv_layer_rows * 512 * 2);
+      DALLOC(&d_kcb, (size_t)kv_nl * kv_layer_rows * 512 * 2);
+      DALLOC(&d_vcb, (size_t)kv_nl * kv_layer_rows * 512 * 2);
       if (qsa_wmma_btv) {
         // paged: kv_layer_rows = (pool + 1) * 256 -> (pool + 1) * 64 blocks,
         // and physical page p owns physical blocks [p*64, p*64+64)
@@ -642,8 +656,7 @@ struct GpuModel {
       // the trunk batch MoE, while MTP draft/ingest/verify run their own
       // fixed kernels at P <= gamma+1 <= 9. gr_bf16 taps are converted
       // bf16->f32 at capture/rollback/ingest (see spec_taps/restore_dR_row).
-      bool moe_default = moe_deterministic && !moe_ordered && !moe_host_route &&
-                         !moe_untiled && !moe_fp32_io;
+      bool moe_default = mtp_moe_default();
       if (!moe_default) {
         fprintf(stderr, "mtp: disabled (moe_default=%d)\n", (int)moe_default);
       } else {
@@ -665,12 +678,14 @@ struct GpuModel {
         DALLOC(&d_mnorm_h, rb * 4);
         upload("mtp.pre_fc_norm_embedding.weight", d_mnorm_e, g_cfg.d);
         upload("mtp.pre_fc_norm_hidden.weight", d_mnorm_h, rb);
+        // B0: pool layer nqsa (allocated above since kv_nl == nqsa + 1)
+        const size_t moff = (size_t)nqsa * kv_layer_rows * 512;
         if (qsa_kv_fp32) {
-          DALLOC(&d_mkcf, (size_t)maxctx * 512 * 4);
-          DALLOC(&d_mvcf, (size_t)maxctx * 512 * 4);
+          d_mkcf = d_kc + moff;
+          d_mvcf = d_vc + moff;
         } else {
-          DALLOC(&d_mkcb, (size_t)maxctx * 512 * 2);
-          DALLOC(&d_mvcb, (size_t)maxctx * 512 * 2);
+          d_mkcb = d_kcb + moff;
+          d_mvcb = d_vcb + moff;
         }
         DALLOC(&d_mRb, (size_t)maxbatch_cap * 10240 * 4);
         DALLOC(&d_mRhatb, (size_t)maxbatch_cap * 10240 * 4);
@@ -686,7 +701,7 @@ struct GpuModel {
           DALLOC(&d_iproj_snap, (size_t)(g_cfg.layers / 4) * 9 * 128 * 4);
         }
         if (!qsa_dense) {
-          DALLOC(&d_mik, (size_t)index_blocks * 128 * 4);
+          d_mik = d_ik + (size_t)nqsa * ik_layer_blocks * 128;
           DALLOC(&d_miraw, 4 * 128 * 4);
           CK(hipMemset(d_miraw, 0, 4 * 128 * 4));
           DALLOC(&d_minorm, 256 * 4);
@@ -2209,7 +2224,7 @@ struct GpuModel {
     return e && (!strcmp(e, "1") || strchr(e, c));
   }
   void kv_zero_unpaged() {
-    const size_t nqsa = (size_t)(g_cfg.layers / 4), rows = nqsa * kv_layer_rows;
+    const size_t nqsa = (size_t)(g_cfg.layers / 4), rows = (size_t)kv_nl * kv_layer_rows;
     if (qsa_kv_fp32) {
       if (kv_zero_has('k')) CK(hipMemset(d_kc, 0, rows * 512 * 4));
       if (kv_zero_has('v')) CK(hipMemset(d_vc, 0, rows * 512 * 4));
@@ -2219,7 +2234,7 @@ struct GpuModel {
       if (qsa_wmma_btv && kv_zero_has('t'))
         CK(hipMemset(d_vcbt, 0, nqsa * qsa_vt_blocks * 2 * 256 * 4 * 2));
     }
-    if (d_ik && kv_zero_has('i')) CK(hipMemset(d_ik, 0, nqsa * ik_layer_blocks * 128 * 4));
+    if (d_ik && kv_zero_has('i')) CK(hipMemset(d_ik, 0, (size_t)kv_nl * ik_layer_blocks * 128 * 4));
   }
   // A3: pin / unpin / adopt the live prefix for RAM checkpoints.
   std::vector<int> kv_pin(int pos) {
@@ -2284,11 +2299,12 @@ struct GpuModel {
     kv_page_regions_k(page, [&](void* q, size_t n, char) { fn(q, n); });
   }
   // Same, fn(device ptr, bytes, kind) with kind k / v / t (transposed V) / i.
+  // Layers 0..kv_nl-1: the trunk QSA layers, then the MTP layer (no t).
   template <typename F>
   void kv_page_regions_k(int page, F&& fn) {
     const int nqsa = g_cfg.layers / 4;
     const size_t g = (size_t)page;
-    for (int qi = 0; qi < nqsa; qi++) {
+    for (int qi = 0; qi < kv_nl; qi++) {
       const size_t row0 = (size_t)qi * kv_layer_rows + g * KV_PAGE;
       if (qsa_kv_fp32) {
         fn(d_kc + row0 * 512, (size_t)KV_PAGE * 512 * 4, 'k');
@@ -2296,7 +2312,7 @@ struct GpuModel {
       } else {
         fn(d_kcb + row0 * 512, (size_t)KV_PAGE * 512 * 2, 'k');
         fn(d_vcb + row0 * 512, (size_t)KV_PAGE * 512 * 2, 'v');
-        if (qsa_wmma_btv)
+        if (qsa_wmma_btv && qi < nqsa)
           fn(vct_layer(qi) + g * KV_PAGE_BLOCKS * 2 * 256 * 4,
              (size_t)KV_PAGE_BLOCKS * 2 * 256 * 4 * 2, 't');
       }
@@ -3652,12 +3668,12 @@ struct GpuModel {
   void mtp_qsa_attn(const KVT* kc, const KVT* vc) {
     if (qsa_dense) {
       k_qsa_step<KVT><<<24, 256, 0, g_str>>>(d_qs, kc, vc, d_attn, d_mpos, 256, 2,
-                                             24);
+                                             24, nullptr, false, kvpt());
       return;
     }
     k_qsa_flash<true, false, KVT, true><<<dim3(QSA_DEC_NSPLIT, 2), 128, 0, g_str>>>(
         d_qs, kc, vc, d_attn, 1, 256, 2, 24, d_iselected, 0, d_mpos, d_pacc,
-        d_pml);
+        d_pml, 0, kvpt());
     k_qsa_flash_combine<<<dim3(12, 2), 64, 0, g_str>>>(d_pml, d_pacc, d_attn, 12,
                                                        256, d_mpos);
   }
@@ -3674,9 +3690,9 @@ struct GpuModel {
                                                d_mpos, 0, nullptr, d_rdelta);
       k_index_append<<<1, 128, 0, g_str>>>(d_iproj, d_minorm + 128, d_miraw,
                                            d_mik, d_mpos, g_cfg.norm_eps,
-                                           g_cfg.rope_theta, d_rdelta);
+                                           g_cfg.rope_theta, d_rdelta, kvpt());
       k_index_scores<<<(index_blocks + 3) / 4, 128, 0, g_str>>>(
-          d_iq, d_mik, d_iscores, index_blocks, d_mpos);
+          d_iq, d_mik, d_iscores, index_blocks, d_mpos, kvpt());
       index_select(d_iscores, index_blocks, d_iselected, 0, 1, d_mpos);
     }
     snprintf(buf, sizeof buf, "%s.q_proj.weight", pfx);
@@ -3700,10 +3716,11 @@ struct GpuModel {
                                                     g_cfg.rope_theta,
                                                     d_rdelta);
     if (qsa_kv_fp32) {
-      k_store_kv<<<2, 256, 0, g_str>>>(d_kb, d_vb, d_mkcf, d_mvcf, d_mpos);
+      k_store_kv<<<2, 256, 0, g_str>>>(d_kb, d_vb, d_mkcf, d_mvcf, d_mpos, kvpt());
       mtp_qsa_attn(d_mkcf, d_mvcf);
     } else {
-      k_store_kv_bf16<<<2, 256, 0, g_str>>>(d_kb, d_vb, d_mkcb, d_mvcb, d_mpos);
+      k_store_kv_bf16<<<2, 256, 0, g_str>>>(d_kb, d_vb, d_mkcb, d_mvcb, d_mpos,
+                                            nullptr, kvpt());
       mtp_qsa_attn(d_mkcb, d_mvcb);
     }
     k_sigmoid_gate<<<(24 * 256 + 255) / 256, 256, 0, g_str>>>(d_attn, d_gs,
@@ -3754,6 +3771,9 @@ struct GpuModel {
   // the argmax; sampling callers request the full logits instead.
   int mtp_step(const float* tap, int tok,
                std::vector<float>* host_logits = nullptr) {
+    // B0: row mtp_pos is in the shared pool; drafts run ahead of the trunk
+    // (rows pos-1 .. pos+gamma-2), so map / un-share the page first
+    kv_prepare(mtp_pos, mtp_pos + 1);
     CK(hipMemcpyAsync(d_mtok, &tok, 4, hipMemcpyHostToDevice, g_str));
     CK(hipMemcpyAsync(d_mpos, &mtp_pos, 4, hipMemcpyHostToDevice, g_str));
     mtp_input_1(tap);
@@ -3882,8 +3902,14 @@ struct GpuModel {
         k_index_pool<<<nb - b0, 128, 0, g_str>>>(d_iproj, d_minorm + 128, d_mik,
                                                  g_cfg.norm_eps,
                                                  g_cfg.rope_theta, base, d_miraw,
-                                                 d_ropecs);
+                                                 d_ropecs, kvpt());
       k_index_ring<<<min(P, 4), 128, 0, g_str>>>(d_iproj, d_miraw, P, base);
+      // paged: gather the keys contiguous for the scores (as trunk qsa_b)
+      const float* skeys = d_mik;
+      if (kv_paged && nb > 0 && std::max(2051, base) < base + P) {
+        k_ik_gather<<<nb, 128, 0, g_str>>>(d_mik, d_ptab, d_ikg, nb);
+        skeys = d_ikg;
+      }
       const float one = 1.f, zero = 0.f;
       const int a0 = std::max(2051, base);
       const int grid =
@@ -3900,7 +3926,7 @@ struct GpuModel {
         if (index_fused2 && !mtp_sgemm && count >= 16 &&
             getenv("GDEC_INDEX_OLDSEL") == nullptr) {
           k_index_scores_tiled<<<dim3((nb + 31) / 32, (count + 15) / 16), 256, 0, g_str>>>(
-              d_iq + (size_t)(first - base) * 512, d_mik, d_iscores, nb, count, first);
+              d_iq + (size_t)(first - base) * 512, skeys, d_iscores, nb, count, first);
           int* const selrow = d_iselected + (size_t)(first - base) * 512;
           if ((first + count) / 4 <= 8192)
             k_index_select_rs<true><<<count, 256, 0, g_str>>>(
@@ -3916,7 +3942,7 @@ struct GpuModel {
         }
         auto status = rocblas_sgemm(rbh, rocblas_operation_transpose,
                                     rocblas_operation_none, nb, count * 4, 128,
-                                    &one, d_mik, 128,
+                                    &one, skeys, 128,
                                     d_iq + (size_t)(first - base) * 512, 128,
                                     &zero, d_iscores, nb);
         if (status != rocblas_status_success) {
@@ -3945,20 +3971,22 @@ struct GpuModel {
                                                       nullptr, g_cfg.norm_eps,
                                                       base, d_ropecs);
     int dense_P = qsa_dense ? P : min(P, std::max(0, 2051 - base));
+    // rows [base, base+P) of pool layer nqsa: one copy / convert per
+    // physically contiguous page run (a single one unpaged)
     if (qsa_kv_fp32) {
-      CK(hipMemcpyAsync(d_mkcf + (size_t)base * 512, d_kbb, (size_t)P * 512 * 4,
-                        hipMemcpyDeviceToDevice, g_str));
-      CK(hipMemcpyAsync(d_mvcf + (size_t)base * 512, d_vbb, (size_t)P * 512 * 4,
-                        hipMemcpyDeviceToDevice, g_str));
-      qsa_flash_b(d_mkcf, d_mvcf, P, dense_P, base);
+      kv_rows_store(d_mkcf, d_kbb, base, P);
+      kv_rows_store(d_mvcf, d_vbb, base, P);
+      qsa_flash_b(d_mkcf, d_mvcf, P, dense_P, base, nullptr, kvpt());
     } else {
-      k_f32_to_bf16_v4<<<(unsigned)(((size_t)P * 128 + 255) / 256), 256, 0,
-                         g_str>>>(d_kbb, d_mkcb + (size_t)base * 512, 512, P,
-                                  512);
-      k_f32_to_bf16_v4<<<(unsigned)(((size_t)P * 128 + 255) / 256), 256, 0,
-                         g_str>>>(d_vbb, d_mvcb + (size_t)base * 512, 512, P,
-                                  512);
-      qsa_flash_b(d_mkcb, d_mvcb, P, dense_P, base);
+      kv_runs(base, base + P, KV_PAGE, [&](int lr, size_t pr, int n) {
+        const size_t so = (size_t)(lr - base) * 512;
+        const unsigned g = (unsigned)(((size_t)n * 128 + 255) / 256);
+        k_f32_to_bf16_v4<<<g, 256, 0, g_str>>>(d_kbb + so, d_mkcb + pr * 512, 512, n,
+                                               512);
+        k_f32_to_bf16_v4<<<g, 256, 0, g_str>>>(d_vbb + so, d_mvcb + pr * 512, 512, n,
+                                               512);
+      });
+      qsa_flash_b(d_mkcb, d_mvcb, P, dense_P, base, nullptr, kvpt());
     }
     k_sigmoid_gate<<<(P * 6144 + 255) / 256, 256, 0, g_str>>>(d_attnb, d_gsb,
                                                               d_attnb, P * 6144);
@@ -4022,6 +4050,7 @@ struct GpuModel {
   void mtp_ingest_b(const float* taps, const std::vector<int>& toks, int P,
                     int base) {
     if (P < 1) return;
+    kv_prepare(base, base + P);  // B0: MTP rows live in the shared pool
     CK(hipMemcpyAsync(d_tokarr, toks.data(), P * 4, hipMemcpyHostToDevice,
                       g_str));
     mtp_input_b(taps, P);
@@ -5426,7 +5455,8 @@ struct GpuModel {
   // ---- Sequence slots (concurrent serve, GDEC_PARALLEL) ----
   // Everything one sequence carries from step to step: host mirrors, GDN /
   // conv / PLE ring / indexer ring state, the page table (the KV pages live
-  // in the shared pool), the MTP KV, per-slot decode graphs (they bake these
+  // in the shared pool, MTP layer included), the MTP indexer ring and
+  // position, per-slot decode graphs (they bake these
   // pointers) and the request-scoped flags/stats. Weights, prefill/decode
   // scratch, logits, verify checkpoints and the KV pool are shared: slots
   // time-slice the GPU and hand it over only at yield_point(), where none of
@@ -5444,7 +5474,7 @@ struct GpuModel {
   X(last_spec_proposed) X(live_spec_rounds) X(live_spec_commits)              \
   X(live_spec_proposed) X(g1_exec) X(g2_exec)                                 \
   X(d_S) X(d_convst) X(d_ring) X(d_iraw) X(d_R) X(d_pos) X(d_ringpos)         \
-  X(d_mkcf) X(d_mvcf) X(d_mkcb) X(d_mvcb) X(d_mik) X(d_miraw) X(d_mpos)
+  X(d_miraw) X(d_mpos)
   struct SeqState {
 #define GDEC_SLOT_DECL(f) decltype(GpuModel::f) f{};
     GDEC_SLOT_FIELDS(GDEC_SLOT_DECL)
@@ -5510,15 +5540,7 @@ struct GpuModel {
       if (mtp_avail) {
         DALLOC(&t.d_mpos, 4);
         CK(hipMemset(t.d_mpos, 0, 4));
-        if (d_mkcf) {
-          DALLOC(&t.d_mkcf, (size_t)maxctx * 512 * 4);
-          DALLOC(&t.d_mvcf, (size_t)maxctx * 512 * 4);
-        }
-        if (d_mkcb) {
-          DALLOC(&t.d_mkcb, (size_t)maxctx * 512 * 2);
-          DALLOC(&t.d_mvcb, (size_t)maxctx * 512 * 2);
-        }
-        if (d_mik) DALLOC(&t.d_mik, (size_t)index_blocks * 128 * 4);
+        // the MTP KV / keys live in the shared pool (layer nqsa, B0)
         if (d_miraw) {
           DALLOC(&t.d_miraw, 4 * 128 * 4);
           CK(hipMemset(t.d_miraw, 0, 4 * 128 * 4));

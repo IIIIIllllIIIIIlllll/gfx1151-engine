@@ -1183,23 +1183,25 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       // state is stored; validity requires the checkpoint tokens to be a
       // prefix of the live token stream (m.chist), which guarantees the
       // QSA KV/indexer prefix is still intact (paged: the checkpoint owns
-      // its pages, any slot may restore it). MTP KV for the restored
-      // prefix is NOT guaranteed -> disable speculation for this turn.
+      // its pages, any slot may restore it). B0: the pinned pages include
+      // the MTP layer, so a checkpoint saved with the MTP layer in lockstep
+      // restores it too and speculation stays available.
       const bool is_mrope = !g.mrope_grids.empty();
       const uint64_t req_ih = is_mrope ? fnv1a_patches(vpatches) : 0;
       auto r0 = std::chrono::steady_clock::now();
       int ci = rckpt::match(g.ids, m.chist, is_mrope,
                             is_mrope ? &g.mrope_grids : nullptr, req_ih);
-      if (ci >= 0 && rckpt::restore(m, ci, &hist)) {
+      bool ck_mtp = false;
+      if (ci >= 0 && rckpt::restore(m, ci, &hist, &ck_mtp)) {
         mcp = hist.size();
         cont = true;
         n_cached = (int)mcp;
-        mtp_live = false;
+        mtp_live = ck_mtp;
         double rs = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - r0)
                         .count();
-        fprintf(stderr, "%s rckpt: restored %zu tokens in %.2fs\n",
-                log_ts(), mcp, rs);
+        fprintf(stderr, "%s rckpt: restored %zu tokens in %.2fs%s\n",
+                log_ts(), mcp, rs, ck_mtp ? " (mtp live)" : "");
       }
     }
     if (!cont && !kvs.dir.empty()) {
@@ -1351,7 +1353,14 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       std::vector<int> seg(g.ids.begin() + done_upto, g.ids.begin() + cc);
       cur = m.prefill_batch(seg, (int)done_upto);
       hist.assign(g.ids.begin(), g.ids.begin() + cc);
-      rckpt::save(m, hist);
+      // The segment leaves MTP position cc-1 pending (mtp_pos == pos-1,
+      // d_R == h_{cc-1}): checkpoint that lockstep state, then pair h_{cc-1}
+      // with token cc, which the next segment's ingest would otherwise skip.
+      rckpt::save(m, hist, use_spec || chain_mtp);
+      if (use_spec || chain_mtp) {
+        std::vector<int> bt{g.ids[cc]};
+        m.mtp_ingest_b(m.d_R, bt, 1, (int)cc - 1);
+      }
       done_upto = cc;
       m.yield_point();  // consistent state between segments
     }
@@ -1370,7 +1379,8 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
                         .count();
     // Phase 1: snapshot only at end-of-turn. This removes the first-token
     // stall while the full asynchronous capture path is being designed.
-    rckpt::save(m, hist);  // prompt-end RAM checkpoint (cheap, deduped)
+    // prompt-end RAM checkpoint (cheap, deduped)
+    rckpt::save(m, hist, use_spec || chain_mtp);
     auto d0 = std::chrono::steady_clock::now();
     int ngen = 0;
     bool dead = false;
@@ -1750,6 +1760,7 @@ static int run(GpuModel& m, int port) {
     return 1;
   }
   m.slots_init(eff_parallel());
+  if (m.nslots > 1) memstats_log("slots");  // per-slot state allocated
   g_slots.assign((size_t)m.nslots, Slot{});
   if (m.nslots > 1) {
     m.kv_starve_fn = &starve;
