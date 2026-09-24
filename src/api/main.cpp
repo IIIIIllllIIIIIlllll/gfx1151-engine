@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <mutex>
@@ -55,6 +56,10 @@ struct Config {
     std::string listen = "0.0.0.0:8731";
     std::string model = "qwen3.8-flash-next";
     int context = 262144;
+    // Server-side sampling/thinking overrides (see apply_overrides). Relative
+    // to the working directory, which every launcher sets to the repo root.
+    std::string overrides_path = "data/api-overrides.json";
+    std::string admin_key;  // env GDEC_API_ADMIN_KEY; empty = POST open (LAN)
 };
 
 Config g_cfg;
@@ -683,6 +688,227 @@ const json* normalize_reasoning_effort(const json* value, json* storage) {
     return value;
 }
 
+// ------------------------------------------------------- server overrides --
+// Operator policy for sampling / thinking, applied to the request body before
+// any parsing so the normal validation still runs on the result. A client
+// therefore cannot switch thinking or send a broken sampler by mistake.
+// Each entry is {"mode": "force" | "default", "value": v}:
+//   force   -- replaces what the client sent (max_tokens: caps it instead);
+//   default -- used only when the client omitted the field.
+// Fields without an entry follow the client. Edited from the dashboard via
+// GET/POST /admin/overrides and persisted to g_cfg.overrides_path.
+
+struct OverrideField {
+    const char* key;
+    char kind;  // b = bool, n = number, i = integer, e = reasoning effort
+    double lo, hi;
+};
+const OverrideField kOverrideFields[] = {
+    {"enable_thinking", 'b', 0, 0},
+    {"preserve_thinking", 'b', 0, 0},
+    {"reasoning_effort", 'e', 0, 0},
+    {"temperature", 'n', 0.0, 2.0},
+    {"top_p", 'n', 0.0, 1.0},
+    {"top_k", 'i', 0, 2147483647.0},
+    {"min_p", 'n', 0.0, 1.0},
+    {"presence_penalty", 'n', -2.0, 2.0},
+    {"frequency_penalty", 'n', -2.0, 2.0},
+    {"max_tokens", 'i', 1, 2147483647.0},
+};
+
+std::mutex g_ovr_mtx;
+json g_overrides = json::object();
+
+// Checks a posted table and returns its canonical form (mode "client" and
+// null entries dropped, effort aliases resolved like the request path does).
+json validate_overrides(const json& in) {
+    if (!in.is_object()) http::fail(400, "overrides must be a JSON object");
+    json out = json::object();
+    for (auto it = in.begin(); it != in.end(); ++it) {
+        const std::string& k = it.key();
+        const OverrideField* f = nullptr;
+        for (const auto& c : kOverrideFields)
+            if (k == c.key) f = &c;
+        if (f == nullptr) http::fail(400, "unknown override field " + k);
+        const json& e = it.value();
+        if (e.is_null()) continue;
+        if (!e.is_object() || !e.contains("mode") || !e["mode"].is_string())
+            http::fail(400, k + ": expected {\"mode\": ..., \"value\": ...}");
+        const std::string mode = e["mode"].get<std::string>();
+        if (mode == "client") continue;
+        if (mode != "force" && mode != "default")
+            http::fail(400, k + ": mode must be force, default or client");
+        if (!e.contains("value") || e["value"].is_null()) http::fail(400, k + ": value is required");
+        json v = e["value"];
+        if (f->kind == 'b') {
+            if (!v.is_boolean()) http::fail(400, k + " must be a boolean");
+        } else if (f->kind == 'e') {
+            json storage;
+            const json* n = normalize_reasoning_effort(&v, &storage);
+            const std::string s = n->get<std::string>();
+            if (s != "xhigh" && s != "medium" && s != "low")
+                http::fail(400, k + " must be one of xhigh, high, medium, low, minimal");
+            v = s;
+        } else {
+            const bool ok = f->kind == 'i' ? (v.is_number_integer() || v.is_number_unsigned())
+                                           : v.is_number();
+            const double d = ok ? v.get<double>() : 0.0;
+            if (!ok || !std::isfinite(d) || d < f->lo || d > f->hi)
+                http::fail(400, k + " must be " + (f->kind == 'i' ? "an integer" : "a number") +
+                                    " in " + json_py::py_float(f->lo) + ".." +
+                                    json_py::py_float(f->hi));
+        }
+        out[k] = json{{"mode", mode}, {"value", std::move(v)}};
+    }
+    return out;
+}
+
+bool save_overrides(const json& table, std::string* err) {
+    if (g_cfg.overrides_path.empty()) return true;
+    const std::string tmp = g_cfg.overrides_path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        f << table.dump(2) << "\n";
+        if (!f.good()) {
+            *err = "cannot write " + tmp;
+            return false;
+        }
+    }
+#ifdef _WIN32
+    std::remove(g_cfg.overrides_path.c_str());  // rename() does not replace on Windows
+#endif
+    if (std::rename(tmp.c_str(), g_cfg.overrides_path.c_str()) != 0) {
+        *err = "cannot rename " + tmp + " -> " + g_cfg.overrides_path;
+        return false;
+    }
+    return true;
+}
+
+void load_overrides() {
+    if (g_cfg.overrides_path.empty()) return;
+    std::ifstream f(g_cfg.overrides_path, std::ios::binary);
+    if (!f) return;  // no file yet: every field follows the client
+    try {
+        g_overrides = validate_overrides(json::parse(f));
+        fprintf(stderr, "gdec-api: overrides from %s: %s\n", g_cfg.overrides_path.c_str(),
+                g_overrides.dump().c_str());
+    } catch (const http::Error& e) {
+        fprintf(stderr, "gdec-api: ignoring %s: %s\n", g_cfg.overrides_path.c_str(),
+                e.message.c_str());
+    } catch (const std::exception& e) {
+        fprintf(stderr, "gdec-api: ignoring %s: %s\n", g_cfg.overrides_path.c_str(), e.what());
+    }
+}
+
+enum class Api { Completions, Chat, Responses };
+
+// Rewrites `body` per the override table and reports the fields it changed in
+// the X-Gdec-Overrides response header.
+void apply_overrides(json* body, Api api, http::Response* r) {
+    json table;
+    {
+        std::lock_guard<std::mutex> lk(g_ovr_mtx);
+        table = g_overrides;
+    }
+    if (table.empty()) return;
+    std::vector<std::string> changed;
+    auto put = [&](json& obj, const char* key, const json& e, const std::string& label) {
+        const bool present = obj.contains(key) && !obj[key].is_null();
+        if (present && (e["mode"] != "force" || obj[key] == e["value"])) return;
+        obj[key] = e["value"];
+        changed.push_back(label);
+    };
+    for (auto it = table.begin(); it != table.end(); ++it) {
+        const std::string& k = it.key();
+        const json& e = it.value();
+        if (k == "enable_thinking" || k == "preserve_thinking") {
+            if (api != Api::Completions) put(*body, k.c_str(), e, k);
+        } else if (k == "reasoning_effort") {
+            if (api == Api::Chat) {
+                put(*body, "reasoning_effort", e, k);
+            } else if (api == Api::Responses) {
+                if (!body->contains("reasoning") || (*body)["reasoning"].is_null())
+                    (*body)["reasoning"] = json::object();
+                // A malformed `reasoning` is left for the normal 400.
+                if ((*body)["reasoning"].is_object()) put((*body)["reasoning"], "effort", e, k);
+            }
+        } else if (k == "max_tokens") {
+            const long long cap = e["value"].get<long long>();
+            bool any = false;
+            for (const char* a : {"max_tokens", "max_completion_tokens", "max_output_tokens"}) {
+                if (!body->contains(a) || (*body)[a].is_null()) continue;
+                any = true;
+                json& v = (*body)[a];
+                if (e["mode"] == "force" && v.is_number_integer() && v.get<long long>() > cap) {
+                    v = cap;
+                    changed.push_back(a);
+                }
+            }
+            if (!any) {
+                (*body)[api == Api::Responses ? "max_output_tokens" : "max_tokens"] = cap;
+                changed.push_back("max_tokens");
+            }
+        } else {
+            put(*body, k.c_str(), e, k);
+        }
+    }
+    // A forced greedy decode cannot honour logprobs (apply_sampling rejects
+    // the pair); the operator's choice wins, so the request loses logprobs.
+    if (std::find(changed.begin(), changed.end(), "temperature") != changed.end() &&
+        (*body)["temperature"] == 0 && body->contains("logprobs")) {
+        body->erase("logprobs");
+        body->erase("top_logprobs");
+        changed.push_back("logprobs");
+    }
+    if (changed.empty()) return;
+    std::string list;
+    for (const auto& c : changed) list += (list.empty() ? "" : ",") + c;
+    r->set("X-Gdec-Overrides", list);
+}
+
+bool admin_ok(const http::Request& q) {
+    if (g_cfg.admin_key.empty()) return true;
+    return q.header("authorization") == "Bearer " + g_cfg.admin_key ||
+           q.header("x-admin-key") == g_cfg.admin_key;
+}
+
+json overrides_state() {
+    json j;
+    {
+        std::lock_guard<std::mutex> lk(g_ovr_mtx);
+        j["overrides"] = g_overrides;
+    }
+    j["persist_path"] = g_cfg.overrides_path;
+    j["admin_key_required"] = !g_cfg.admin_key.empty();
+    return j;
+}
+
+// GET /admin/overrides
+void handle_overrides_get(const http::Request&, http::Response* r, http::Stream*) {
+    r->set("Cache-Control", "no-store");
+    r->body = json_py::dumps(overrides_state(), /*spaced=*/false);
+}
+
+// POST /admin/overrides — replaces the whole table; {} clears it.
+void handle_overrides_post(const http::Request& q, http::Response* r, http::Stream*) {
+    if (!admin_ok(q))
+        http::fail(401, "admin key required (Authorization: Bearer <key> or X-Admin-Key)");
+    const json body = parse_body(q);
+    json table = validate_overrides(body.contains("overrides") ? body["overrides"] : body);
+    std::string err;
+    {
+        std::lock_guard<std::mutex> lk(g_ovr_mtx);
+        g_overrides = table;
+    }
+    const bool saved = save_overrides(table, &err);
+    fprintf(stderr, "gdec-api: overrides set by %s: %s%s\n", q.remote.c_str(),
+            table.dump().c_str(), saved ? "" : (" (NOT persisted: " + err + ")").c_str());
+    json j = overrides_state();
+    j["saved"] = saved;
+    if (!saved) j["save_error"] = err;
+    r->body = json_py::dumps(j, /*spaced=*/false);
+}
+
 struct ToolSetup {
     json tools = json::array();
     toolparse::ToolChoice choice;
@@ -1042,12 +1268,18 @@ void handle_health(const http::Request&, http::Response* r, http::Stream*) {
     j["max_tokens_cap"] = nullptr;
     j["reasoning_effort_values"] =
         json::array({"high", "low", "medium", "minimal", "xhigh"});
+    {
+        std::lock_guard<std::mutex> lk(g_ovr_mtx);
+        j["server_overrides"] = g_overrides;
+    }
     r->body = json_py::dumps(j, /*spaced=*/false);
 }
 
 // POST /v1/completions — raw prompt, no chat template.
 void handle_completions(const http::Request& q, http::Response* r, http::Stream* st) {
-    const json body = parse_body(q);
+    json mutable_body = parse_body(q);
+    apply_overrides(&mutable_body, Api::Completions, r);
+    const json& body = mutable_body;
     GenSpec spec;
     if (body.contains("prompt")) {
         const json& p = body["prompt"];
@@ -1276,7 +1508,9 @@ std::vector<long long> compute_snap_cuts(const json& messages,
 
 // POST /v1/chat/completions
 void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
-    const json body = parse_body(q);
+    json mutable_body = parse_body(q);
+    apply_overrides(&mutable_body, Api::Chat, r);
+    const json& body = mutable_body;
     if (!body.contains("messages")) http::fail(400, "No messages provided.");
     if (!body["messages"].is_array() || body["messages"].empty())
         http::fail(400, "No messages provided.");
@@ -1467,7 +1701,9 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
 
 // POST /v1/responses -- stateless text and function-call subset.
 void handle_responses(const http::Request& q, http::Response* r, http::Stream* st) {
-    const json body = parse_body(q);
+    json mutable_body = parse_body(q);
+    apply_overrides(&mutable_body, Api::Responses, r);
+    const json& body = mutable_body;
     json messages = normalize_responses_input(body);
     std::vector<vision::Frame> frames;
     std::string vision_error;
@@ -1853,14 +2089,19 @@ int main(int argc, char** argv) {
         } else if (a == "--context") g_cfg.context = std::atoi(next().c_str());
         else if (a == "--model") g_cfg.model = next();
         else if (a == "--listen") g_cfg.listen = next();
+        else if (a == "--overrides") g_cfg.overrides_path = next();  // "" = memory only
         else {
             fprintf(stderr,
                     "usage: %s [--tokenizer DIR] [--engine H:P] [--listen H:P] "
-                    "[--port N] [--host H] [--context N] [--model NAME]\n",
+                    "[--port N] [--host H] [--context N] [--model NAME] "
+                    "[--overrides FILE]\n",
                     argv[0]);
             return 2;
         }
     }
+    // Environment, not argv: keeps the key out of `ps`.
+    if (const char* k = std::getenv("GDEC_API_ADMIN_KEY")) g_cfg.admin_key = k;
+    load_overrides();
 
     std::string err;
     if (!g_tok.load(g_cfg.tokenizer_dir, &err)) {
@@ -1883,6 +2124,8 @@ int main(int argc, char** argv) {
     srv.on("GET", "/health", handle_health);
     srv.on("GET", "/memory", handle_memory);
     srv.on("GET", "/cache", handle_cache);
+    srv.on("GET", "/admin/overrides", handle_overrides_get);
+    srv.on("POST", "/admin/overrides", handle_overrides_post);
     srv.on("POST", "/v1/completions", handle_completions);
     srv.on("POST", "/v1/chat/completions", handle_chat);
     srv.on("POST", "/v1/responses", handle_responses);

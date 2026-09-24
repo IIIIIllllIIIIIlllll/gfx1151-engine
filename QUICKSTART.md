@@ -78,6 +78,45 @@ HIP 设备分配、`mmap + hipHostRegister` 的专家权重、pinned host 内存
 进程 RSS；`gpu_accessible_committed_bytes` 是引擎自身可准确记账的合计，
 不会把未注册、可回收的文件 mmap 页缓存误算为显存。
 
+### 控制台与服务端参数覆盖
+
+浏览器打开 `http://<主机>:8731/` 即是控制台,包括健康状态、内存记账、
+"采样 / 思考参数(服务端覆盖)"和"对话测试"(流式调用
+`/v1/chat/completions`,思考内容单独显示)。
+
+覆盖表用来防止客户端传错采样参数或思考开关。可覆盖的字段:
+`enable_thinking`、`reasoning_effort`、`preserve_thinking`、`temperature`、
+`top_p`、`top_k`、`min_p`、`presence_penalty`、`frequency_penalty`、
+`max_tokens`。每个字段三种模式:
+
+- 跟随客户端:不干预(表里没有该字段)。
+- 默认值:仅在客户端没传该字段时使用。
+- 强制:无论客户端传什么都改成此值;`max_tokens` 的强制是上限,客户端
+  给得更大才压到此值。强制 `temperature=0` 时请求里的 `logprobs` 会被去掉。
+
+覆盖在请求解析之前改写请求体,对 chat / responses / completions 都生效
+(responses 的思考强度是 `reasoning.effort`;思考字段对 completions 无意义)。
+被改写的字段写进响应头 `X-Gdec-Overrides`(流式同样有)。当前表也出现在
+`/health` 的 `server_overrides`。
+
+接口:`GET /admin/overrides` 读取,`POST /admin/overrides` 整表替换,`{}`
+表示清空。示例:
+
+```bash
+curl -X POST http://127.0.0.1:8731/admin/overrides -H 'Content-Type: application/json' \
+  -d '{"enable_thinking":{"mode":"force","value":true},
+       "reasoning_effort":{"mode":"default","value":"medium"},
+       "temperature":{"mode":"force","value":0.6}}'
+```
+
+表持久化在 `data/api-overrides.json`(相对启动目录,重启后自动加载);
+`gdec-api --overrides FILE` 可改路径,`--overrides ''` 表示只放内存。默认
+任何能访问 API 的人都能修改覆盖表(与 API 本身同样开放)。需要限制时在
+启动 API 的环境里设置 `GDEC_API_ADMIN_KEY=<密钥>`,之后 POST 必须带
+`X-Admin-Key: <密钥>` 或 `Authorization: Bearer <密钥>`;控制台会显示
+密钥输入框。一键验证:`bash tools/api_override_verify.sh`(测试端口
+8732/8733,需先停掉生产服务)。
+
 引擎使用 `tools/run_capped.sh`,默认 86 GiB 内存上限、启动前至少
 100 GiB 可用内存;另一个引擎或同项目启动任务运行时会拒绝重复启动。
 加载阶段持续 60 秒没有日志、引擎 I/O 或 GPU GTT 分配进展会停止;最长

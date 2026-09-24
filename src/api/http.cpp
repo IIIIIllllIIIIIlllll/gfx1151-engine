@@ -130,12 +130,27 @@ class SseStream : public Stream {
         return it == headers_.end() ? std::string() : it->second;
     }
     void set_headers(const std::map<std::string, std::string>& h) { headers_ = h; }
+    // Headers the handler put on its Response before streaming (framing
+    // headers are fixed here and skipped).
+    void set_response_headers(const std::vector<std::pair<std::string, std::string>>* h) {
+        extra_ = h;
+    }
 
   private:
     bool write_head() {
         std::string head =
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n"
-            "Cache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: ";
+            "Cache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n";
+        if (extra_ != nullptr) {
+            for (const auto& [k, v] : *extra_) {
+                const std::string lk = to_lower(k);
+                if (lk == "content-type" || lk == "cache-control" || lk == "connection" ||
+                    lk == "content-length" || lk == "transfer-encoding")
+                    continue;
+                head += k + ": " + v + "\r\n";
+            }
+        }
+        head += "Connection: ";
         head += keep_alive_ ? "keep-alive" : "close";
         head += "\r\n\r\n";
         if (!write_all(head.data(), head.size())) return false;
@@ -192,6 +207,7 @@ class SseStream : public Stream {
     bool started_ = false;
     bool keep_alive_ = true;
     std::map<std::string, std::string> headers_;
+    const std::vector<std::pair<std::string, std::string>>* extra_ = nullptr;
 };
 
 }  // namespace
@@ -513,6 +529,7 @@ void Server::serve_connection(sock_t fd, const std::string& remote) {
         Response res;
         SseStream st(fd);
         st.set_headers(req.headers);
+        st.set_response_headers(&res.headers);
         st.set_keep_alive(req.keep_alive());
 
         // A handler that threw: if the SSE headers are already on the wire the
