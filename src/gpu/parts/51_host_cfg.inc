@@ -2,477 +2,1127 @@ struct Cfg {
   std::string dir;
   uint64_t cap_bytes = 20ull << 30;
   size_t min_tokens = 4096;
+  uint64_t queue_bytes = 1024ull << 20;  // captured but not yet written
 };
 
-static uint64_t fnv1a(const int* p, size_t n) {
-  uint64_t h = 1469598103934665603ULL;
+// Model identity for the cache fingerprint (set by main before serve::run).
+static std::vector<std::string> g_model_files;  // base + overlays
+static std::string g_vision_file;
+
+static const int FMT = 1;  // A4 layout version (part of the fingerprint)
+
+// ---- hashing ----------------------------------------------------------------
+static inline uint64_t mix64(uint64_t z) {  // splitmix64 finalizer
+  z += 0x9e3779b97f4a7c15ULL;
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+  return z ^ (z >> 31);
+}
+static uint64_t hash_toks(uint64_t h, const int* p, size_t n) {
   for (size_t i = 0; i < n; i++) {
     h ^= (uint32_t)p[i];
     h *= 1099511628211ULL;
   }
+  return mix64(h);
+}
+static inline uint64_t rotl64(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); }
+// Content checksum: four independent lanes (xxhash-style rounds), so verifying
+// a restore runs near memory speed.
+static uint64_t sum64(const void* data, size_t n) {
+  const char* p = (const char*)data;
+  const uint64_t P1 = 0x9E3779B185EBCA87ULL, P2 = 0xC2B2AE3D27D4EB4FULL;
+  uint64_t a[4] = {P1, P2, ~P1, ~P2};
+  size_t i = 0;
+  for (; i + 32 <= n; i += 32)
+    for (int k = 0; k < 4; k++) {
+      uint64_t w;
+      memcpy(&w, p + i + 8 * k, 8);
+      a[k] = rotl64(a[k] + w * P2, 31) * P1;
+    }
+  uint64_t h = mix64(n);
+  for (int k = 0; k < 4; k++) h = mix64(h ^ a[k]);
+  for (; i < n; i++) h = mix64(h ^ (uint8_t)p[i]);
+  return h;
+}
+// c[i] = key of the prefix of i full pages; c[0] = seed. A page's key covers
+// the whole prefix, so equal keys mean equal KV for that page.
+static std::vector<uint64_t> chain(uint64_t seed, const int* t, int npages) {
+  std::vector<uint64_t> c((size_t)npages + 1);
+  c[0] = seed;
+  for (int i = 0; i < npages; i++)
+    c[(size_t)i + 1] =
+        hash_toks(mix64(c[(size_t)i] + 0x6b76636bULL), t + (size_t)i * KV_PAGE, KV_PAGE);
+  return c;
+}
+// MTP row r pairs h_r with token r+1: a page's MTP rows also depend on the
+// first token of the next page.
+static uint64_t mtp_key(uint64_t page_key, int look) {
+  return mix64(page_key ^ mix64(0x6d747073ULL + (uint32_t)look));
+}
+static uint64_t ck_id(uint64_t seed, const int* t, size_t n) {
+  return hash_toks(mix64(seed ^ 0x636b6964ULL), t, n);
+}
+
+static uint64_t g_fp = 0, g_vis_id = 0;
+static uint64_t file_id(const std::string& path) {
+  std::error_code ec;
+  uint64_t h = mix64((uint64_t)std::filesystem::file_size(path, ec));
+  for (unsigned char ch : std::filesystem::path(path).filename().string()) h = mix64(h ^ ch);
+  return h;
+}
+// Plain requests: the fingerprint. M-RoPE requests: placeholder ids are
+// pixel-agnostic, so the vision tower, the patch-bytes hash and the grids are
+// folded into the seed (a different image never shares a page key).
+static uint64_t seed_for(bool mrope, uint64_t img_hash,
+                         const std::vector<std::array<int, 3>>& grids) {
+  if (!mrope) return g_fp;
+  uint64_t h = mix64(g_fp ^ 0x6d726f7065ULL);
+  h = mix64(h ^ g_vis_id);
+  h = mix64(h ^ img_hash);
+  for (const auto& g : grids)
+    for (int v : g) h = mix64(h ^ (uint32_t)v);
   return h;
 }
 
-static bool wr(int fd, const void* data, size_t n) {
-  const char* p = (const char*)data;
+// ---- geometry and file layouts ----------------------------------------------
+struct Geo {
+  int nqsa, ngdn, kvb, has_ik;
+  size_t row_b, s_b, conv_b, ring_b, iraw_b;
+};
+static Geo geo(const GpuModel& m) {
+  Geo G;
+  G.nqsa = g_cfg.layers / 4;
+  G.ngdn = g_cfg.layers - G.nqsa;
+  G.kvb = m.qsa_kv_fp32 ? 4 : 2;
+  G.has_ik = m.d_ik ? 1 : 0;
+  G.row_b = (size_t)512 * G.kvb;
+  G.s_b = (size_t)G.ngdn * 48 * 128 * 128 * 4;
+  G.conv_b = (size_t)G.ngdn * 3 * 10240 * 4;
+  G.ring_b = 9 * 10240 * 4;
+  G.iraw_b = m.d_iraw ? (size_t)G.nqsa * 512 * 4 : 0;
+  return G;
+}
+// one layer of one page: K rows, V rows, indexer key blocks
+static size_t page_layer_b(int kvb, int has_ik) {
+  return 2 * (size_t)KV_PAGE * 512 * kvb + (has_ik ? (size_t)KV_PAGE_BLOCKS * 512 : 0);
+}
+static const char MAG_C[8] = "GDKVC1", MAG_M[8] = "GDKVM1", MAG_K[8] = "GDKCK1";
+struct ChHdr {  // c_<key>.kvc (trunk page) / m_<key>.kvm (MTP section)
+  char magic[8];
+  uint64_t key, parent, sum;  // sum: sum64 of the body
+  int32_t nl, kvb, has_ik, look;  // look: MTP lookahead token (-1 trunk)
+  int32_t toks[KV_PAGE];
+};
+struct CkHdr {  // k_<n>_<id>.kck
+  char magic[8];
+  uint64_t seed, base, id, sum;
+  int32_t n, nc, nl, kvb, ringpos, mtp, mtp_pos, nik, has_ik, pad;
+  uint64_t s_b, conv_b, ring_b, iraw_b, mR_b, miraw_b;
+};
+static_assert(sizeof(ChHdr) % 8 == 0 && sizeof(CkHdr) % 8 == 0, "header alignment");
+static size_t ck_body_b(const CkHdr& h) {
+  const size_t nt = (size_t)h.n - (size_t)h.nc * KV_PAGE;
+  return (size_t)h.nc * 16 + nt * 4 + h.s_b + h.conv_b + h.ring_b + h.iraw_b + h.mR_b +
+         h.miraw_b + (size_t)h.nl * (2 * nt * 512 * h.kvb + (size_t)h.nik * 512);
+}
+static bool ck_sane(const CkHdr& h) {
+  const uint64_t big = 1ull << 36;
+  return !memcmp(h.magic, MAG_K, 8) && h.n > 0 && h.n < (1 << 24) &&
+         h.nc == (h.n - 1) / KV_PAGE && h.nl > 0 && h.nl <= 64 &&
+         (h.kvb == 2 || h.kvb == 4) && h.nik >= 0 && h.nik <= 2 * KV_PAGE_BLOCKS &&
+         h.s_b < big && h.conv_b < big && h.ring_b < big && h.iraw_b < big &&
+         h.mR_b < big && h.miraw_b < big;
+}
+// Indexer key blocks past the full pages that a checkpoint carries. Clamped
+// to the mapped pages (paged kv_runs aborts past them) and the capacity.
+static int tail_ik(const GpuModel& m, int n, int nc) {
+  if (!m.d_ik) return 0;
+  const int hi = std::min({n / 4 + 2, KV_PAGE_BLOCKS * ((n + KV_PAGE - 1) / KV_PAGE),
+                           m.index_blocks});
+  return std::max(0, hi - KV_PAGE_BLOCKS * nc);
+}
+
+// Device slices (layer nqsa = the MTP layer, B0).
+static char* kv_layer(GpuModel& m, int half, int l) {
+  char* b = m.qsa_kv_fp32 ? (char*)(half ? m.d_vc : m.d_kc)
+                          : (char*)(half ? m.d_vcb : m.d_kcb);
+  return b + (size_t)l * m.kv_layer_rows * 512 * (m.qsa_kv_fp32 ? 4 : 2);
+}
+static char* ik_layer(GpuModel& m, int l) {
+  return (char*)(m.d_ik + (size_t)l * m.ik_layer_blocks * 128);
+}
+// Copy logical rows [r0, r1) of a paged per-layer region to/from a
+// row-contiguous host buffer (files hold logical order, layout-agnostic).
+static bool xfer(GpuModel& m, bool h2d, char* dev, char* host, int r0, int r1,
+                 int per_page, size_t row_b) {
+  bool ok = true;
+  m.kv_runs(r0, r1, per_page, [&](int lr, size_t pr, int n) {
+    if (!ok) return;
+    char* d = dev + pr * row_b;
+    char* h = host + (size_t)(lr - r0) * row_b;
+    ok = hipMemcpy(h2d ? (void*)d : (void*)h, h2d ? (void*)h : (void*)d,
+                   (size_t)n * row_b,
+                   h2d ? hipMemcpyHostToDevice : hipMemcpyDeviceToHost) == hipSuccess;
+  });
+  return ok;
+}
+static bool d2h(void* h, const void* d, size_t n) {
+  return !n || hipMemcpy(h, d, n, hipMemcpyDeviceToHost) == hipSuccess;
+}
+static bool h2d(void* d, const void* h, size_t n) {
+  return !n || hipMemcpy(d, h, n, hipMemcpyHostToDevice) == hipSuccess;
+}
+
+// ---- host buffers ------------------------------------------------------------
+// Pooled (page images are all one size): a fresh 100+ MB malloc per save is
+// mmap/munmap churn whose first-touch faults stalled D2H for seconds under
+// memory pressure. NOTE: never pinned -- hipHostMalloc'd memory makes D2H
+// collapse to ~7 MB/s on gfx1151.
+struct HBuf {
+  std::unique_ptr<char[]> p;
+  size_t cap = 0, n = 0;
+  char* data() { return p.get(); }
+};
+static std::mutex g_pool_mtx;
+static std::vector<HBuf> g_pool;
+static size_t g_pool_bytes = 0;
+static const size_t g_pool_max = 512ull << 20;
+static HBuf buf_get(size_t n) {
+  {
+    std::lock_guard<std::mutex> lk(g_pool_mtx);
+    size_t best = g_pool.size();
+    for (size_t i = 0; i < g_pool.size(); i++)
+      if (g_pool[i].cap >= n && (best == g_pool.size() || g_pool[i].cap < g_pool[best].cap))
+        best = i;
+    if (best < g_pool.size()) {
+      HBuf b = std::move(g_pool[best]);
+      g_pool.erase(g_pool.begin() + (long)best);
+      g_pool_bytes -= b.cap;
+      b.n = n;
+      return b;
+    }
+  }
+  HBuf b;
+  b.p.reset(new (std::nothrow) char[n ? n : 1]);
+  b.cap = b.p ? n : 0;
+  b.n = b.p ? n : 0;
+  return b;
+}
+static void buf_put(HBuf&& b) {
+  if (!b.p) return;
+  std::lock_guard<std::mutex> lk(g_pool_mtx);
+  if (g_pool_bytes + b.cap > g_pool_max) return;  // freed on scope exit
+  g_pool_bytes += b.cap;
+  g_pool.push_back(std::move(b));
+}
+
+// ---- files -------------------------------------------------------------------
+static std::string g_dir;
+static uint64_t g_cap = 0, g_qcap = 0;
+static bool g_on = false;
+static std::string ch_name(uint64_t k) {
+  char b[32];
+  snprintf(b, sizeof b, "c_%016llx.kvc", (unsigned long long)k);
+  return b;
+}
+static std::string mt_name(uint64_t k) {
+  char b[32];
+  snprintf(b, sizeof b, "m_%016llx.kvm", (unsigned long long)k);
+  return b;
+}
+static std::string ck_name(int n, uint64_t id) {
+  char b[48];
+  snprintf(b, sizeof b, "k_%d_%016llx.kck", n, (unsigned long long)id);
+  return b;
+}
+static std::string path_of(const std::string& name) { return g_dir + "/" + name; }
+static int64_t now_t() {
+  return (int64_t)std::filesystem::file_time_type::clock::now().time_since_epoch().count();
+}
+static void rm_file(const std::string& name) {
+  std::error_code ec;
+  std::filesystem::remove(path_of(name), ec);
+}
+static bool wr_all(int fd, const char* p, size_t n) {
   while (n) {
-    ssize_t w = os_write(fd, p, n);
+    ssize_t w = os_write(fd, p, std::min(n, (size_t)1 << 30));
     if (w <= 0) return false;
     p += w;
     n -= (size_t)w;
   }
   return true;
 }
-
-// D2H into staging, then append to fd. Phase timings accumulate for the
-// slow-save diagnostic in kvsnap::save (cold-start page-in can stall writes).
-static double g_t_d2h = 0, g_t_wr = 0;
-static bool d2h_wr(int fd, const void* dptr, void* staging, size_t n) {
-  auto a = std::chrono::steady_clock::now();
-  if (hipMemcpy(staging, dptr, n, hipMemcpyDeviceToHost) != hipSuccess)
-    return false;
-  auto b = std::chrono::steady_clock::now();
-  const bool ok = wr(fd, staging, n);
-  g_t_d2h += std::chrono::duration<double>(b - a).count();
-  g_t_wr += std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - b)
-                .count();
-  return ok;
-}
-
-static bool h2d_rd(const void* src, void* dptr, size_t n) {
-  return hipMemcpy(dptr, src, n, hipMemcpyHostToDevice) == hipSuccess;
-}
-
-struct Sizes {
-  int ntok, nqsa, ngdn, maxctx, kvb, iblocks, ringpos;
-  // M-RoPE extras: placeholder token ids are pixel-agnostic, so an
-  // M-RoPE snapshot is only valid for a request with the same grids and
-  // the same patch-bytes hash.
-  bool mrope = false;
-  int rope_delta = 0;
-  uint64_t img_hash = 0;
-  std::vector<std::array<int, 3>> grids;
-  bool legacy = false;  // KVS1/KVS2 snapshot (broken ik layout): never restored
-};
-
-// Meta format (KVS3):
-//   line 1: "KVS3 ntok nqsa ngdn maxctx kvb index_blocks ringpos mrope"
-//   line 2 (mrope == 1 only): "rope_delta img_hash k t0 h0 w0 ..."
-// KVS1/KVS2 stored ik.bin as one contiguous slice (only layer 0 correct, see
-// KVSNAP-REVIEW.md §1); they are rejected here and dropped by maintain_lru.
-static bool read_meta(const std::string& dir, Sizes& s) {
-  std::ifstream f(dir + "/meta");
-  char tag[8];
-  if (!(f >> tag)) return false;
-  if (!strcmp(tag, "KVS1") || !strcmp(tag, "KVS2")) {
-    s.legacy = true;
-    return false;
+static bool rd_all(int fd, char* p, size_t n) {
+  while (n) {
+    ssize_t r = os_read(fd, p, std::min(n, (size_t)1 << 30));
+    if (r <= 0) return false;
+    p += r;
+    n -= (size_t)r;
   }
-  if (strcmp(tag, "KVS3")) return false;
-  int mrope = 0;
-  if (!(f >> s.ntok >> s.nqsa >> s.ngdn >> s.maxctx >> s.kvb >> s.iblocks >>
-        s.ringpos >> mrope))
-    return false;
-  if (!mrope) return true;
-  s.mrope = true;
-  size_t ng = 0;
-  if (!(f >> s.rope_delta >> s.img_hash >> ng) || ng > 64) return false;
-  s.grids.resize(ng);
-  for (auto& g : s.grids)
-    if (!(f >> g[0] >> g[1] >> g[2])) return false;
   return true;
 }
-
-// Indexer key blocks stored per QSA layer: logical blocks [0, n), clamped to
-// the per-layer capacity (ntok near maxctx would otherwise run past it).
-static size_t ik_blocks(int ntok, int iblocks) {
-  return std::min((size_t)ntok / 4 + 2, (size_t)std::max(0, iblocks));
-}
-
-static uint64_t state_bytes(const Sizes& s) {
-  uint64_t fixed = (uint64_t)s.ngdn * 48 * 128 * 128 * 4 +
-                   (uint64_t)s.ngdn * 3 * 10240 * 4 + 9 * 10240 * 4 +
-                   (uint64_t)s.nqsa * 512 * 4;
-  return fixed + (uint64_t)s.nqsa * ik_blocks(s.ntok, s.iblocks) * 128 * 4 +
-         2ull * s.nqsa * s.ntok * 512 * s.kvb;
-}
-
-
-// LRU maintenance is intentionally separate from the request path. The queue
-// is bounded to one pending job: a newer save supersedes an older maintenance
-// pass, so a burst of requests cannot grow an unbounded background queue.
-struct MaintJob {
-  Cfg cfg;
-  std::string protect;
-  bool touch_existing = false;
-};
-
-static std::mutex g_maint_mtx;
-static std::condition_variable g_maint_cv;
-static MaintJob g_maint_job;
-static bool g_maint_pending = false;
-static bool g_maint_started = false;
-
-static void maintain_lru(const MaintJob& job) {
-  namespace fs = std::filesystem;
+// tmp_<name>, fdatasync, rename: a crash never publishes a torn file.
+static bool write_file(const std::string& name, const char* p, size_t n) {
+  const std::string tmp = path_of("tmp_" + name);
+  int fd = os_open_wr(tmp.c_str());
+  if (fd < 0) return false;
+  bool ok = wr_all(fd, p, n) && os_sync(fd) == 0;
+  if (ok) os_drop_cache(fd);  // clean now: don't let the page cache keep it
+  if (os_close(fd)) ok = false;
   std::error_code ec;
-  const std::string dst = job.cfg.dir + "/" + job.protect;
-  if (job.touch_existing && fs::exists(dst, ec))
-    fs::last_write_time(dst, fs::file_time_type::clock::now(), ec);
-
-  struct Ent {
-    fs::path p;
-    fs::file_time_type t;
-    uint64_t bytes;
-  };
-  std::vector<Ent> ents;
-  std::vector<fs::path> legacy;
-  uint64_t total = 0;
-  for (auto& de : fs::directory_iterator(job.cfg.dir, ec)) {
-    Sizes s;
-    std::string fn = de.path().filename().string();
-    if (fn.rfind("s_", 0)) continue;
-    if (!read_meta(de.path().string(), s)) {
-      if (s.legacy) legacy.push_back(de.path());
-      continue;
-    }
-    uint64_t b = state_bytes(s) + (uint64_t)s.ntok * 4;
-    ents.push_back({de.path(), fs::last_write_time(de.path(), ec), b});
-    total += b;
-  }
-  // pre-KVS3 snapshots have an invalid ik layout and are never restored
-  for (auto& p : legacy) {
-    std::error_code rec;
-    fs::remove_all(p, rec);
-    if (!rec)
-      fprintf(stderr, "kvsnap: removed legacy snapshot %s (pre-KVS3 format)\n",
-              p.filename().string().c_str());
-  }
-  std::sort(ents.begin(), ents.end(),
-            [](const Ent& a, const Ent& b) { return a.t < b.t; });
-  for (auto& e : ents) {
-    if (total <= job.cfg.cap_bytes) break;
-    if (e.p.filename().string() == job.protect) continue;
-    uint64_t b = e.bytes;
-    ec.clear();
-    fs::remove_all(e.p, ec);
-    if (!ec) {
-      total -= b;
-      fprintf(stderr, "kvsnap: evicted %s (LRU, cap %.1f GB)\n",
-              e.p.filename().string().c_str(),
-              job.cfg.cap_bytes / 1073741824.0);
-    }
-  }
-}
-
-static void maintain_worker() {
-  for (;;) {
-    MaintJob job;
-    {
-      std::unique_lock<std::mutex> lk(g_maint_mtx);
-      g_maint_cv.wait(lk, [] { return g_maint_pending; });
-      job = std::move(g_maint_job);
-      g_maint_pending = false;
-    }
-    maintain_lru(job);
-  }
-}
-
-static void schedule_lru(const Cfg& cfg, const char* protect,
-                         bool touch_existing) {
-  {
-    std::lock_guard<std::mutex> lk(g_maint_mtx);
-    if (!g_maint_started) {
-      g_maint_started = true;
-      std::thread(maintain_worker).detach();
-    }
-    g_maint_job = MaintJob{cfg, protect ? protect : "", touch_existing};
-    g_maint_pending = true;
-  }
-  g_maint_cv.notify_one();
-}
-static void save(GpuModel& m, const std::vector<int>& toks, const Cfg& cfg) {
-  namespace fs = std::filesystem;
-  const int ntok = (int)toks.size();
-  const int nqsa = g_cfg.layers / 4, ngdn = g_cfg.layers - nqsa;
-  const int kvb = m.qsa_kv_fp32 ? 4 : 2;
-  // The device state must describe exactly `toks` (pos == ntok); anything
-  // else would publish a snapshot whose KV/GDN state belongs to other tokens.
-  if (ntok != m.pos || ntok > m.maxctx) {
-    fprintf(stderr, "kvsnap: save skipped: %d tokens but live pos %d\n", ntok, m.pos);
-    return;
-  }
-  char name[64];
-  snprintf(name, sizeof name, "s_%d_%016llx", ntok,
-           (unsigned long long)fnv1a(toks.data(), toks.size()));
-  std::string dst = cfg.dir + "/" + name, tmp = cfg.dir + "/tmp_" + name;
-  std::error_code ec;
-  if (fs::exists(dst, ec)) {  // same state already cached: just bump LRU time
-    schedule_lru(cfg, name, true);
-    return;
-  }
-  fs::remove_all(tmp, ec);
-  if (fs::create_directories(tmp, ec) == false && ec) return;
-  const size_t s_b = (size_t)ngdn * 48 * 128 * 128 * 4,
-               conv_b = (size_t)ngdn * 3 * 10240 * 4, ring_b = 9 * 10240 * 4,
-               iraw_b = (size_t)nqsa * 512 * 4,
-               ik_n = ik_blocks(ntok, m.index_blocks),
-               ik_l = ik_n * 128 * 4,  // one layer's ik slice
-               kvl_b = (size_t)ntok * 512 * kvb;
-  size_t stage_b = std::max({s_b, ik_l, kvl_b});
-  // Persistent staging: a fresh 100+MB malloc per save is mmap/munmap churn,
-  // and the first-touch page faults can stall for seconds (observed up to
-  // 148s D2H) when the system is under memory pressure. Grow-only, so the
-  // steady state faults nothing.
-  // NOTE: do NOT pin this buffer — hipHostMalloc'd memory makes hipMemcpy D2H
-  // collapse to ~7 MB/s on gfx1151 (measured 160 s for 1 GiB vs ~6 s
-  // unpinned); the unified-memory GPU write path hates pinned mappings.
-  static void* st = nullptr;
-  static size_t st_b = 0;
-  if (st_b < stage_b) {
-    free(st);
-    st = malloc(stage_b);
-    st_b = st ? stage_b : 0;
-  }
-  if (!st) return;
-  // one blob file per device state region; any short write aborts the save
-  auto blob = [&](const char* fn, const void* dptr, size_t n) {
-    int fd = os_open_wr((tmp + "/" + fn).c_str());
-    if (fd < 0) return false;
-    bool ok = d2h_wr(fd, dptr, st, n);
-    if (os_close(fd)) ok = false;
-    return ok;
-  };
-  bool ok = true;
-  g_t_d2h = g_t_wr = 0;
-  const auto sv0 = std::chrono::steady_clock::now();
-  {  // meta
-    std::ofstream f(tmp + "/meta");
-    f << "KVS3 " << ntok << " " << nqsa << " " << ngdn << " " << m.maxctx << " "
-      << kvb << " " << m.index_blocks << " " << m.ple_ringpos << " "
-      << (m.mrope_active_ ? 1 : 0) << "\n";
-    if (m.mrope_active_) {
-      f << m.rope_delta_ << " " << m.img_hash_ << " " << m.mrope_grids_.size();
-      for (const auto& g : m.mrope_grids_)
-        f << " " << g[0] << " " << g[1] << " " << g[2];
-      f << "\n";
-    }
-  }
-  {  // tokens (host data, not a device blob)
-    int fd = os_open_wr((tmp + "/tokens").c_str());
-    if (fd < 0 || !wr(fd, toks.data(), toks.size() * 4) || os_close(fd)) ok = false;
-  }
-  ok = ok && blob("s.bin", m.d_S, s_b) && blob("convst.bin", m.d_convst, conv_b) &&
-       blob("ring.bin", m.d_ring, ring_b) && blob("iraw.bin", m.d_iraw, iraw_b);
-  // Files hold LOGICAL order (independent of the device page table):
-  // ik.bin = per QSA layer, blocks [0, ik_n); kv.bin = K half then V half,
-  // per QSA layer, rows [0, ntok). Device reads go page-run by page-run.
   if (ok) {
-    int fd = os_open_wr((tmp + "/ik.bin").c_str());
-    if (fd < 0) ok = false;
-    for (int qi = 0; qi < nqsa && ok; qi++) {
-      const float* layer = m.d_ik + (size_t)qi * m.ik_layer_blocks * 128;
-      m.kv_runs(0, (int)ik_n, KV_PAGE_BLOCKS, [&](int, size_t pb, int n) {
-        if (ok) ok = d2h_wr(fd, layer + pb * 128, st, (size_t)n * 128 * 4);
-      });
-    }
-    if (fd >= 0 && os_close(fd)) ok = false;
-  }
-  if (ok) {
-    int fd = os_open_wr((tmp + "/kv.bin").c_str());
-    if (fd < 0)
-      ok = false;
-    const size_t row_b = (size_t)512 * kvb;
-    for (int half = 0; half < 2 && ok; half++)
-      for (int qi = 0; qi < nqsa && ok; qi++) {
-        const char* layer =
-            (m.qsa_kv_fp32 ? (const char*)(half ? m.d_vc : m.d_kc)
-                           : (const char*)(half ? m.d_vcb : m.d_kcb)) +
-            (size_t)qi * m.kv_layer_rows * row_b;
-        m.kv_runs(0, ntok, KV_PAGE, [&](int, size_t pr, int n) {
-          if (ok) ok = d2h_wr(fd, layer + pr * row_b, st, (size_t)n * row_b);
-        });
-      }
-    if (fd >= 0 && os_close(fd)) ok = false;
-  }
-  if (ok) {
-    fs::rename(tmp, dst, ec);  // atomic publish
+    std::filesystem::rename(tmp, path_of(name), ec);
     ok = !ec;
   }
-  if (!ok) {
-    fs::remove_all(tmp, ec);
-    fprintf(stderr, "kvsnap: save of %d tokens failed (non-fatal)\n", ntok);
-    return;
-  }
-  Sizes mine{ntok, nqsa, ngdn, m.maxctx, kvb, m.index_blocks, 0};
-  fprintf(stderr, "kvsnap: saved %d tokens (%.1f MB) -> %s\n", ntok,
-          state_bytes(mine) / 1048576.0, name);
-  const double sv = std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - sv0)
-                        .count();
-  if (sv > 1.0)
-    fprintf(stderr,
-            "%s kvsnap: slow save %.1fs (d2h %.1fs, write %.1fs, other %.1fs)\n",
-            log_ts(), sv, g_t_d2h, g_t_wr, sv - g_t_d2h - g_t_wr);
-  // Queue LRU accounting/eviction after publishing. Atomic rename remains the
-  // snapshot commit point; maintenance cannot make a partial tree visible.
-  schedule_lru(cfg, name, false);
+  if (!ok) std::filesystem::remove(tmp, ec);
+  return ok;
 }
-
-// map a blob read-only and H2D it into place; expected size must match exactly.
-static bool rd_blob(const std::string& path, void* dptr, size_t n) {
+// Whole file into a pooled buffer; `want` = exact expected size (0 = any,
+// bounded by `max`).
+static bool read_file(const std::string& path, HBuf& b, size_t want, size_t max = 0) {
   int fd = os_open_rd(path.c_str());
   if (fd < 0) return false;
-  int64_t fsz = os_fsize(fd);
+  const int64_t fsz = os_fsize(fd);
+  bool ok = fsz > 0 && (want ? (uint64_t)fsz == want : (uint64_t)fsz <= max);
+  if (ok) {
+    b = buf_get((size_t)fsz);
+    ok = b.p && rd_all(fd, b.data(), (size_t)fsz);
+  }
+  os_drop_cache(fd);
   os_close(fd);
-  if (fsz < 0 || (uint64_t)fsz != n) return false;
-  void* mp = os_map_ro(path.c_str(), n);
-  if (!mp) return false;
-  bool ok = h2d_rd(mp, dptr, n);
-  os_unmap_ro(mp, n);
+  return ok;
+}
+static bool read_prefix(const std::string& path, void* dst, size_t n, uint64_t* fsz) {
+  int fd = os_open_rd(path.c_str());
+  if (fd < 0) return false;
+  const int64_t s = os_fsize(fd);
+  const bool ok = s >= (int64_t)n && rd_all(fd, (char*)dst, n);
+  os_close(fd);
+  *fsz = (uint64_t)std::max<int64_t>(s, 0);
   return ok;
 }
 
-static bool restore(GpuModel& m, const std::string& dir,
-                    std::vector<int>& toks_out, const Cfg& cfg) {
-  Sizes s;
-  const int nqsa = g_cfg.layers / 4, ngdn = g_cfg.layers - nqsa;
-  const int kvb = m.qsa_kv_fp32 ? 4 : 2;
-  if (!read_meta(dir, s) || s.nqsa != nqsa || s.ngdn != ngdn ||
-      s.maxctx != m.maxctx || s.kvb != kvb || s.iblocks != m.index_blocks)
-    return false;
-  const int ntok = s.ntok;
-  if (ntok <= 0 || ntok > m.maxctx) return false;
-  {  // tokens
-    std::ifstream f(dir + "/tokens", std::ios::binary);
-    toks_out.resize(ntok);
-    if (!f.read((char*)toks_out.data(), (std::streamsize)ntok * 4)) return false;
+// ---- in-memory index ---------------------------------------------------------
+// Pages and MTP sections are shared by every checkpoint whose prefix covers
+// them (refcounted); checkpoints are the LRU unit. All under g_mtx.
+enum { ST_PEND, ST_PUB, ST_FAIL };
+struct Blk {
+  uint64_t bytes = 0;
+  int refs = 0;
+  int st = ST_PEND;
+};
+struct CkEnt {
+  std::string name;
+  uint64_t seed = 0, base = 0, id = 0, bytes = 0;
+  int n = 0, nc = 0, nl = 0;
+  bool mtp = false, pub = false;
+  std::vector<uint64_t> chunks, mtps;  // mtps[i] == 0: not referenced
+  std::vector<int> tail;               // tokens [256*nc, n)
+  int64_t t = 0;                       // LRU time (file_time clock)
+  int busy = 0;                        // restores in progress: not evictable
+};
+static std::mutex g_mtx;
+static std::condition_variable g_cv;
+static std::unordered_map<uint64_t, Blk> g_ch, g_mt;
+static std::vector<std::shared_ptr<CkEnt>> g_ck;
+static uint64_t g_total = 0;  // bytes of published files
+
+static void unref_locked(std::unordered_map<uint64_t, Blk>& mp, uint64_t key, bool mtp) {
+  auto it = mp.find(key);
+  if (it == mp.end() || --it->second.refs > 0) return;
+  if (it->second.st == ST_PEND) return;  // the writer deletes it on publish
+  if (it->second.st == ST_PUB) {
+    rm_file(mtp ? mt_name(key) : ch_name(key));
+    g_total -= it->second.bytes;
   }
-  if (!rd_blob(dir + "/s.bin", m.d_S, (size_t)ngdn * 48 * 128 * 128 * 4) ||
-      !rd_blob(dir + "/convst.bin", m.d_convst, (size_t)ngdn * 3 * 10240 * 4) ||
-      !rd_blob(dir + "/ring.bin", m.d_ring, 9 * 10240 * 4) ||
-      !rd_blob(dir + "/iraw.bin", m.d_iraw, (size_t)nqsa * 512 * 4))
-    return false;
-  // A2: the snapshot replaces the live sequence: drop its pages, then map
-  // [0, ntok) on demand (the page-run writes below need them backed). On a
-  // failed restore the caller's reset_state() releases them again.
-  m.kv_trim(0);
-  m.kv_reserve(ntok);
-  // Map a logical-order blob and scatter it page-run by page-run (see save()).
-  auto rd_layers = [&](const std::string& path, size_t tot, auto&& per_file) {
-    int fd = os_open_rd(path.c_str());
-    if (fd < 0) return false;
-    int64_t fsz = os_fsize(fd);
-    os_close(fd);
-    if (fsz < 0 || (uint64_t)fsz != tot) return false;
-    if (!tot) return true;
-    void* mp = os_map_ro(path.c_str(), tot);
-    if (!mp) return false;
-    bool ok = per_file((const char*)mp);
-    os_unmap_ro(mp, tot);
-    return ok;
-  };
-  {  // ik.bin: per QSA layer, logical blocks [0, ik_n)
-    const size_t ik_n = ik_blocks(ntok, m.index_blocks), ik_l = ik_n * 128 * 4;
-    if (!rd_layers(dir + "/ik.bin", (size_t)nqsa * ik_l, [&](const char* mp) {
-          bool ok = true;
-          for (int qi = 0; qi < nqsa && ok; qi++) {
-            const char* src = mp + (size_t)qi * ik_l;
-            float* layer = m.d_ik + (size_t)qi * m.ik_layer_blocks * 128;
-            m.kv_runs(0, (int)ik_n, KV_PAGE_BLOCKS, [&](int lb, size_t pb, int n) {
-              if (ok)
-                ok = h2d_rd(src + (size_t)lb * 128 * 4, layer + pb * 128,
-                            (size_t)n * 128 * 4);
-            });
-          }
-          return ok;
-        }))
-      return false;
+  mp.erase(it);
+}
+static void drop_ck_locked(std::shared_ptr<CkEnt> e, bool del_file) {
+  auto it = std::find(g_ck.begin(), g_ck.end(), e);
+  if (it == g_ck.end()) return;
+  g_ck.erase(it);
+  if (e->pub) {
+    g_total -= e->bytes;
+    if (del_file) rm_file(e->name);
   }
-  {  // kv.bin: K half then V half, per QSA layer, logical rows [0, ntok)
-    const size_t row_b = (size_t)512 * kvb, kvl_b = (size_t)ntok * row_b;
-    if (!rd_layers(dir + "/kv.bin", 2 * (size_t)nqsa * kvl_b, [&](const char* mp) {
-          bool ok = true;
-          for (int half = 0; half < 2 && ok; half++)
-            for (int qi = 0; qi < nqsa && ok; qi++) {
-              const char* src = mp + ((size_t)half * nqsa + qi) * kvl_b;
-              char* layer = (m.qsa_kv_fp32 ? (char*)(half ? m.d_vc : m.d_kc)
-                                           : (char*)(half ? m.d_vcb : m.d_kcb)) +
-                            (size_t)qi * m.kv_layer_rows * row_b;
-              m.kv_runs(0, ntok, KV_PAGE, [&](int lr, size_t pr, int n) {
-                if (ok)
-                  ok = h2d_rd(src + (size_t)lr * row_b, layer + pr * row_b,
-                              (size_t)n * row_b);
-              });
+  for (uint64_t k : e->chunks) unref_locked(g_ch, k, false);
+  for (uint64_t k : e->mtps)
+    if (k) unref_locked(g_mt, k, true);
+}
+static void evict_locked(const CkEnt* keep) {
+  while (g_total > g_cap) {
+    std::shared_ptr<CkEnt> v;
+    for (auto& e : g_ck)
+      if (e->pub && !e->busy && e.get() != keep && (!v || e->t < v->t)) v = e;
+    if (!v) break;
+    fprintf(stderr, "kvsnap: evicted %s (LRU, cap %.1f GB)\n", v->name.c_str(),
+            g_cap / 1073741824.0);
+    drop_ck_locked(v, true);
+  }
+}
+static void touch_locked(const std::shared_ptr<CkEnt>& e) {
+  e->t = now_t();
+  std::error_code ec;  // the file mtime carries the LRU order across restarts
+  std::filesystem::last_write_time(path_of(e->name),
+                                   std::filesystem::file_time_type::clock::now(), ec);
+}
+
+// ---- background writer -------------------------------------------------------
+// One detached thread writes captured images in FIFO order: a commit enqueues
+// its pages, then its MTP sections, then its checkpoints, so a checkpoint is
+// published only after the pages it names (checked again before writing).
+struct Item {
+  int kind = 0;  // 0 trunk page, 1 MTP section, 2 checkpoint
+  uint64_t key = 0;
+  HBuf buf;
+  std::shared_ptr<CkEnt> ck;
+  double cap_s = 0;
+  int new_ch = 0, new_mt = 0;
+  uint64_t new_b = 0;
+};
+static std::deque<Item> g_q;
+static uint64_t g_q_bytes = 0;  // queued + being written
+static bool g_wbusy = false;
+
+static void writer() {
+  for (;;) {
+    Item it;
+    {
+      std::unique_lock<std::mutex> lk(g_mtx);
+      g_cv.wait(lk, [] { return !g_q.empty(); });
+      it = std::move(g_q.front());
+      g_q.pop_front();
+      g_wbusy = true;
+    }
+    const size_t len = it.buf.n;
+    char* p = it.buf.data();
+    std::string name;
+    bool go = true;
+    if (it.kind == 2) {
+      std::lock_guard<std::mutex> lk(g_mtx);
+      for (uint64_t k : it.ck->chunks) {
+        auto f = g_ch.find(k);
+        if (f == g_ch.end() || f->second.st != ST_PUB) go = false;
+      }
+      name = it.ck->name;
+    } else {
+      name = it.kind ? mt_name(it.key) : ch_name(it.key);
+    }
+    const size_t hb = it.kind == 2 ? sizeof(CkHdr) : sizeof(ChHdr);
+    const uint64_t sum = sum64(p + hb, len - hb);
+    memcpy(p + (it.kind == 2 ? offsetof(CkHdr, sum) : offsetof(ChHdr, sum)), &sum, 8);
+    const auto w0 = std::chrono::steady_clock::now();
+    const bool ok = go && write_file(name, p, len);
+    const double ws =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
+    {
+      std::lock_guard<std::mutex> lk(g_mtx);
+      g_q_bytes -= len;
+      if (it.kind < 2) {
+        auto& mp = it.kind ? g_mt : g_ch;
+        auto f = mp.find(it.key);
+        if (f == mp.end() || f->second.refs == 0) {
+          if (ok) rm_file(name);  // every referencing checkpoint is gone
+          if (f != mp.end()) mp.erase(f);
+        } else if (ok) {
+          f->second.st = ST_PUB;
+          f->second.bytes = len;
+          g_total += len;
+        } else {
+          f->second.st = ST_FAIL;  // erased with its last reference
+          fprintf(stderr, "kvsnap: write of %s failed (non-fatal)\n", name.c_str());
+        }
+      } else {
+        const auto& e = it.ck;
+        if (!ok) {
+          fprintf(stderr, "kvsnap: save of %d tokens failed (%s, non-fatal)\n", e->n,
+                  go ? "write error" : "a page write failed");
+          drop_ck_locked(e, false);
+        } else {
+          // same state saved before without MTP state: this file replaced it
+          for (auto& o : g_ck)
+            if (o != e && o->name == e->name) {
+              drop_ck_locked(o, false);
+              break;
             }
-          return ok;
-        }))
-      return false;
+          e->pub = true;
+          e->bytes = len;
+          e->t = now_t();
+          g_total += len;
+          fprintf(stderr,
+                  "%s kvsnap: saved %d tokens -> %s (ckpt %.1f MB + %d new pages%s "
+                  "%.1f MB; capture %.2fs, write %.2fs%s; total %.2f GB)\n",
+                  log_ts(), e->n, e->name.c_str(), len / 1048576.0, it.new_ch,
+                  it.new_mt ? " + mtp" : "", it.new_b / 1048576.0, it.cap_s, ws,
+                  e->mtp ? ", mtp" : "", g_total / 1073741824.0);
+          evict_locked(e.get());
+        }
+      }
+      g_wbusy = false;
+    }
+    g_cv.notify_all();
+    buf_put(std::move(it.buf));
+  }
+}
+static void enqueue(Item&& it) {
+  std::unique_lock<std::mutex> lk(g_mtx);
+  // bounded: the GPU thread waits for the disk rather than hoard host memory
+  g_cv.wait(lk, [&] { return g_q_bytes == 0 || g_q_bytes + it.buf.n <= g_qcap; });
+  g_q_bytes += it.buf.n;
+  g_q.push_back(std::move(it));
+  lk.unlock();
+  g_cv.notify_all();
+}
+
+// Requests in flight: a turn commits after its reply went out, so KVSYNC
+// also waits for those (gen_one holds a Turn for its whole run).
+static int g_turns = 0;
+struct Turn {
+  Turn() {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    g_turns++;
+  }
+  ~Turn() {
+    {
+      std::lock_guard<std::mutex> lk(g_mtx);
+      g_turns--;
+    }
+    g_cv.notify_all();
+  }
+};
+
+// KVSYNC: wait for in-flight turns and the writer to drain;
+// "K <ckpts> <pages> <mtp> <bytes>".
+static std::string sync_line() {
+  std::unique_lock<std::mutex> lk(g_mtx);
+  g_cv.wait(lk, [] { return g_q.empty() && !g_wbusy && !g_turns; });
+  size_t nck = 0;
+  for (auto& e : g_ck) nck += e->pub;
+  char b[128];
+  snprintf(b, sizeof b, "K %zu %zu %zu %llu\n", nck, g_ch.size(), g_mt.size(),
+           (unsigned long long)g_total);
+  return b;
+}
+
+// ---- save --------------------------------------------------------------------
+// A checkpoint captured at a cut or at the end of a turn; its trunk pages are
+// captured by commit(), once, and only those not already on disk.
+struct Pending {
+  std::shared_ptr<CkEnt> ck;
+  HBuf buf;  // checkpoint file image (the writer fills in the checksum)
+  double cap_s = 0;
+};
+
+// GPU-owner thread. `toks` must be exactly the live state (m.pos). `mtp`: the
+// MTP layer is in lockstep (mtp_pos == pos-1, rows [0, pos-1) ingested); the
+// checkpoint then carries d_R/d_miraw/mtp_pos and names MTP sections.
+static void capture(GpuModel& m, const std::vector<int>& toks, bool mtp,
+                    std::vector<Pending>& out) {
+  if (!g_on) return;
+  const int n = (int)toks.size();
+  if (n <= 0 || n != m.pos) {
+    fprintf(stderr, "kvsnap: save skipped: %d tokens but live pos %d\n", n, m.pos);
+    return;
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  const Geo G = geo(m);
+  mtp = mtp && m.kv_nl > G.nqsa && m.mtp_pos == m.pos - 1;
+  const int nc = (n - 1) / KV_PAGE, nt = n - nc * KV_PAGE;
+  auto e = std::make_shared<CkEnt>();
+  e->seed = seed_for(m.mrope_active_, m.img_hash_, m.mrope_grids_);
+  std::vector<uint64_t> ch = chain(e->seed, toks.data(), nc);
+  e->base = ch[(size_t)nc];
+  e->id = ck_id(e->seed, toks.data(), (size_t)n);
+  e->n = n;
+  e->nc = nc;
+  e->nl = mtp ? G.nqsa + 1 : G.nqsa;
+  e->mtp = mtp;
+  e->chunks.assign(ch.begin() + 1, ch.end());
+  e->mtps.assign((size_t)nc, 0);
+  if (mtp)
+    for (int i = 0; i < nc; i++)
+      e->mtps[(size_t)i] = mtp_key(ch[(size_t)i + 1], toks[(size_t)(i + 1) * KV_PAGE]);
+  e->tail.assign(toks.begin() + (size_t)nc * KV_PAGE, toks.end());
+  e->name = ck_name(n, e->id);
+  CkHdr h{};
+  memcpy(h.magic, MAG_K, 8);
+  h.seed = e->seed;
+  h.base = e->base;
+  h.id = e->id;
+  h.n = n;
+  h.nc = nc;
+  h.nl = e->nl;
+  h.kvb = G.kvb;
+  h.ringpos = m.ple_ringpos;
+  h.mtp = mtp;
+  h.mtp_pos = mtp ? m.mtp_pos : 0;
+  h.nik = tail_ik(m, n, nc);
+  h.has_ik = G.has_ik;
+  h.s_b = G.s_b;
+  h.conv_b = G.conv_b;
+  h.ring_b = G.ring_b;
+  h.iraw_b = G.iraw_b;
+  h.mR_b = mtp ? (uint64_t)g_cfg.branches * g_cfg.d * 4 : 0;
+  h.miraw_b = mtp && m.d_miraw ? 4 * 128 * 4 : 0;
+  const size_t len = sizeof h + ck_body_b(h);
+  HBuf b = buf_get(len);
+  if (!b.p) return;
+  char* p = b.data();
+  memcpy(p, &h, sizeof h);
+  p += sizeof h;
+  memcpy(p, e->chunks.data(), (size_t)nc * 8);
+  p += (size_t)nc * 8;
+  memcpy(p, e->mtps.data(), (size_t)nc * 8);
+  p += (size_t)nc * 8;
+  memcpy(p, e->tail.data(), (size_t)nt * 4);
+  p += (size_t)nt * 4;
+  CK(hipStreamSynchronize(g_str));
+  bool ok = true;
+  auto blob = [&](const void* d, size_t sz) {
+    if (ok) ok = d2h(p, d, sz);
+    p += sz;
+  };
+  blob(m.d_S, h.s_b);
+  blob(m.d_convst, h.conv_b);
+  blob(m.d_ring, h.ring_b);
+  blob(m.d_iraw, h.iraw_b);
+  blob(m.d_R, h.mR_b);
+  blob(m.d_miraw, h.miraw_b);
+  const int r0 = nc * KV_PAGE, b0 = nc * KV_PAGE_BLOCKS;
+  for (int l = 0; l < h.nl && ok; l++) {
+    ok = xfer(m, false, kv_layer(m, 0, l), p, r0, n, KV_PAGE, G.row_b) &&
+         xfer(m, false, kv_layer(m, 1, l), p + (size_t)nt * G.row_b, r0, n, KV_PAGE,
+              G.row_b) &&
+         xfer(m, false, G.has_ik ? ik_layer(m, l) : nullptr,
+              p + 2 * (size_t)nt * G.row_b, b0, b0 + h.nik, KV_PAGE_BLOCKS, 512);
+    p += 2 * (size_t)nt * G.row_b + (size_t)h.nik * 512;
+  }
+  if (!ok) {
+    fprintf(stderr, "kvsnap: capture of %d tokens failed (non-fatal)\n", n);
+    return;
+  }
+  Pending pd;
+  pd.ck = std::move(e);
+  pd.buf = std::move(b);
+  pd.cap_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  out.push_back(std::move(pd));
+}
+
+// One page's (or MTP section's) file image, read from the live sequence.
+static bool page_image(GpuModel& m, const Geo& G, bool mtp, int i, uint64_t key,
+                       uint64_t parent, int look, const int* toks, HBuf& b) {
+  const int l0 = mtp ? G.nqsa : 0, nl = mtp ? 1 : G.nqsa;
+  const size_t lb = page_layer_b(G.kvb, G.has_ik);
+  b = buf_get(sizeof(ChHdr) + (size_t)nl * lb);
+  if (!b.p) return false;
+  ChHdr h{};
+  memcpy(h.magic, mtp ? MAG_M : MAG_C, 8);
+  h.key = key;
+  h.parent = parent;
+  h.nl = nl;
+  h.kvb = G.kvb;
+  h.has_ik = G.has_ik;
+  h.look = look;
+  memcpy(h.toks, toks, sizeof h.toks);
+  memcpy(b.data(), &h, sizeof h);
+  char* p = b.data() + sizeof h;
+  const int r0 = i * KV_PAGE, k0 = i * KV_PAGE_BLOCKS;
+  bool ok = true;
+  for (int l = l0; l < l0 + nl && ok; l++, p += lb)
+    ok = xfer(m, false, kv_layer(m, 0, l), p, r0, r0 + KV_PAGE, KV_PAGE, G.row_b) &&
+         xfer(m, false, kv_layer(m, 1, l), p + (size_t)KV_PAGE * G.row_b, r0,
+              r0 + KV_PAGE, KV_PAGE, G.row_b) &&
+         (!G.has_ik || xfer(m, false, ik_layer(m, l), p + 2 * (size_t)KV_PAGE * G.row_b,
+                            k0, k0 + KV_PAGE_BLOCKS, KV_PAGE_BLOCKS, 512));
+  return ok;
+}
+
+// End of turn (GPU-owner thread, `hist` == the live state): register the
+// pending checkpoints, capture the pages/MTP sections none of the cached
+// files hold yet, and hand everything to the writer. Every pending state is
+// a prefix of `hist` (cut states of this prompt), so the live KV still holds
+// their pages: KV rows and MTP rows below each checkpoint are append-only.
+static void commit(GpuModel& m, const std::vector<int>& hist, std::vector<Pending>& pend) {
+  if (!g_on || pend.empty() || (int)hist.size() != m.pos) {
+    pend.clear();
+    return;
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  const Geo G = geo(m);
+  std::sort(pend.begin(), pend.end(),
+            [](const Pending& a, const Pending& b) { return a.ck->n < b.ck->n; });
+  const uint64_t seed = seed_for(m.mrope_active_, m.img_hash_, m.mrope_grids_);
+  const int np = (int)((hist.size() - 1) / KV_PAGE);
+  const std::vector<uint64_t> ch = chain(seed, hist.data(), np);
+  std::vector<char> need_ch((size_t)np, 0), need_mt((size_t)np, 0);
+  std::vector<int> owner_ch((size_t)np, -1), owner_mt((size_t)np, -1);
+  std::vector<size_t> keep;
+  {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    for (size_t pi = 0; pi < pend.size(); pi++) {
+      auto& e = pend[pi].ck;
+      if (e->seed != seed || e->nc > np || ch[(size_t)e->nc] != e->base ||
+          !std::equal(e->tail.begin(), e->tail.end(),
+                      hist.begin() + (size_t)e->nc * KV_PAGE))
+        continue;  // not a prefix of the final state (should not happen)
+      std::shared_ptr<CkEnt> old;
+      for (auto& o : g_ck)
+        if (o->name == e->name) old = o;
+      if (old && (old->mtp || !e->mtp)) {  // already cached (or queued)
+        if (old->pub) touch_locked(old);
+        continue;
+      }
+      bool bad = false;  // a failed page write whose references linger
+      for (uint64_t k : e->chunks) {
+        auto f = g_ch.find(k);
+        if (f != g_ch.end() && f->second.st == ST_FAIL) bad = true;
+      }
+      if (bad) continue;
+      for (int i = 0; i < e->nc; i++) {
+        auto r = g_ch.try_emplace(e->chunks[(size_t)i]);
+        r.first->second.refs++;
+        if (r.second) need_ch[(size_t)i] = 1, owner_ch[(size_t)i] = (int)pi;
+      }
+      for (int i = 0; i < e->nc; i++) {
+        uint64_t& k = e->mtps[(size_t)i];
+        if (!k) continue;
+        auto f = g_mt.find(k);
+        if (f != g_mt.end() && f->second.st == ST_FAIL) {
+          k = 0;  // restores then find the section missing: no MTP state
+          continue;
+        }
+        auto r = g_mt.try_emplace(k);
+        r.first->second.refs++;
+        if (r.second) need_mt[(size_t)i] = 1, owner_mt[(size_t)i] = (int)pi;
+      }
+      g_ck.push_back(e);  // pending (pub = false): dedupes the next commit
+      keep.push_back(pi);
+    }
+  }
+  std::vector<int> nch(pend.size(), 0), nmt(pend.size(), 0);
+  std::vector<uint64_t> nb(pend.size(), 0);
+  auto fail_blk = [&](std::unordered_map<uint64_t, Blk>& mp, uint64_t k) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    auto f = mp.find(k);
+    if (f != mp.end()) f->second.st = ST_FAIL;
+  };
+  CK(hipStreamSynchronize(g_str));
+  for (int pass = 0; pass < 2; pass++)
+    for (int i = 0; i < np; i++) {
+      if (!(pass ? need_mt : need_ch)[(size_t)i]) continue;
+      const int o = (pass ? owner_mt : owner_ch)[(size_t)i];
+      Item it;
+      it.kind = pass;
+      it.key = pass ? pend[(size_t)o].ck->mtps[(size_t)i] : ch[(size_t)i + 1];
+      const uint64_t parent = pass ? ch[(size_t)i + 1] : ch[(size_t)i];
+      const int look = pass ? hist[(size_t)(i + 1) * KV_PAGE] : -1;
+      if (!page_image(m, G, pass == 1, i, it.key, parent, look,
+                      hist.data() + (size_t)i * KV_PAGE, it.buf)) {
+        fprintf(stderr, "kvsnap: capture of page %d failed (non-fatal)\n", i);
+        fail_blk(pass ? g_mt : g_ch, it.key);
+        continue;
+      }
+      (pass ? nmt : nch)[(size_t)o]++;
+      nb[(size_t)o] += it.buf.n;
+      enqueue(std::move(it));
+    }
+  const double pages_s =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  for (size_t k = 0; k < keep.size(); k++) {
+    Pending& pd = pend[keep[k]];
+    Item it;
+    it.kind = 2;
+    it.ck = pd.ck;
+    it.buf = std::move(pd.buf);
+    it.cap_s = pd.cap_s + (k + 1 == keep.size() ? pages_s : 0.0);
+    // log the new pages with the checkpoint that first needed them
+    it.new_ch = nch[keep[k]];
+    it.new_mt = nmt[keep[k]];
+    it.new_b = nb[keep[k]];
+    enqueue(std::move(it));
+  }
+  for (auto& pd : pend) buf_put(std::move(pd.buf));  // deduped images
+  pend.clear();
+}
+
+// ---- restore -----------------------------------------------------------------
+// Longest published checkpoint whose tokens are a strict prefix of `prompt`
+// (strictly shorter: a full-length match has no logits to resume from).
+// The returned entry is marked busy until restore() releases it.
+static std::shared_ptr<CkEnt> match(const std::vector<int>& prompt, uint64_t seed) {
+  if (!g_on || prompt.size() < 2) return nullptr;
+  const int np = (int)((prompt.size() - 1) / KV_PAGE);
+  const std::vector<uint64_t> ch = chain(seed, prompt.data(), np);
+  std::lock_guard<std::mutex> lk(g_mtx);
+  std::shared_ptr<CkEnt> best;
+  for (auto& e : g_ck) {
+    if (!e->pub || e->seed != seed || (size_t)e->n >= prompt.size() ||
+        (best && e->n <= best->n) || e->nc > np || ch[(size_t)e->nc] != e->base ||
+        !std::equal(e->tail.begin(), e->tail.end(),
+                    prompt.begin() + (size_t)e->nc * KV_PAGE))
+      continue;
+    best = e;
+  }
+  if (best) best->busy++;
+  return best;
+}
+
+struct Rd {
+  HBuf b;
+  bool ok = false;
+};
+// Read + verify one page / MTP section file (runs on a prefetch thread).
+static Rd read_page(const std::string& name, bool mtp, uint64_t key, uint64_t parent,
+                    int nl, int kvb, int has_ik, const int* toks, int look) {
+  Rd r;
+  const size_t len = sizeof(ChHdr) + (size_t)nl * page_layer_b(kvb, has_ik);
+  if (!read_file(path_of(name), r.b, len)) return r;
+  ChHdr h;
+  memcpy(&h, r.b.data(), sizeof h);
+  r.ok = !memcmp(h.magic, mtp ? MAG_M : MAG_C, 8) && h.key == key && h.parent == parent &&
+         h.nl == nl && h.kvb == kvb && h.has_ik == has_ik && h.look == look &&
+         !memcmp(h.toks, toks, sizeof h.toks) &&
+         h.sum == sum64(r.b.data() + sizeof h, len - sizeof h);
+  return r;
+}
+
+enum { RS_OK, RS_CKPT, RS_PAGE, RS_OTHER };
+// Pages stream in on a prefetch thread (read + checksum) while the previous
+// one is copied to the device. *bad_page: the trunk page that failed.
+static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& prompt,
+                        bool* mtp_out, uint64_t* bad_page, int* npages) {
+  const Geo G = geo(m);
+  HBuf cb;
+  if (!read_file(path_of(e.name), cb, 0, (size_t)1 << 40)) return RS_CKPT;
+  struct Ret {  // pooled buffer back on every exit
+    HBuf& b;
+    ~Ret() { buf_put(std::move(b)); }
+  } ret{cb};
+  CkHdr h;
+  if (cb.n < sizeof h) return RS_CKPT;
+  memcpy(&h, cb.data(), sizeof h);
+  if (!ck_sane(h) || cb.n != sizeof h + ck_body_b(h) || h.id != e.id || h.n != e.n ||
+      h.seed != e.seed || h.base != e.base ||
+      h.sum != sum64(cb.data() + sizeof h, cb.n - sizeof h))
+    return RS_CKPT;
+  const int n = h.n, nc = h.nc, nt = n - nc * KV_PAGE;
+  if (n > m.maxctx || h.kvb != G.kvb || h.has_ik != G.has_ik || h.s_b != G.s_b ||
+      h.conv_b != G.conv_b || h.ring_b != G.ring_b || h.iraw_b != G.iraw_b ||
+      h.nl < G.nqsa || h.nl > G.nqsa + 1 || (h.nl > G.nqsa && !h.mtp))
+    return RS_OTHER;
+  const char* p = cb.data() + sizeof h;
+  std::vector<uint64_t> chunks((size_t)nc), mtps((size_t)nc);
+  memcpy(chunks.data(), p, (size_t)nc * 8);
+  memcpy(mtps.data(), p + (size_t)nc * 8, (size_t)nc * 8);
+  p += (size_t)nc * 16;
+  if (memcmp(p, prompt.data() + (size_t)nc * KV_PAGE, (size_t)nt * 4)) return RS_CKPT;
+  p += (size_t)nt * 4;
+  bool want_mtp = h.mtp && h.nl == G.nqsa + 1 && m.kv_nl > G.nqsa &&
+                  h.mtp_pos == n - 1 &&
+                  h.mR_b == (uint64_t)g_cfg.branches * g_cfg.d * 4 &&
+                  h.miraw_b == (m.d_miraw ? 4 * 128 * 4u : 0u);
+  if (want_mtp) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    for (uint64_t k : mtps) {
+      auto f = g_mt.find(k);
+      if (!k || f == g_mt.end() || f->second.st != ST_PUB) want_mtp = false;
+    }
+  }
+  // the restored state replaces the live sequence: map fresh rows [0, n)
+  m.kv_trim(0);
+  m.kv_reserve(n);
+  const std::vector<uint64_t> ch = chain(e.seed, prompt.data(), nc);
+  const int njobs = nc + (want_mtp ? nc : 0);
+  auto job = [&](int j) {
+    const bool mt = j >= nc;
+    const int i = mt ? j - nc : j;
+    const int* toks = prompt.data() + (size_t)i * KV_PAGE;
+    return std::async(std::launch::async, read_page,
+                      mt ? mt_name(mtps[(size_t)i]) : ch_name(chunks[(size_t)i]), mt,
+                      mt ? mtps[(size_t)i] : chunks[(size_t)i],
+                      mt ? chunks[(size_t)i] : ch[(size_t)i], mt ? 1 : G.nqsa, G.kvb,
+                      G.has_ik, toks, mt ? prompt[(size_t)(i + 1) * KV_PAGE] : -1);
+  };
+  std::future<Rd> fut;
+  if (njobs) fut = job(0);
+  const size_t lb = page_layer_b(G.kvb, G.has_ik);
+  for (int j = 0; j < njobs; j++) {
+    Rd r = fut.get();
+    if (j + 1 < njobs) fut = job(j + 1);
+    const bool mt = j >= nc;
+    const int i = mt ? j - nc : j;
+    if (!mt && chunks[(size_t)i] != ch[(size_t)i + 1]) r.ok = false;
+    if (!r.ok) {
+      buf_put(std::move(r.b));
+      if (fut.valid()) fut.wait();
+      if (!mt) {
+        *bad_page = chunks[(size_t)i];
+        return RS_PAGE;
+      }
+      want_mtp = false;  // the trunk is complete; only speculation is lost
+      break;
+    }
+    char* q = r.b.data() + sizeof(ChHdr);
+    const int l0 = mt ? G.nqsa : 0, nl = mt ? 1 : G.nqsa;
+    const int r0 = i * KV_PAGE, k0 = i * KV_PAGE_BLOCKS;
+    bool ok = true;
+    for (int l = l0; l < l0 + nl && ok; l++, q += lb)
+      ok = xfer(m, true, kv_layer(m, 0, l), q, r0, r0 + KV_PAGE, KV_PAGE, G.row_b) &&
+           xfer(m, true, kv_layer(m, 1, l), q + (size_t)KV_PAGE * G.row_b, r0,
+                r0 + KV_PAGE, KV_PAGE, G.row_b) &&
+           (!G.has_ik || xfer(m, true, ik_layer(m, l), q + 2 * (size_t)KV_PAGE * G.row_b,
+                              k0, k0 + KV_PAGE_BLOCKS, KV_PAGE_BLOCKS, 512));
+    buf_put(std::move(r.b));
+    if (!ok) {
+      if (fut.valid()) fut.wait();
+      return RS_OTHER;
+    }
+  }
+  *npages = nc;
+  // checkpoint: GDN/PLE/indexer state, then the partial page of every layer
+  char* src = (char*)p;
+  bool ok = true;
+  auto blob = [&](void* d, size_t sz, bool use) {
+    if (ok && use) ok = h2d(d, src, sz);
+    src += sz;
+  };
+  blob(m.d_S, h.s_b, true);
+  blob(m.d_convst, h.conv_b, true);
+  blob(m.d_ring, h.ring_b, true);
+  blob(m.d_iraw, h.iraw_b, true);
+  blob(m.d_R, h.mR_b, want_mtp);
+  blob(m.d_miraw, h.miraw_b, want_mtp);
+  const int r0 = nc * KV_PAGE, k0 = nc * KV_PAGE_BLOCKS;
+  const int nik = std::min(
+      h.nik, std::max(0, std::min(KV_PAGE_BLOCKS * ((n + KV_PAGE - 1) / KV_PAGE),
+                                  m.index_blocks) - k0));
+  const int nl = want_mtp ? h.nl : G.nqsa;
+  for (int l = 0; l < nl && ok; l++) {
+    ok = xfer(m, true, kv_layer(m, 0, l), src, r0, n, KV_PAGE, G.row_b) &&
+         xfer(m, true, kv_layer(m, 1, l), src + (size_t)nt * G.row_b, r0, n, KV_PAGE,
+              G.row_b) &&
+         (!G.has_ik || xfer(m, true, ik_layer(m, l), src + 2 * (size_t)nt * G.row_b, k0,
+                            k0 + nik, KV_PAGE_BLOCKS, 512));
+    src += 2 * (size_t)nt * G.row_b + (size_t)h.nik * 512;
+  }
+  if (!ok) return RS_OTHER;
+  if (want_mtp) {
+    m.mtp_pos = h.mtp_pos;
+    CK(hipMemcpy(m.d_mpos, &m.mtp_pos, 4, hipMemcpyHostToDevice));
   }
   // GDEC_QSA_WMMA_BTV: the transposed prefill V cache is derived state (not
-  // in the snapshot); rebuild it for [0, ntok) from the restored row-major V,
-  // or sparse prefill after the restore would read stale V for the prefix.
+  // saved); rebuild it for [0, n) from the restored row-major V, or sparse
+  // prefill after the restore would read stale V for the prefix. Paged:
+  // per physically contiguous run; a page holds whole 4-token blocks, so
+  // physical row block pr/4 is exactly the physical vct block of that run.
   if (m.qsa_wmma_btv) {
-    // Paged (A1c): rebuild per physically contiguous run on physical rows; a
-    // page holds whole 4-token blocks, so physical row block pr/4 is exactly
-    // the physical vct block of that run (unpaged: one run [0, ntok)).
-    for (int qi = 0; qi < nqsa; qi++)
-      m.kv_runs(0, ntok, KV_PAGE, [&](int, size_t prz, int n) {
+    for (int qi = 0; qi < G.nqsa; qi++)
+      m.kv_runs(0, n, KV_PAGE, [&](int, size_t prz, int cnt) {
         const int pr = (int)prz;
         const unsigned grid =
-            (unsigned)((((size_t)(pr + n + 3) / 4 - (size_t)pr / 4) * 512 + 255) / 256);
+            (unsigned)((((size_t)(pr + cnt + 3) / 4 - (size_t)pr / 4) * 512 + 255) / 256);
         k_bf16_rows_to_bt<<<grid, 256, 0, g_str>>>(
-            m.d_vcb + (size_t)qi * m.kv_layer_rows * 512, m.vct_layer(qi), pr, pr + n);
+            m.d_vcb + (size_t)qi * m.kv_layer_rows * 512, m.vct_layer(qi), pr, pr + cnt);
       });
     CK(hipGetLastError());
     CK(hipStreamSynchronize(g_str));
   }
   // host-side and scalar state: pos/ringpos (both mirrors), PLE token history
-  m.pos = ntok;
-  m.ple_ringpos = s.ringpos;
+  m.pos = n;
+  m.ple_ringpos = h.ringpos;
   CK(hipMemcpy(m.d_pos, &m.pos, 4, hipMemcpyHostToDevice));
   CK(hipMemcpy(m.d_ringpos, &m.ple_ringpos, 4, hipMemcpyHostToDevice));
-  m.chist.assign(toks_out.begin(), toks_out.end());
-  // LRU touch and eviction are coalesced onto the bounded maintenance worker.
-  std::string name = std::filesystem::path(dir).filename().string();
-  schedule_lru(cfg, name.c_str(), true);
+  m.chist.assign(prompt.begin(), prompt.begin() + n);
+  *mtp_out = want_mtp;
+  return RS_OK;
+}
+
+// Restore `e` (from match()) for `prompt`: hist := its tokens. *mtp_out: the
+// MTP layer is back in lockstep (speculation may continue). On failure the
+// live state is undefined: the caller resets it.
+static bool restore(GpuModel& m, const std::shared_ptr<CkEnt>& e,
+                    const std::vector<int>& prompt, std::vector<int>& hist,
+                    bool* mtp_out) {
+  *mtp_out = false;
+  const auto t0 = std::chrono::steady_clock::now();
+  uint64_t bad = 0;
+  int npages = 0;
+  const int rc = restore_body(m, *e, prompt, mtp_out, &bad, &npages);
+  {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    e->busy--;
+    if (rc == RS_OK) {
+      touch_locked(e);
+    } else if (rc == RS_CKPT) {
+      drop_ck_locked(e, true);
+    } else if (rc == RS_PAGE) {
+      // a damaged page invalidates every checkpoint built on it
+      std::vector<std::shared_ptr<CkEnt>> v;
+      for (auto& o : g_ck)
+        if (o->pub && !o->busy && std::count(o->chunks.begin(), o->chunks.end(), bad))
+          v.push_back(o);
+      for (auto& o : v) drop_ck_locked(o, true);
+    }
+  }
+  const double s =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  if (rc != RS_OK) {
+    fprintf(stderr, "%s kvsnap: restore of %s failed (%s, non-fatal)\n", log_ts(),
+            e->name.c_str(),
+            rc == RS_CKPT ? "bad checkpoint" : rc == RS_PAGE ? "bad page" : "device/geometry");
+    return false;
+  }
+  hist.assign(prompt.begin(), prompt.begin() + e->n);
+  fprintf(stderr, "%s kvsnap: restored %d tokens from %s in %.2fs (%d pages)%s\n",
+          log_ts(), e->n, e->name.c_str(), s, npages, *mtp_out ? " (mtp live)" : "");
   return true;
 }
 
-// Longest snapshot whose token list is a strict prefix of `prompt` (strictly
-// shorter: a full-length match has no logits to resume generation from).
-// M-RoPE candidates additionally require the request's grids and patch-bytes
-// hash to match the snapshot meta (req_grids != nullptr for vision requests).
-static std::string best_prefix(const Cfg& cfg, const std::vector<int>& prompt,
-                               size_t* ntok_out,
-                               const std::vector<std::array<int, 3>>* req_grids =
-                                   nullptr,
-                               uint64_t req_img_hash = 0) {
+// ---- startup -----------------------------------------------------------------
+static uint64_t fingerprint(const GpuModel& m) {
+  const Geo G = geo(m);
+  uint64_t h = mix64(0x6764656b76736e70ULL + FMT);
+  auto add = [&](uint64_t v) { h = mix64(h ^ v); };
+  for (const auto& f : g_model_files) add(file_id(f));
+  for (uint64_t v : {(uint64_t)m.ple_on, (uint64_t)G.kvb, (uint64_t)G.has_ik,
+                     (uint64_t)G.nqsa, (uint64_t)g_cfg.layers, (uint64_t)g_cfg.d,
+                     (uint64_t)g_cfg.branches, (uint64_t)KV_PAGE})
+    add(v);
+  return h;
+}
+static bool ends_with(const std::string& s, const char* suf) {
+  const size_t k = strlen(suf);
+  return s.size() >= k && !s.compare(s.size() - k, k, suf);
+}
+static std::shared_ptr<CkEnt> load_ck(const std::string& fn) {
+  CkHdr h;
+  uint64_t fsz = 0;
+  if (!read_prefix(path_of(fn), &h, sizeof h, &fsz) || !ck_sane(h) ||
+      fsz != sizeof h + ck_body_b(h) || fn != ck_name(h.n, h.id))
+    return nullptr;
+  const size_t nt = (size_t)h.n - (size_t)h.nc * KV_PAGE;
+  std::vector<char> v(sizeof h + (size_t)h.nc * 16 + nt * 4);
+  if (!read_prefix(path_of(fn), v.data(), v.size(), &fsz)) return nullptr;
+  auto e = std::make_shared<CkEnt>();
+  e->name = fn;
+  e->seed = h.seed;
+  e->base = h.base;
+  e->id = h.id;
+  e->bytes = fsz;
+  e->n = h.n;
+  e->nc = h.nc;
+  e->nl = h.nl;
+  e->mtp = h.mtp != 0;
+  e->pub = true;
+  e->chunks.resize((size_t)h.nc);
+  e->mtps.resize((size_t)h.nc);
+  e->tail.resize(nt);
+  memcpy(e->chunks.data(), v.data() + sizeof h, (size_t)h.nc * 8);
+  memcpy(e->mtps.data(), v.data() + sizeof h + (size_t)h.nc * 8, (size_t)h.nc * 8);
+  memcpy(e->tail.data(), v.data() + sizeof h + (size_t)h.nc * 16, nt * 4);
+  return e;
+}
+
+// Index the cache directory (serve::run, before the first request). Torn
+// temporaries, pre-A4 snapshot directories, unreadable files and checkpoints
+// missing a trunk page are removed; unreferenced pages too.
+static void init(GpuModel& m, Cfg& cfg) {
   namespace fs = std::filesystem;
   std::error_code ec;
-  std::string best;
-  size_t bestn = 0;
-  for (auto& de : fs::directory_iterator(cfg.dir, ec)) {
-    std::string fn = de.path().filename().string();
-    if (fn.rfind("s_", 0)) continue;
-    Sizes s;
-    if (!read_meta(de.path().string(), s) || (size_t)s.ntok >= prompt.size() ||
-        (size_t)s.ntok <= bestn)
-      continue;
-    if (s.mrope && (!req_grids || s.grids != *req_grids ||
-                    s.img_hash != req_img_hash))
-      continue;  // same-shaped different image: not this snapshot
-    std::ifstream f(de.path().string() + "/tokens", std::ios::binary);
-    std::vector<int> t(s.ntok);
-    if (!f.read((char*)t.data(), (std::streamsize)s.ntok * 4)) continue;
-    if (std::equal(t.begin(), t.end(), prompt.begin())) {
-      best = de.path().string();
-      bestn = (size_t)s.ntok;
+  fs::create_directories(cfg.dir, ec);
+  if (!fs::is_directory(cfg.dir, ec)) {
+    fprintf(stderr, "kvsnap: cannot use %s: disabled\n", cfg.dir.c_str());
+    cfg.dir.clear();
+    return;
+  }
+  g_dir = cfg.dir;
+  g_cap = cfg.cap_bytes;
+  g_qcap = cfg.queue_bytes;
+  g_fp = fingerprint(m);
+  g_vis_id = g_vision_file.empty() ? 0 : file_id(g_vision_file);
+  std::vector<std::shared_ptr<CkEnt>> cks;
+  size_t legacy = 0, bad = 0;
+  std::vector<fs::path> ents;
+  for (auto& de : fs::directory_iterator(cfg.dir, ec)) ents.push_back(de.path());
+  for (const auto& pth : ents) {
+    std::error_code e2;
+    const std::string fn = pth.filename().string();
+    if (!fn.rfind("tmp_", 0)) {
+      fs::remove_all(pth, e2);
+    } else if (!fn.rfind("s_", 0) && fs::is_directory(pth, e2)) {
+      fs::remove_all(pth, e2);  // KVS1-3 whole-state snapshots
+      legacy++;
+    } else if ((!fn.rfind("c_", 0) && ends_with(fn, ".kvc")) ||
+               (!fn.rfind("m_", 0) && ends_with(fn, ".kvm"))) {
+      const bool mt = fn[0] == 'm';
+      ChHdr h;
+      uint64_t fsz = 0;
+      if (!read_prefix(pth.string(), &h, sizeof h, &fsz) ||
+          memcmp(h.magic, mt ? MAG_M : MAG_C, 8) || h.nl <= 0 || h.nl > 64 ||
+          (h.kvb != 2 && h.kvb != 4) ||
+          fsz != sizeof h + (size_t)h.nl * page_layer_b(h.kvb, h.has_ik) ||
+          fn != (mt ? mt_name(h.key) : ch_name(h.key))) {
+        fs::remove(pth, e2);
+        bad++;
+        continue;
+      }
+      Blk& b = (mt ? g_mt : g_ch)[h.key];
+      b.bytes = fsz;
+      b.st = ST_PUB;
+    } else if (!fn.rfind("k_", 0) && ends_with(fn, ".kck")) {
+      auto e = load_ck(fn);
+      if (!e) {
+        fs::remove(pth, e2);
+        bad++;
+        continue;
+      }
+      e->t = (int64_t)fs::last_write_time(pth, e2).time_since_epoch().count();
+      cks.push_back(e);
     }
   }
-  *ntok_out = bestn;
-  return best;
+  std::lock_guard<std::mutex> lk(g_mtx);
+  for (auto& e : cks) {
+    bool whole = true;
+    for (uint64_t k : e->chunks) whole = whole && g_ch.count(k);
+    if (!whole) {
+      rm_file(e->name);
+      bad++;
+      continue;
+    }
+    for (uint64_t k : e->chunks) g_ch[k].refs++;
+    for (uint64_t& k : e->mtps) {
+      auto f = g_mt.find(k);
+      if (f == g_mt.end()) k = 0;
+      else f->second.refs++;
+    }
+    g_total += e->bytes;
+    g_ck.push_back(e);
+  }
+  size_t orphans = 0;
+  for (auto* mp : {&g_ch, &g_mt})
+    for (auto it = mp->begin(); it != mp->end();) {
+      if (it->second.refs == 0) {
+        rm_file(mp == &g_mt ? mt_name(it->first) : ch_name(it->first));
+        it = mp->erase(it);
+        orphans++;
+      } else {
+        g_total += it->second.bytes;
+        ++it;
+      }
+    }
+  if (legacy)
+    fprintf(stderr, "kvsnap: removed %zu pre-A4 snapshot director%s (old format)\n",
+            legacy, legacy == 1 ? "y" : "ies");
+  if (bad || orphans)
+    fprintf(stderr, "kvsnap: removed %zu unusable and %zu unreferenced files\n", bad,
+            orphans);
+  evict_locked(nullptr);
+  fprintf(stderr, "kvsnap: index %zu checkpoints, %zu pages, %zu mtp sections, %.2f GB "
+          "(cap %.1f GB, queue %.0f MB)\n",
+          g_ck.size(), g_ch.size(), g_mt.size(), g_total / 1073741824.0,
+          g_cap / 1073741824.0, g_qcap / 1048576.0);
+  g_on = true;
+  std::thread(writer).detach();
 }
 
 }  // namespace kvsnap
@@ -1056,6 +1706,7 @@ struct Conn {
 static void gen_one(GpuModel& m, Conn& c, GenReq g,
                     std::vector<std::vector<float>> vpatches,
                     const kvsnap::Cfg& kvs) {
+  kvsnap::Turn kv_turn;  // KVSYNC waits for this turn's SSD commit
   const std::atomic<bool>& cancel = c.cancel;
   char db[192];
   auto err_line = [&]() {
@@ -1205,29 +1856,22 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       }
     }
     if (!cont && !kvs.dir.empty()) {
-      size_t sn = 0;
-      // M-RoPE requests: placeholder ids are pixel-agnostic, so a
-      // snapshot only qualifies when grids AND patch-bytes hash match
-      // (checked inside best_prefix against the KVS3 meta); a mismatch
-      // is simply a cache miss and falls to a full recompute.
+      // SSD tier. M-RoPE requests: placeholder ids are pixel-agnostic, so
+      // the vision tower, grids and patch-bytes hash are folded into the
+      // page-key seed; a different image is simply a cache miss. A
+      // checkpoint saved with the MTP layer in lockstep restores it too.
       const bool is_mrope = !g.mrope_grids.empty();
       const uint64_t req_ih = is_mrope ? fnv1a_patches(vpatches) : 0;
-      std::string sp = kvsnap::best_prefix(
-          kvs, g.ids, &sn, is_mrope ? &g.mrope_grids : nullptr, req_ih);
-      if (!sp.empty()) {
-        auto r0 = std::chrono::steady_clock::now();
-        if (kvsnap::restore(m, sp, hist, kvs)) {  // hist := snapshot tokens
+      auto ck = kvsnap::match(g.ids, kvsnap::seed_for(is_mrope, req_ih, g.mrope_grids));
+      bool ck_mtp = false;
+      if (ck) {
+        if (kvsnap::restore(m, ck, g.ids, hist, &ck_mtp)) {  // hist := its tokens
           mcp = hist.size();
           cont = true;
           n_cached = (int)mcp;
-          // the snapshot holds no MTP KV/state: as after an rckpt restore,
-          // the MTP layer is stale for the restored prefix
-          mtp_live = false;
-          double rs = std::chrono::duration<double>(
-                          std::chrono::steady_clock::now() - r0)
-                          .count();
-          fprintf(stderr, "%s kvsnap: restored %zu tokens from %s in %.1fs\n",
-                  log_ts(), mcp, sp.c_str(), rs);
+          mtp_live = ck_mtp;
+        } else {
+          hist.clear();  // live state undefined after a failed restore
         }
       }
     }
@@ -1274,8 +1918,8 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     int cur;
     float cur_lp = 0.0f;
     // MTP speculation is available for greedy and rejection-sampled
-    // requests when its KV can be made complete. kvsnap restores lack MTP
-    // KV for the prompt, so those requests stay on plain decode.
+    // requests when its KV can be made complete: a fresh prefill, or a
+    // restore (rckpt/kvsnap) of a state saved with the MTP layer live.
     static const int spec_gamma = std::max(
         1, std::min(8, getenv("GDEC_SPEC_GAMMA")
                            ? atoi(getenv("GDEC_SPEC_GAMMA"))
@@ -1290,8 +1934,8 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // requests run spec_loop_chain_sample (ngram rounds re-draw from the
     // target distribution; GDEC_NOSPEC_SAMPLE forces plain serial, same
     // as use_spec). The MTP leg requires a complete MTP KV: a fresh
-    // prefill always has one; a cont/kvsnap turn only if the previous
-    // request left MTP live.
+    // prefill always has one; a cont/restored turn only if the previous
+    // request (or the restored checkpoint) left MTP live.
     const bool use_chain = g.drafter == 4 &&
                            (!g.sample ||
                             getenv("GDEC_NOSPEC_SAMPLE") == nullptr);
@@ -1322,9 +1966,10 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // resume. The next turn re-renders history as TEXT whose ids match
     // the prompt only up to these boundaries (the assistant opener and
     // generated text retokenize differently), so they are the cuts
-    // that hit. Checkpoints go to the RAM tier (rckpt): the SSD tier
-    // only takes the prompt-end and request-end states to bound disk
-    // churn.
+    // that hit. Checkpoints go to the RAM tier (rckpt) and are captured
+    // for the SSD tier (kvsnap); the SSD captures are committed at the end
+    // of the turn together with the final state, where only the pages no
+    // cached file holds yet are written (content-addressed, shared).
     std::vector<size_t> cuts;
     if (!kvs.dir.empty() || rckpt::enabled()) {
       for (size_t cc : g.snaps)
@@ -1349,6 +1994,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // live spec counters reset per request, or a serial decode after a
     // speculative one would report the previous request's acceptance
     m.live_spec_rounds = m.live_spec_commits = m.live_spec_proposed = 0;
+    std::vector<kvsnap::Pending> pend;  // SSD captures, committed at turn end
     for (size_t cc : cuts) {
       std::vector<int> seg(g.ids.begin() + done_upto, g.ids.begin() + cc);
       cur = m.prefill_batch(seg, (int)done_upto);
@@ -1357,6 +2003,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       // d_R == h_{cc-1}): checkpoint that lockstep state, then pair h_{cc-1}
       // with token cc, which the next segment's ingest would otherwise skip.
       rckpt::save(m, hist, use_spec || chain_mtp);
+      if (!kvs.dir.empty()) kvsnap::capture(m, hist, use_spec || chain_mtp, pend);
       if (use_spec || chain_mtp) {
         std::vector<int> bt{g.ids[cc]};
         m.mtp_ingest_b(m.d_R, bt, 1, (int)cc - 1);
@@ -1592,12 +2239,14 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
                           : (use_ngram ? "ngram" : "mtp"));
       }
     }
-    // SSD prompt cache: snapshot the end-of-turn state for future
-    // sessions. Cancelled turns are valid too -- hist tracks exactly the
-    // ingested tokens, and short states are skipped inside save().
-    // M-RoPE states carry the KVS3 grids/img-hash meta (see above).
-    if (!kvs.dir.empty() && hist.size() >= kvs.min_tokens)
-      kvsnap::save(m, hist, kvs);
+    // SSD prompt cache: capture the end-of-turn state, then commit it with
+    // the cut captures (new pages + MTP sections + checkpoints go to the
+    // background writer). Cancelled turns are valid too -- hist tracks
+    // exactly the ingested tokens. The MTP layer is saved only when live.
+    if (!kvs.dir.empty()) {
+      if (hist.size() >= kvs.min_tokens) kvsnap::capture(m, hist, mtp_live, pend);
+      kvsnap::commit(m, hist, pend);
+    }
   } catch (const std::exception& e) {
     // prefill/decode failure, or KvOverflow (pool exhausted by concurrent
     // requests: this one is the later): the partial state is unknown, so
@@ -1661,6 +2310,10 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
                (unsigned long long)ms.process_rss,
                (unsigned long long)ms.process_locked);
       alive = c.send(mb);
+    } else if (verb == "KVSYNC") {
+      // wait until every in-flight turn committed and the SSD writer is
+      // idle (tests/ops); replies "K <ckpts> <pages> <mtp> <bytes>"
+      alive = c.send(kvs.dir.empty() ? std::string("K 0 0 0 0\n") : kvsnap::sync_line());
     } else if (verb == "X") {
       int64_t req = 0;
       ss >> req;
@@ -1777,9 +2430,13 @@ static int run(GpuModel& m, int port) {
     kvs.cap_bytes = (uint64_t)(atof(v) * 1073741824.0);
   if (!kvs.cap_bytes) kvs.dir.clear();
   if (const char* v = getenv("GDEC_KVSNAP_MIN")) kvs.min_tokens = (size_t)atol(v);
-  if (!kvs.dir.empty())
+  if (const char* v = getenv("GDEC_KVSNAP_QUEUE_MB"))
+    kvs.queue_bytes = (uint64_t)std::max(64.0, atof(v)) << 20;
+  if (!kvs.dir.empty()) {
     fprintf(stderr, "kvsnap: dir %s, cap %.1f GB, min %zu tokens\n",
             kvs.dir.c_str(), kvs.cap_bytes / 1073741824.0, kvs.min_tokens);
+    kvsnap::init(m, kvs);  // may disable it (dir unusable)
+  }
   for (;;) {
     sockfd_t cfd = accept(lfd, nullptr, nullptr);
     if (cfd < 0) continue;

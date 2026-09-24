@@ -273,6 +273,11 @@ int main(int argc, char** argv) {
       m.reset_state();
     }
     memstats_log("ready");
+    // kvsnap cache identity: the weights (and the vision tower for image
+    // prompts) that produced the cached KV
+    kvsnap::g_model_files = overlays;
+    kvsnap::g_model_files.insert(kvsnap::g_model_files.begin(), base);
+    kvsnap::g_vision_file = vision_tower;
     return serve::run(m, port);
   }
   if (!kld_mode && tokens.size() < (ppl ? 2u : 1u)) {

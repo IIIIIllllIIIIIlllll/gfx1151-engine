@@ -24,6 +24,11 @@ static inline int os_close(int fd) { return close(fd); }
 static inline ssize_t os_write(int fd, const void* p, size_t n) {
   return write(fd, p, n);
 }
+static inline ssize_t os_read(int fd, void* p, size_t n) { return read(fd, p, n); }
+static inline int os_sync(int fd) { return fdatasync(fd); }
+// written/read data will not be needed again soon: keep the page cache (which
+// competes with device memory on a unified-memory APU) from holding it
+static inline void os_drop_cache(int fd) { posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); }
 static inline int64_t os_fsize(int fd) {
   struct stat sb;
   return fstat(fd, &sb) ? -1 : (int64_t)sb.st_size;

@@ -115,6 +115,11 @@ static inline ssize_t os_write(int fd, const void* p, size_t n) {
   return _write(fd, p, (unsigned int)n);
 }
 static inline int64_t os_fsize(int fd) { return _filelengthi64(fd); }
+static inline ssize_t os_read(int fd, void* p, size_t n) {
+  return _read(fd, p, (unsigned int)n);  // 同 _write：单次 < 4 GiB，调用方循环
+}
+static inline int os_sync(int fd) { return _commit(fd); }
+static inline void os_drop_cache(int) {}  // Windows 无 posix_fadvise 等价物，跳过
 
 // 只读映射整个文件（mmap PROT_READ 等价物），返回 nullptr 失败
 static inline void* os_map_ro(const char* path, size_t len) {

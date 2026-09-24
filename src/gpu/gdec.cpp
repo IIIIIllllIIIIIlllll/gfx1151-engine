@@ -105,8 +105,10 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <list>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
