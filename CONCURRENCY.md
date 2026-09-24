@@ -15,7 +15,8 @@
 | `KV_POOL_TOKENS` | 0 | 共享 KV 页池大小，取 `max(KV_POOL_TOKENS, MAX_CONTEXT)`；默认即一条 256K |
 
 引擎读 `GDEC_PARALLEL`，API 启动时从引擎 `INFO` 的 `kv_slots` 字段得知路数并开同样
-多的引擎连接。每多一路约多占 0.65 GiB 显存（每槽独立的 GDN 状态、MTP 状态和 decode 图）。
+多的引擎连接。每多一路约多占 1.1 GiB 显存（256K、默认 FP32 KV 下：MTP KV 按 MAX_CONTEXT 预分配
+约 1 GiB，GDN 状态 113 MB，MTP indexer keys 34 MB；MTP KV 随 MAX_CONTEXT 缩放）。
 
 ## 语义
 

@@ -368,7 +368,7 @@ int main(int argc, char** argv) {
                kv_pool_tokens > max_context ? kv_pool_tokens : max_context, parallel,
                rckpt_max);
         if (parallel > 1)
-            fprintf(stderr, "提示：每多一路并发约多占 0.65 GiB 设备内存，arena"
+            fprintf(stderr, "提示：每多一路并发约多占 1.1 GiB 设备内存（256K 下），arena"
                             "（95 GiB 上限）放不下的部分会回退 hipMalloc\n");
         if (kv_pool_tokens > max_context)
             fprintf(stderr, "警告：KV_POOL_TOKENS 大于 MAX_CONTEXT，Windows arena"
