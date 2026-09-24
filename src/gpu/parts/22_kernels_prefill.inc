@@ -143,8 +143,13 @@ __global__ void k_f32_to_bf16_v4(const float* __restrict__ x,
 // Compact BF16 [P,512] V rows into block-transposed
 // [block][kvh][dim][slot] storage. Each thread owns one dimension of one KV
 // head and packs the four token slots, so the WMMA V gather can issue one
-// contiguous 64-bit load per four-key group. Partial edge blocks only update
-// slots covered by this chunk; masked WMMA keys never consume the others.
+// contiguous 64-bit load per four-key group. The leading partial block keeps
+// its slots < base (earlier rows). Slots >= base + P of the trailing partial
+// block are written as ZERO: k_qsa_wmma<true> loads whole 4-slot groups and
+// multiplies the masked slots by p = 0 inside the WMMA, and on gfx1151 the
+// result is NOT independent of those V bits (stale finite values changed
+// the output LSBs; A5 off-vs-paged divergence, 2026-09-24). Zero keeps the
+// output a function of valid rows only, identical for paged / unpaged.
 __global__ void k_f32_to_bf16_v4_bt(const float* __restrict__ x,
                                     uint16_t* __restrict__ out, uint64_t xs,
                                     int P, int n, int base) {
@@ -163,8 +168,8 @@ __global__ void k_f32_to_bf16_v4_bt(const float* __restrict__ x,
 #pragma unroll
   for (int slot = 0; slot < 4; ++slot) {
     int abs = b * 4 + slot;
-    if (abs >= base && abs < base + P) {
-      v[slot] = f2bf(x[(size_t)(abs - base) * xs + kvh * (n / 2) + dim]);
+    if (abs >= base) {
+      if (abs < base + P) v[slot] = f2bf(x[(size_t)(abs - base) * xs + kvh * (n / 2) + dim]);
       valid |= 1 << slot;
     }
   }
@@ -184,8 +189,9 @@ __global__ void k_f32_to_bf16_v4_bt(const float* __restrict__ x,
 // Rebuild block-transposed V for absolute rows [r0, r1) from the row-major
 // BF16 cache (kvsnap restore: the snapshot stores only the row-major cache).
 // Same packing as k_f32_to_bf16_v4_bt (n = 512); bits are copied, so the
-// result equals what the live prefill/decode stores wrote. Slots outside
-// [r0, r1) are left untouched.
+// result equals what the live prefill/decode stores wrote. Slots < r0 are left
+// untouched; slots >= r1 of the trailing partial block are zeroed (same rule
+// as k_f32_to_bf16_v4_bt).
 __global__ void k_bf16_rows_to_bt(const uint16_t* __restrict__ vc,
                                   uint16_t* __restrict__ vct, int r0, int r1) {
   const int b0 = r0 / 4, b1 = (r1 + 3) / 4;
@@ -196,7 +202,78 @@ __global__ void k_bf16_rows_to_bt(const uint16_t* __restrict__ vc,
 #pragma unroll
   for (int slot = 0; slot < 4; ++slot) {
     const int t = b * 4 + slot;
-    if (t >= r0 && t < r1) dst[slot] = vc[(size_t)t * 512 + i];
+    if (t >= r0) dst[slot] = t < r1 ? vc[(size_t)t * 512 + i] : (uint16_t)0;
+  }
+}
+
+// Debug (GDEC_VCT_CHECK): count logical rows [0, r1) whose transposed-V slot
+// differs from the row-major BF16 V. out = {count, first row, last row}.
+__global__ void k_vct_check(const uint16_t* __restrict__ vc,
+                            const uint16_t* __restrict__ vct,
+                            const int* __restrict__ ptab, int r1,
+                            unsigned* __restrict__ out) {
+  uint64_t gid = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+  if (gid >= (uint64_t)r1 * 512) return;
+  const int t = (int)(gid / 512), i = (int)(gid % 512), row = kv_row(ptab, t);
+  if (vct[((size_t)(row >> 2) * 512 + i) * 4 + (t & 3)] != vc[(size_t)row * 512 + i]) {
+    atomicAdd(&out[0], 1u);
+    atomicMin(&out[1], (unsigned)t);
+    atomicMax(&out[2], (unsigned)t);
+  }
+}
+// Zero the transposed-V slots of logical rows [r0, r1) (grid (r1-r0)*512/256).
+__global__ void k_vct_zero_slots(uint16_t* __restrict__ vct,
+                                 const int* __restrict__ ptab, int r0, int r1,
+                                 uint16_t val = 0) {
+  uint64_t gid = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+  if (gid >= (uint64_t)(r1 - r0) * 512) return;
+  const int t = r0 + (int)(gid / 512), i = (int)(gid % 512), row = kv_row(ptab, t);
+  if (val == 0xFFFF) {  // debug: per-element pseudo-random finite bf16 (+-2^-7..2^7)
+    unsigned h = (unsigned)(t * 512 + i) * 2654435761u;
+    h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
+    val = (uint16_t)((h & 0x807f) | ((0x78 + (h >> 8) % 15) << 7));
+  }
+  vct[((size_t)(row >> 2) * 512 + i) * 4 + (t & 3)] = val;
+}
+// Debug (GDEC_ATTN_HASH): order-independent hashes. Logical rows [r0, r1) of a
+// row-major bf16 cache (512 per row) / of the transposed V (per slot), and a
+// raw float buffer.
+__device__ __forceinline__ unsigned long long dbg_mix(unsigned long long x) {
+  x ^= x >> 31; x *= 0x9E3779B97F4A7C15ull; x ^= x >> 29; return x;
+}
+__global__ void k_dbg_hash_rows(const uint16_t* __restrict__ c, const uint16_t* __restrict__ vct,
+                                const int* __restrict__ ptab, int r0, int r1,
+                                unsigned long long* __restrict__ out) {
+  uint64_t gid = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+  if (gid >= (uint64_t)(r1 - r0) * 512) return;
+  const int t = r0 + (int)(gid / 512), i = (int)(gid % 512), row = kv_row(ptab, t);
+  const uint16_t v = vct ? vct[((size_t)(row >> 2) * 512 + i) * 4 + (t & 3)]
+                         : c[(size_t)row * 512 + i];
+  atomicAdd(out, dbg_mix(((unsigned long long)t * 512 + i) * 65537ull + v + 1));
+}
+__global__ void k_dbg_hash_f32(const float* __restrict__ x, uint64_t n,
+                               unsigned long long* __restrict__ out) {
+  uint64_t gid = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+  if (gid >= n) return;
+  atomicAdd(out, dbg_mix(gid * 0x100000001ull + __float_as_uint(x[gid]) + 1));
+}
+__global__ void k_dbg_hash_i32(const int* __restrict__ x, uint64_t n,
+                               unsigned long long* __restrict__ out) {
+  uint64_t gid = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+  if (gid >= n) return;
+  atomicAdd(out, dbg_mix(gid * 0x100000001ull + (unsigned)x[gid] + 1));
+}
+// Debug (GDEC_VCT_CHECK): non-finite bf16 values in n raw uint16 of vct.
+// out = {count, first physical row, last physical row}.
+__global__ void k_vct_nonfinite(const uint16_t* __restrict__ vct, uint64_t n,
+                                unsigned* __restrict__ out) {
+  uint64_t gid = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+  if (gid >= n) return;
+  if ((vct[gid] & 0x7f80u) == 0x7f80u) {
+    const unsigned row = (unsigned)((gid / 2048) * 4 + gid % 4);  // [blk][512][4]
+    atomicAdd(&out[0], 1u);
+    atomicMin(&out[1], row);
+    atomicMax(&out[2], row);
   }
 }
 

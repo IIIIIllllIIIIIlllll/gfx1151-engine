@@ -46,6 +46,10 @@ MAX_CONTEXT="${MAX_CONTEXT:-262144}"
 MTP_GAMMA="${MTP_GAMMA:-3}"
 KVSNAP_MAX_GB="${KVSNAP_MAX_GB:-20}"
 RCKPT_MAX="${RCKPT_MAX:-8}"
+# 分页 KV（见 service.conf）：默认开启，页池 = 一条 MAX_CONTEXT 序列。
+# Windows 的 95 GiB arena 在 256K 下没有余量，KV_POOL_TOKENS 保持 0。
+KV_PAGED="${KV_PAGED:-1}"
+KV_POOL_TOKENS="${KV_POOL_TOKENS:-0}"
 # 本机 68 GiB 权重 cold-load 实测 ~9 分钟（NVMe 弱盘），超时给足。
 START_TIMEOUT="${START_TIMEOUT:-1800}"
 
@@ -55,6 +59,8 @@ START_TIMEOUT="${START_TIMEOUT:-1800}"
 [[ "$MTP_GAMMA" =~ ^[1-8]$ ]] || fail 'MTP_GAMMA 范围为 1–8'
 [[ "$KVSNAP_MAX_GB" =~ ^(0|[1-9][0-9]*)$ ]] || fail 'KVSNAP_MAX_GB 必须为非负整数'
 [[ "$RCKPT_MAX" =~ ^(0|[1-9][0-9]*)$ ]] || fail 'RCKPT_MAX 必须为非负整数'
+[[ "$KV_PAGED" =~ ^[01]$ ]] || fail 'KV_PAGED 必须为 0 或 1'
+[[ "$KV_POOL_TOKENS" =~ ^(0|[1-9][0-9]*)$ && ${#KV_POOL_TOKENS} -le 8 ]] || fail 'KV_POOL_TOKENS 必须为非负整数'
 [[ -f build/gdec-win.exe ]] || fail '缺少 build/gdec-win.exe，请先运行 bash build_win.sh'
 [[ -f build/gdec-api-win.exe ]] || fail '缺少 build/gdec-api-win.exe，请先运行 bash build_win.sh api'
 [[ -r "$MODEL_FILE" ]] || fail "找不到模型：$MODEL_FILE"
@@ -71,6 +77,12 @@ done
 echo "项目：$ROOT"
 echo "模型：$MODEL_FILE"
 echo "配置：${MAX_CONTEXT} 上下文，MTP gamma=${MTP_GAMMA}，API ${API_HOST}:${API_PORT}"
+if (( KV_PAGED )); then
+  echo "KV：分页，页池 $(( (KV_POOL_TOKENS > MAX_CONTEXT ? KV_POOL_TOKENS : MAX_CONTEXT) )) token，RAM 检查点 ${RCKPT_MAX} 个"
+  (( KV_POOL_TOKENS <= MAX_CONTEXT )) || echo "警告：KV_POOL_TOKENS 大于 MAX_CONTEXT，Windows arena（95 GiB 上限）可能放不下，超出部分会回退 hipMalloc" >&2
+else
+  echo "KV：不分页（KV_PAGED=0）"
+fi
 if [[ "${1:-}" == --check ]]; then
   echo '检查通过；没有启动引擎或 API。'
   exit 0
@@ -86,6 +98,11 @@ export GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1
 if (( KVSNAP_MAX_GB )); then export GDEC_KVSNAP=1; else export GDEC_KVSNAP=0; fi
 export GDEC_KVSNAP_MAX_GB="$KVSNAP_MAX_GB" GDEC_RCKPT_MAX="$RCKPT_MAX"
 export GDEC_SPEC_GAMMA="$MTP_GAMMA"
+unset GDEC_KV_PAGED GDEC_KV_POOL_TOKENS
+if (( KV_PAGED )); then
+  export GDEC_KV_PAGED=1
+  if (( KV_POOL_TOKENS )); then export GDEC_KV_POOL_TOKENS="$KV_POOL_TOKENS"; fi
+fi
 
 mkdir -p logs
 ENGINE_LOG="logs/engine-win-$(date +%Y%m%d-%H%M%S).log"

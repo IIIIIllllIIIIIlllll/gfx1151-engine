@@ -822,8 +822,8 @@ int main() {
   // ---- 9d2. BTV transposed V cache: decode store + snapshot rebuild ----
   // k_store_kv_bf16(vct) must write slot pos%4 of block pos/4 with the same
   // bits as the row-major cache; k_bf16_rows_to_bt must reproduce the
-  // k_f32_to_bf16_v4_bt layout from the row-major cache for [r0, r1) and
-  // leave every other slot untouched.
+  // k_f32_to_bf16_v4_bt layout from the row-major cache for [r0, r1), zero
+  // the slots >= r1 of the trailing partial block and leave the rest untouched.
   {
     const int NT = 13, NB = (NT + 3) / 4;
     std::vector<float> v((size_t)NT * 512), kb(512);
@@ -862,8 +862,12 @@ int main() {
     };
     std::vector<uint16_t> ref = get16(dref, vt_n), st = get16(dst, vt_n);
     std::vector<uint16_t> vcd = get16(dvc, (size_t)NT * 512);
+    // slots >= NT of the trailing partial block: the prefill writer zeroes
+    // them (k_qsa_wmma<true> WMMA output depends on masked V bits), the
+    // decode store leaves them alone (next prefill rewrites from its base)
     double bad_st = 0;
-    for (size_t i = 0; i < vt_n; i++) bad_st += st[i] != ref[i];
+    for (size_t i = 0; i < vt_n; i++)
+      bad_st += (int)(i / 2048) * 4 + (int)(i % 4) < NT ? st[i] != ref[i] : ref[i] != 0;
     for (size_t i = 0; i < vcd.size(); i++) bad_st += vcd[i] != vrow[i];
     check("qsa_store_bf16_vct_bits", bad_st, 0);
     // rebuild a ragged sub-range [r0, r1) from the row-major cache
@@ -879,7 +883,9 @@ int main() {
         for (int s = 0; s < 4; s++) {
           const size_t o = ((size_t)b * 512 + i) * 4 + s;
           const int t = b * 4 + s;
-          const uint16_t e = (t >= r0 && t < r1) ? ref[o] : (uint16_t)0xEEEE;
+          const uint16_t e = t < r0 ? (uint16_t)0xEEEE
+                             : t < r1 ? ref[o]
+                             : b == (r1 - 1) / 4 ? (uint16_t)0 : (uint16_t)0xEEEE;
           bad_rb += reb[o] != e;
         }
     check("qsa_bt_rebuild_bits", bad_rb, 0);

@@ -1916,6 +1916,38 @@ struct GpuModel {
     gemm(wview(ckpt.at(buf)), d_qkvb + 4096, d_yb, P, 10240 /*row stride*/);
   }
 
+  // Debug (GDEC_ATTN_HASH): per prefill chunk and QSA layer, hashes of the
+  // attention inputs (K / V / transposed V over valid rows [0, base+P), the
+  // transposed-V tail slots [base+P, roundup4), q, selections) and the output.
+  void dbg_attn_hash(int qi, int base, int P, const uint16_t* kc, const uint16_t* vc,
+                     const uint16_t* vct) {
+    static unsigned long long* d_h = nullptr;
+    if (!d_h) CK(hipMalloc(&d_h, 8 * sizeof(unsigned long long)));
+    CK(hipMemsetAsync(d_h, 0, 8 * sizeof(unsigned long long), g_str));
+    const int r1 = base + P, r2 = (r1 + 3) & ~3, first = std::max(base, 2051);
+    auto g = [](uint64_t n) { return (unsigned)((n + 255) / 256); };
+    k_dbg_hash_rows<<<g((uint64_t)r1 * 512), 256, 0, g_str>>>(kc, nullptr, kvpt(), 0, r1, d_h + 0);
+    k_dbg_hash_rows<<<g((uint64_t)r1 * 512), 256, 0, g_str>>>(vc, nullptr, kvpt(), 0, r1, d_h + 1);
+    if (vct) {
+      k_dbg_hash_rows<<<g((uint64_t)r1 * 512), 256, 0, g_str>>>(nullptr, vct, kvpt(), 0, r1, d_h + 2);
+      if (r2 > r1)
+        k_dbg_hash_rows<<<g((uint64_t)(r2 - r1) * 512), 256, 0, g_str>>>(nullptr, vct, kvpt(), r1, r2,
+                                                                         d_h + 3);
+    }
+    k_dbg_hash_f32<<<g((uint64_t)P * 6144), 256, 0, g_str>>>(d_qsb, (uint64_t)P * 6144, d_h + 4);
+    if (base + P > first)
+      k_dbg_hash_i32<<<g((uint64_t)(base + P - first) * 512), 256, 0, g_str>>>(
+          d_iselected + (size_t)(first - base) * 512, (uint64_t)(base + P - first) * 512, d_h + 5);
+    k_dbg_hash_f32<<<g((uint64_t)P * 6144), 256, 0, g_str>>>(d_attnb, (uint64_t)P * 6144, d_h + 6);
+    unsigned long long h[8];
+    CK(hipStreamSynchronize(g_str));
+    CK(hipMemcpy(h, d_h, sizeof h, hipMemcpyDeviceToHost));
+    fprintf(stderr,
+            "[ahash] base=%d P=%d qsa%d K=%016llx V=%016llx Vt=%016llx tail=%016llx "
+            "q=%016llx sel=%016llx out=%016llx\n",
+            base, P, qi, h[0], h[1], h[2], h[3], h[4], h[5], h[6]);
+  }
+
   // QSA prefill flash over the KV cache: dense prefix plus the sparse tail.
   // base = absolute position of batch row 0 (0 for a fresh prefill; > 0 when
   // continuing from live KV/state). Dense rows are the batch-local prefix,
@@ -2060,6 +2092,10 @@ struct GpuModel {
       if (!kv_evict_one()) kv_fatal("pool exhausted", end);
     CK(hipMemcpy(d_ptab + m0, kv_seq.tab.data() + m0,
                  (size_t)(kv_seq.mapped - m0) * 4, hipMemcpyHostToDevice));
+    if (kv_zero_dbg)  // debug: fresh pages read as zeros, like a zeroed unpaged cache
+      for (int lp = m0; lp < kv_seq.mapped; lp++)
+        kv_page_regions(kv_seq.tab[(size_t)lp],
+                        [&](void* q, size_t n) { CK(hipMemset(q, 0, n)); });
     if (kv_mode == 2 && m0 == 0)
       fprintf(stderr, "[kvpage] seq map: logical 0 -> phys %d (free %d/%d)\n",
               kv_seq.tab[0], kv_pool.nfree(), kv_pool_pages);
@@ -2095,6 +2131,30 @@ struct GpuModel {
               old, p, kv_pool.nfree(), kv_pool_pages);
   }
   long long kv_cow_count = 0;
+  // GDEC_KV_ZERO=1 (debug, A5 hunt): no row a sequence has not written holds
+  // another sequence's data -- unpaged: the whole trunk KV/ik cache is zeroed
+  // on reset_state; paged: every freshly mapped page is zeroed. If outputs
+  // then agree across modes, some kernel reads rows >= pos and uses them.
+  // debug: GDEC_KV_ZERO=1 zeroes all of K/V/Vt/ik; or a subset of letters
+  // k v t i (e.g. GDEC_KV_ZERO=i) for the unpaged reset-time zeroing.
+  bool kv_zero_dbg = getenv("GDEC_KV_ZERO") != nullptr;
+  bool kv_zero_has(char c) {
+    const char* e = getenv("GDEC_KV_ZERO");
+    return e && (!strcmp(e, "1") || strchr(e, c));
+  }
+  void kv_zero_unpaged() {
+    const size_t nqsa = (size_t)(g_cfg.layers / 4), rows = nqsa * kv_layer_rows;
+    if (qsa_kv_fp32) {
+      if (kv_zero_has('k')) CK(hipMemset(d_kc, 0, rows * 512 * 4));
+      if (kv_zero_has('v')) CK(hipMemset(d_vc, 0, rows * 512 * 4));
+    } else {
+      if (kv_zero_has('k')) CK(hipMemset(d_kcb, 0, rows * 512 * 2));
+      if (kv_zero_has('v')) CK(hipMemset(d_vcb, 0, rows * 512 * 2));
+      if (qsa_wmma_btv && kv_zero_has('t'))
+        CK(hipMemset(d_vcbt, 0, nqsa * qsa_vt_blocks * 2 * 256 * 4 * 2));
+    }
+    if (d_ik && kv_zero_has('i')) CK(hipMemset(d_ik, 0, nqsa * ik_layer_blocks * 128 * 4));
+  }
   // A3: pin / unpin / adopt the live prefix for RAM checkpoints.
   std::vector<int> kv_pin(int pos) {
     if (!kv_paged) return {};
@@ -2317,6 +2377,29 @@ struct GpuModel {
         uint16_t* kc = d_kcb + qsa_off;
         uint16_t* vc = d_vcb + qsa_off;
         uint16_t* vct = vct_layer(qi);
+        if (vct && base > 0 && getenv("GDEC_VCT_CHECK")) {  // debug only
+          static unsigned* d_chk = nullptr;
+          if (!d_chk) CK(hipMalloc(&d_chk, 3 * sizeof(unsigned)));
+          const unsigned init[3] = {0u, ~0u, 0u};
+          unsigned h[3];
+          CK(hipMemcpy(d_chk, init, sizeof init, hipMemcpyHostToDevice));
+          k_vct_check<<<(unsigned)(((size_t)base * 512 + 255) / 256), 256, 0, g_str>>>(
+              vc, vct, kvpt(), base, d_chk);
+          CK(hipStreamSynchronize(g_str));
+          CK(hipMemcpy(h, d_chk, sizeof h, hipMemcpyDeviceToHost));
+          if (h[0] || qi == 0)
+            fprintf(stderr, "[vctchk] qsa%d base=%d P=%d mismatch=%u first=%d last=%d\n",
+                    qi, base, P, h[0], h[0] ? (int)h[1] : -1, h[0] ? (int)h[2] : -1);
+          const uint64_t nraw = (uint64_t)qsa_vt_blocks * 2 * 256 * 4;
+          CK(hipMemcpy(d_chk, init, sizeof init, hipMemcpyHostToDevice));
+          k_vct_nonfinite<<<(unsigned)((nraw + 255) / 256), 256, 0, g_str>>>(vct, nraw,
+                                                                            d_chk);
+          CK(hipStreamSynchronize(g_str));
+          CK(hipMemcpy(h, d_chk, sizeof h, hipMemcpyDeviceToHost));
+          if (h[0] || qi == 0)
+            fprintf(stderr, "[vctnan] qsa%d base=%d nonfinite=%u phys rows %d..%d\n", qi,
+                    base, h[0], h[0] ? (int)h[1] : -1, h[0] ? (int)h[2] : -1);
+        }
         if (!kv_paged) {
           k_qsa_kprep<true><<<dim3(2, P), 256, 0, g_str>>>(
               d_kbb, knw, d_kbb, kc + (size_t)base * 512, g_cfg.norm_eps, base,
@@ -2354,7 +2437,15 @@ struct GpuModel {
                                    256, 0, g_str>>>(d_vbb + so, vct, 512, n, 512, pr);
           });
         }
+        if (vct && getenv("GDEC_VCT_TAILZERO") && ((base + P) & 3)) {  // debug only
+          const int r0 = base + P, r1 = (r0 + 3) & ~3;
+          const char* tv = getenv("GDEC_VCT_TAILVAL");  // hex bf16 poison (debug)
+          k_vct_zero_slots<<<(unsigned)(((size_t)(r1 - r0) * 512 + 255) / 256), 256, 0,
+                             g_str>>>(vct, kvpt(), r0, r1,
+                                      tv ? (uint16_t)strtoul(tv, nullptr, 16) : 0);
+        }
         qsa_flash_b(kc, vc, P, dense_P, base, vct, kvpt());
+        if (base > 0 && getenv("GDEC_ATTN_HASH")) dbg_attn_hash(qi, base, P, kc, vc, vct);
       }
       k_sigmoid_gate<<<(P * 6144 + 255) / 256, 256, 0, g_str>>>(d_attnb, d_gsb,
                                                                 d_attnb, P * 6144);
@@ -5149,6 +5240,7 @@ struct GpuModel {
     CK(hipMemsetAsync(d_ring, 0, (size_t)9 * 10240 * 4, 0));
     CK(hipDeviceSynchronize());
     kv_trim(0);  // A2: the next sequence maps its pages from scratch
+    if (kv_zero_dbg && !kv_paged) kv_zero_unpaged();
   }
 
   int forward(int token) {

@@ -334,6 +334,9 @@ int main(int argc, char** argv) {
     const int mtp_gamma = cfg_int("MTP_GAMMA", 3, 1, 8);
     const int kvsnap_max_gb = cfg_int("KVSNAP_MAX_GB", 20, 0, 1 << 16);
     const int rckpt_max = cfg_int("RCKPT_MAX", 8, 0, 1 << 16);
+    // 分页 KV（见 service.conf）：默认开启，页池 = 一条 MAX_CONTEXT 序列。
+    const int kv_paged = cfg_int("KV_PAGED", 1, 0, 1);
+    const int kv_pool_tokens = cfg_int("KV_POOL_TOKENS", 0, 0, 1 << 24);
     const int start_timeout = env_int("START_TIMEOUT", 1800, 30, 86400);
 
     if (engine_port == api_port) fail("ENGINE_PORT 与 API_PORT 必须不同");
@@ -357,6 +360,15 @@ int main(int argc, char** argv) {
     printf("模型：%s\n", model_file.c_str());
     printf("配置：%d 上下文，MTP gamma=%d，API %s:%d\n", max_context, mtp_gamma,
            api_host.c_str(), api_port);
+    if (kv_paged) {
+        printf("KV：分页，页池 %d token，RAM 检查点 %d 个\n",
+               kv_pool_tokens > max_context ? kv_pool_tokens : max_context, rckpt_max);
+        if (kv_pool_tokens > max_context)
+            fprintf(stderr, "警告：KV_POOL_TOKENS 大于 MAX_CONTEXT，Windows arena"
+                            "（95 GiB 上限）可能放不下，超出部分会回退 hipMalloc\n");
+    } else {
+        printf("KV：不分页（KV_PAGED=0）\n");
+    }
     if (argc > 1 && strcmp(argv[1], "--check") == 0) {
         printf("检查通过；没有启动引擎或 API。\n");
         return 0;
@@ -377,6 +389,12 @@ int main(int argc, char** argv) {
                             std::to_string(kvsnap_max_gb).c_str());
     SetEnvironmentVariableA("GDEC_RCKPT_MAX", std::to_string(rckpt_max).c_str());
     SetEnvironmentVariableA("GDEC_SPEC_GAMMA", std::to_string(mtp_gamma).c_str());
+    // 只在开启时设置；关闭时删掉外部环境的残留值（引擎子进程继承本进程环境）。
+    SetEnvironmentVariableA("GDEC_KV_PAGED", kv_paged ? "1" : nullptr);
+    SetEnvironmentVariableA("GDEC_KV_POOL_TOKENS",
+                            kv_paged && kv_pool_tokens
+                                ? std::to_string(kv_pool_tokens).c_str()
+                                : nullptr);
 
     CreateDirectoryA("logs", nullptr);
     SYSTEMTIME st;

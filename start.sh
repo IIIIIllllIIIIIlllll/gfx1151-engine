@@ -11,6 +11,9 @@ case "${1:-}" in
   *) fail '用法：bash start.sh [--check]' ;;
 esac
 source "$ROOT/service.conf"
+# 旧版 service.conf 没有这两项时的缺省值（与 service.conf 相同）
+KV_PAGED="${KV_PAGED:-1}"
+KV_POOL_TOKENS="${KV_POOL_TOKENS:-0}"
 if [[ -f "$ROOT/build/bundled-runtime.conf" ]]; then
   # --bundle 产物优先使用随包库；kernel db 使用绝对路径，不依赖 cwd。
   [[ -d "$ROOT/build/lib" ]] || fail '缺少 build/lib，请重新运行 bash build.sh --bundle'
@@ -29,11 +32,12 @@ for key in ENGINE_PORT API_PORT MAX_CONTEXT MTP_GAMMA MEMORY_CAP_GB MIN_AVAILABL
   value="${!key}"
   [[ "$value" =~ ^[1-9][0-9]*$ && ${#value} -le 8 ]] || fail "$key 必须为正整数"
 done
-for key in KVSNAP_MAX_GB RCKPT_MAX; do
+for key in KVSNAP_MAX_GB RCKPT_MAX KV_POOL_TOKENS; do
   value="${!key}"
   [[ "$value" =~ ^(0|[1-9][0-9]*)$ && ${#value} -le 8 ]] || fail "$key 必须为非负整数"
 done
 [[ "$PLE_URING" =~ ^[01]$ ]] || fail 'PLE_URING 必须为 0 或 1'
+[[ "$KV_PAGED" =~ ^[01]$ ]] || fail 'KV_PAGED 必须为 0 或 1'
 (( ENGINE_PORT <= 65535 && API_PORT <= 65535 && ENGINE_PORT != API_PORT )) || fail '端口必须为不同的 1–65535 整数'
 (( MTP_GAMMA <= 8 )) || fail 'MTP_GAMMA 范围为 1–8'
 for cmd in flock ss systemctl stat awk pgrep setsid; do command -v "$cmd" >/dev/null || fail "缺少命令：$cmd"; done
@@ -52,10 +56,54 @@ if processes="$(pgrep -af '(^|/)(gdec[^/[:space:]]*|flash_serve|serve_api\.py)([
 fi
 available="$(awk '/MemAvailable:/{print int($2/1048576)}' /proc/meminfo)"
 (( available >= MIN_AVAILABLE_GB )) || fail "可用内存 ${available} GiB，要求至少 ${MIN_AVAILABLE_GB} GiB"
+# Existing production options; no closed-source modules or experimental paths.
+# （放在 --check 之前：--check 会打印这些变量，tools/a5_verify.sh 据此复现生产环境）
+export GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1
+# 自写 WMMA dense GEMM（Phase 3g）：8K +2%、32K +3%，对拍 8049 token 仅尾部分歧 4 个。
+export GDEC_GEMM_WMMA=1
+#export GDEC_PROF=1        # 临时诊断：每个 prefill chunk 打印 ple_host/ple_wait 等耗时
+# GDN 融合持久化 kernel（Phase 3c）：intra+strip 全融合、ws 不落 DRAM，kernel 3.34×，
+# 8K +5.7%、32K +4.4%，ids 对拍 8054 token 0 分歧。与 GDEC_GDN_PIPE2 互斥（fused 优先）。
+export GDEC_GDN_FUSED=1
+export GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1
+export GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 GDEC_NOWARMUP=1
+# 32768: 32K prompt 单 chunk 实测 +7.4%（1155 vs 1076 tok/s）；65536 超内存 PSI 上限。
+# 32768性能最佳但是吃的显存太多，8192吃的最少但是性能最差，16384折中一下，性能损失不大，吃的显存更少
+export GDEC_PREFILL_CHUNK=16384
+export GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1
+if (( KVSNAP_MAX_GB )); then export GDEC_KVSNAP=1; else export GDEC_KVSNAP=0; fi
+# PLE io_uring 聚集由 service.conf 的 PLE_URING 控制；引擎只查 GDEC_PLE_URING
+# 的存在性（设 0 也会开），故 0 时必须不导出。
+if (( PLE_URING )); then export GDEC_PLE_URING=1; fi
+export GDEC_KVSNAP_MAX_GB="$KVSNAP_MAX_GB"
+export GDEC_RCKPT_MAX="$RCKPT_MAX"
+# 分页 KV（A5 起默认开启）。引擎按 atoi 解析，0 即关闭；这里仍然只在开启时导出，
+# 并清掉外部环境里可能残留的值，保证 service.conf 说了算。
+unset GDEC_KV_PAGED GDEC_KV_POOL_TOKENS
+if (( KV_PAGED )); then
+  export GDEC_KV_PAGED=1
+  if (( KV_POOL_TOKENS )); then export GDEC_KV_POOL_TOKENS="$KV_POOL_TOKENS"; fi
+fi
+# --serve reads GDEC_SPEC_GAMMA; --gamma is for offline --spec-gen.
+export GDEC_SPEC_GAMMA="$MTP_GAMMA"
+engine=("$ROOT/build/gdec" "$MODEL_FILE")
+[[ -z "$OVERLAY_FILE" ]] || engine+=("$OVERLAY_FILE")
+[[ -z "$MTP_FILE" ]] || engine+=("$MTP_FILE")
+engine+=(--serve --port "$ENGINE_PORT" --maxctx "$MAX_CONTEXT")
+[[ -z "$VISION_FILE" ]] || engine+=(--vision-tower "$VISION_FILE")
+
 echo "项目：$ROOT"
 echo "模型：$MODEL_FILE"
 echo "配置：${MAX_CONTEXT} 上下文，MTP gamma=${MTP_GAMMA}，API ${API_HOST}:${API_PORT}"
+if (( KV_PAGED )); then
+  echo "KV：分页，页池 $(( (KV_POOL_TOKENS > MAX_CONTEXT ? KV_POOL_TOKENS : MAX_CONTEXT) )) token，RAM 检查点 ${RCKPT_MAX} 个"
+else
+  echo "KV：不分页（KV_PAGED=0）"
+fi
 if [[ "${1:-}" == --check ]]; then
+  # 机器可读：引擎环境变量与命令行（tools/a5_verify.sh 解析这两段）
+  env | grep '^GDEC_' | sort | sed 's/^/ENV /'
+  printf 'CMD'; printf ' %q' "${engine[@]}"; echo
   echo '检查通过；没有启动引擎或 API。'
   exit 0
 fi
@@ -99,33 +147,6 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-# Existing production options; no closed-source modules or experimental paths.
-export GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1
-# 自写 WMMA dense GEMM（Phase 3g）：8K +2%、32K +3%，对拍 8049 token 仅尾部分歧 4 个。
-export GDEC_GEMM_WMMA=1
-#export GDEC_PROF=1        # 临时诊断：每个 prefill chunk 打印 ple_host/ple_wait 等耗时
-# GDN 融合持久化 kernel（Phase 3c）：intra+strip 全融合、ws 不落 DRAM，kernel 3.34×，
-# 8K +5.7%、32K +4.4%，ids 对拍 8054 token 0 分歧。与 GDEC_GDN_PIPE2 互斥（fused 优先）。
-export GDEC_GDN_FUSED=1
-export GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1
-export GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 GDEC_NOWARMUP=1
-# 32768: 32K prompt 单 chunk 实测 +7.4%（1155 vs 1076 tok/s）；65536 超内存 PSI 上限。
-# 32768性能最佳但是吃的显存太多，8192吃的最少但是性能最差，16384折中一下，性能损失不大，吃的显存更少
-export GDEC_PREFILL_CHUNK=16384
-export GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1
-if (( KVSNAP_MAX_GB )); then export GDEC_KVSNAP=1; else export GDEC_KVSNAP=0; fi
-# PLE io_uring 聚集由 service.conf 的 PLE_URING 控制；引擎只查 GDEC_PLE_URING
-# 的存在性（设 0 也会开），故 0 时必须不导出。
-if (( PLE_URING )); then export GDEC_PLE_URING=1; fi
-export GDEC_KVSNAP_MAX_GB="$KVSNAP_MAX_GB"
-export GDEC_RCKPT_MAX="$RCKPT_MAX"
-# --serve reads GDEC_SPEC_GAMMA; --gamma is for offline --spec-gen.
-export GDEC_SPEC_GAMMA="$MTP_GAMMA"
-engine=("$ROOT/build/gdec" "$MODEL_FILE")
-[[ -z "$OVERLAY_FILE" ]] || engine+=("$OVERLAY_FILE")
-[[ -z "$MTP_FILE" ]] || engine+=("$MTP_FILE")
-engine+=(--serve --port "$ENGINE_PORT" --maxctx "$MAX_CONTEXT")
-[[ -z "$VISION_FILE" ]] || engine+=(--vision-tower "$VISION_FILE")
 echo "加载模型中，日志：$ENGINE_LOG；Ctrl+C 停止。"
 setsid bash tools/run_capped.sh "$MEMORY_CAP_GB" -- "${engine[@]}" >"$ENGINE_LOG" 2>&1 9>&- 8>&- &
 engine_pid=$!
