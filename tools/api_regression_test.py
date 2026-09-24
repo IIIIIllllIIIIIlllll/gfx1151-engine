@@ -51,6 +51,8 @@ def parse_sse(raw):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="http://127.0.0.1:18731")
+    parser.add_argument("--slots", type=int, default=1,
+                        help="the fake engine's --slots (concurrent generations)")
     args = parser.parse_args()
 
     tiny_png = (
@@ -316,18 +318,42 @@ def main():
     })
     check(status == 200, "engine-auto-reconnect-next-request", raw[:300])
 
+    status, _, raw = get(args.base, "/health")
+    check(status == 200 and json.loads(raw).get("slots") == args.slots,
+          "health-slots", raw[:300])
+
+    # the aborted-mid-decode failure (shared KV pool full) is a 503; streamed,
+    # an SSE error event after the first token
+    status, _, raw = request(args.base, "/v1/completions", {
+        "prompt": "x", "temperature": 1, "seed": 5150, "max_tokens": 4,
+    })
+    check(status == 503 and b"aborted" in raw, "engine-aborted-503", raw[:300])
+    status, _, raw = request(args.base, "/v1/completions", {
+        "prompt": "x", "temperature": 1, "seed": 5150, "max_tokens": 4, "stream": True,
+    })
+    check(status == 200 and b"aborted" in raw and b'"error"' in raw,
+          "engine-aborted-stream-error", raw[:500])
+
+    # `slots` slow requests run side by side; one more waits for a free slot
     slow_result = []
-    slow = threading.Thread(target=lambda: slow_result.append(request(args.base, "/v1/completions", {
-        "prompt": "x", "temperature": 1, "seed": 31337, "max_tokens": 2,
-    })))
-    slow.start()
+
+    def slow_request():
+        slow_result.append(request(args.base, "/v1/completions", {
+            "prompt": "x", "temperature": 1, "seed": 31337, "max_tokens": 2,
+        }))
+    slow = [threading.Thread(target=slow_request) for _ in range(args.slots)]
+    t0 = time.monotonic()
+    for thread in slow:
+        thread.start()
     time.sleep(0.25)
     started = time.monotonic()
     status, _, raw = request(args.base, "/v1/completions", {
         "prompt": "x", "temperature": 0, "max_tokens": 2, "stream": True,
     })
     elapsed = time.monotonic() - started
-    slow.join()
+    for thread in slow:
+        thread.join()
+    slow_wall = time.monotonic() - t0
     events = parse_sse(raw) if status == 200 else []
     empty_wait = any(
         isinstance(event, dict)
@@ -338,7 +364,9 @@ def main():
     )
     check(status == 200 and elapsed >= 1.5 and empty_wait,
           "engine-queued-stream-heartbeat", raw[:500])
-    check(slow_result and slow_result[0][0] == 200, "engine-queued-owner-completes")
+    check(len(slow_result) == args.slots and all(r[0] == 200 for r in slow_result),
+          "engine-queued-owner-completes")
+    check(slow_wall < 3.5, "engine-slots-run-concurrently", f"{slow_wall:.1f}s")
 
     print("RESULT PASS")
 

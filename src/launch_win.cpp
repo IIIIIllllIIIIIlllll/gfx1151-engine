@@ -337,9 +337,12 @@ int main(int argc, char** argv) {
     // 分页 KV（见 service.conf）：默认开启，页池 = 一条 MAX_CONTEXT 序列。
     const int kv_paged = cfg_int("KV_PAGED", 1, 0, 1);
     const int kv_pool_tokens = cfg_int("KV_POOL_TOKENS", 0, 0, 1 << 24);
+    // 并发请求数（见 service.conf）：几条序列共享同一个页池，需要分页 KV。
+    const int parallel = cfg_int("PARALLEL", 1, 1, 8);
     const int start_timeout = env_int("START_TIMEOUT", 1800, 30, 86400);
 
     if (engine_port == api_port) fail("ENGINE_PORT 与 API_PORT 必须不同");
+    if (parallel > 1 && !kv_paged) fail("PARALLEL>1 需要 KV_PAGED=1");
     if (!file_exists("build\\gdec-win.exe")) fail("缺少 build\\gdec-win.exe");
     if (!file_exists("build\\gdec-api-win.exe")) fail("缺少 build\\gdec-api-win.exe");
     if (!file_exists(model_file)) fail("找不到模型：" + model_file + "（修改 service.conf）");
@@ -361,8 +364,12 @@ int main(int argc, char** argv) {
     printf("配置：%d 上下文，MTP gamma=%d，API %s:%d\n", max_context, mtp_gamma,
            api_host.c_str(), api_port);
     if (kv_paged) {
-        printf("KV：分页，页池 %d token，RAM 检查点 %d 个\n",
-               kv_pool_tokens > max_context ? kv_pool_tokens : max_context, rckpt_max);
+        printf("KV：分页，页池 %d token（%d 路并发共享），RAM 检查点 %d 个\n",
+               kv_pool_tokens > max_context ? kv_pool_tokens : max_context, parallel,
+               rckpt_max);
+        if (parallel > 1)
+            fprintf(stderr, "提示：每多一路并发约多占 0.65 GiB 设备内存，arena"
+                            "（95 GiB 上限）放不下的部分会回退 hipMalloc\n");
         if (kv_pool_tokens > max_context)
             fprintf(stderr, "警告：KV_POOL_TOKENS 大于 MAX_CONTEXT，Windows arena"
                             "（95 GiB 上限）可能放不下，超出部分会回退 hipMalloc\n");
@@ -395,6 +402,7 @@ int main(int argc, char** argv) {
                             kv_paged && kv_pool_tokens
                                 ? std::to_string(kv_pool_tokens).c_str()
                                 : nullptr);
+    SetEnvironmentVariableA("GDEC_PARALLEL", std::to_string(parallel).c_str());
 
     CreateDirectoryA("logs", nullptr);
     SYSTEMTIME st;

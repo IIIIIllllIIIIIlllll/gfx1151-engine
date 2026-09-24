@@ -1,3 +1,11 @@
+// Concurrent serve (GDEC_PARALLEL > 1): thrown by kv_reserve / kv_cow when the
+// shared KV pool cannot back this sequence's rows (the later request loses),
+// and by the serve yield hook when another request aborted this one. Always
+// raised before any device write of the step, so the slot can simply reset.
+struct KvOverflow : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
 struct GpuModel {
   const Checkpoint& ckpt;
   bool ple_on = true;
@@ -69,6 +77,16 @@ struct GpuModel {
   int kv_pool_pages = 0;        // allocatable physical pages (kv_pool_pages_for)
   int kv_mode = 0;              // GDEC_KV_PAGED value (2 = self-test logging)
   bool (*kv_evict_fn)(GpuModel&) = nullptr;  // A3: drop one pinned checkpoint
+  // Concurrent serve: called once no checkpoint is left to evict. Frees pages
+  // held by other sequence slots (true -> retry) or throws KvOverflow.
+  bool (*kv_starve_fn)(GpuModel&) = nullptr;
+  // Concurrent serve: GPU hand-off point between sequence slots (nullptr =
+  // single sequence). Called only where no round-local state is live: spec
+  // round tops, between prompt prefill chunks, between serial decode steps.
+  void (*yield_fn)(GpuModel&) = nullptr;
+  void yield_point() {
+    if (yield_fn) yield_fn(*this);
+  }
   size_t kv_layer_rows = 0;     // per-layer KV row stride (== maxctx unpaged)
   size_t ik_layer_blocks = 0;   // per-layer d_ik block stride (== index_blocks unpaged)
   int* d_ptab = nullptr;        // [kv_lpages] live logical page -> physical page
@@ -1159,6 +1177,33 @@ struct GpuModel {
   // 指针全程静态,图捕获照常。
   // (2026-09-12 staging 方案曾记"裸指针 Memory Fault",与今日实测矛盾;
   //  当时 fault 应另有原因,本路径以 oracle 验证为准。)
+  // Single-token routed down projection (trunk decode + MTP draft) into
+  // d_moeacc. The atomic kernel sums the 10 expert partials in wave-schedule
+  // order, so a decode step was not bit-reproducible: timing changes (another
+  // slot's work in between, a debug sync) flipped near-tie tokens thousands of
+  // steps later. The top-k kernel keeps the partials in registers and sums in
+  // expert order, overwriting every row (no memset). GDEC_MOE_DOWN_ATOMIC /
+  // GDEC_MOE_ATOMIC restore the old path.
+  bool moe_down_direct(int k, const WView& dn) const {
+    return moe_down_topk && k == 10 && dn.cols == 640;
+  }
+  void moe_down1(int k, const WView& dn, const int* topids) {
+    if (moe_down_direct(k, dn)) {
+      const uint64_t row_pairs = (g_cfg.d + 1) / 2, warps_per_block = 128 / 32;
+      k_q4cp_gemv_gd_topk_h16<10><<<(unsigned)((row_pairs + warps_per_block - 1) / warps_per_block),
+                                    128, 0, g_str>>>(
+          dn.data + 64, dn.data + 64 + dn.rows * dn.cols / 2, (const float*)dn.data, d_hid,
+          d_moeacc, topids, d_topw, (uint64_t)g_cfg.d, dn.cols, dn.scale_stride,
+          (uint64_t)g_cfg.moe_mid, 1, 16 /*id_stride*/, (uint64_t)g_cfg.d);
+      return;
+    }
+    // v3 kernel: 2 rows per warp -> k * (d/2) warp-pairs
+    uint64_t pairs = (uint64_t)k * ((g_cfg.d + 1) / 2);
+    k_q4cp_gemv_gd<<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
+        dn.data + 64, dn.data + 64 + dn.rows * dn.cols / 2, (const float*)dn.data, d_hid,
+        d_moeacc, topids, d_topw, (uint64_t)g_cfg.d, dn.cols, dn.scale_stride,
+        (uint64_t)g_cfg.moe_mid, k, 16 /*id_stride*/, 0 /*acc_stride*/, k);
+  }
   void moe(int l, const float* x, float* y) {
     char buf[128];
     snprintf(buf, sizeof buf, "layers.%d.mlp.gate.weight", l);
@@ -1175,11 +1220,11 @@ struct GpuModel {
       fprintf(stderr, "\n");
     }
 
-    CK(hipMemsetAsync(d_moeacc, 0, g_cfg.d * 4, g_str));
     snprintf(buf, sizeof buf, "layers.%d.mlp.experts.gate_up_proj.weight", l);
     WView gu = wview(ckpt.at(buf));
     snprintf(buf, sizeof buf, "layers.%d.mlp.experts.down_proj.weight", l);
     WView dn = wview(ckpt.at(buf));
+    if (!moe_down_direct(k, dn)) CK(hipMemsetAsync(d_moeacc, 0, g_cfg.d * 4, g_str));
     const int* topids = d_topids;  // 直读:ids 即专家号,免 D2H 同步
     // fused experts: one grouped launch each for gate_up / silu / down+accum
     {
@@ -1191,14 +1236,7 @@ struct GpuModel {
           0 /*x_stride*/, 16 /*id_stride*/, k);
     }
     k_silu_mul_g<<<(k * g_cfg.moe_mid + 255) / 256, 256, 0, g_str>>>(d_guv, d_hid, g_cfg.moe_mid, k);
-    {
-      // v3 kernel: 2 rows per warp -> k * (d/2) warp-pairs
-      uint64_t pairs = (uint64_t)k * ((g_cfg.d + 1) / 2);
-      k_q4cp_gemv_gd<<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
-          dn.data + 64, dn.data + 64 + dn.rows * dn.cols / 2, (const float*)dn.data, d_hid,
-          d_moeacc, topids, d_topw, (uint64_t)g_cfg.d, dn.cols, dn.scale_stride,
-          (uint64_t)g_cfg.moe_mid, k, 16 /*id_stride*/, 0 /*acc_stride*/, k);
-    }
+    moe_down1(k, dn, topids);
     // shared expert
     snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
     gemv(wview(ckpt.at(buf)), x, d_guv);
@@ -2100,7 +2138,9 @@ struct GpuModel {
   // reserves fresh rows itself. New entries were guard entries that no
   // in-flight kernel reads, so the table upload needs no extra sync.
   // A3: drop the LRU pinned checkpoint; false when there is none left.
-  bool kv_evict_one() { return kv_evict_fn && kv_evict_fn(*this); }
+  bool kv_evict_one() {
+    return (kv_evict_fn && kv_evict_fn(*this)) || (kv_starve_fn && kv_starve_fn(*this));
+  }
   [[noreturn]] void kv_fatal(const char* what, int end) {
     fprintf(stderr,
             "[kvpage] FATAL: %s (%d tokens; pool %d pages, %d free, table %d "
@@ -2119,8 +2159,9 @@ struct GpuModel {
                  (size_t)(kv_seq.mapped - m0) * 4, hipMemcpyHostToDevice));
     if (kv_zero_dbg)  // debug: fresh pages read as zeros, like a zeroed unpaged cache
       for (int lp = m0; lp < kv_seq.mapped; lp++)
-        kv_page_regions(kv_seq.tab[(size_t)lp],
-                        [&](void* q, size_t n) { CK(hipMemset(q, 0, n)); });
+        kv_page_regions_k(kv_seq.tab[(size_t)lp], [&](void* q, size_t n, char c) {
+          if (kv_zero_has(c)) CK(hipMemset(q, 0, n));
+        });
     if (kv_mode == 2 && m0 == 0)
       fprintf(stderr, "[kvpage] seq map: logical 0 -> phys %d (free %d/%d)\n",
               kv_seq.tab[0], kv_pool.nfree(), kv_pool_pages);
@@ -2161,7 +2202,7 @@ struct GpuModel {
   // on reset_state; paged: every freshly mapped page is zeroed. If outputs
   // then agree across modes, some kernel reads rows >= pos and uses them.
   // debug: GDEC_KV_ZERO=1 zeroes all of K/V/Vt/ik; or a subset of letters
-  // k v t i (e.g. GDEC_KV_ZERO=i) for the unpaged reset-time zeroing.
+  // k v t i (e.g. GDEC_KV_ZERO=i), for both the unpaged and the paged zeroing.
   bool kv_zero_dbg = getenv("GDEC_KV_ZERO") != nullptr;
   bool kv_zero_has(char c) {
     const char* e = getenv("GDEC_KV_ZERO");
@@ -2240,23 +2281,28 @@ struct GpuModel {
   // Physical page `page`'s slice of every paged buffer, in a fixed order.
   template <typename F>
   void kv_page_regions(int page, F&& fn) {
+    kv_page_regions_k(page, [&](void* q, size_t n, char) { fn(q, n); });
+  }
+  // Same, fn(device ptr, bytes, kind) with kind k / v / t (transposed V) / i.
+  template <typename F>
+  void kv_page_regions_k(int page, F&& fn) {
     const int nqsa = g_cfg.layers / 4;
     const size_t g = (size_t)page;
     for (int qi = 0; qi < nqsa; qi++) {
       const size_t row0 = (size_t)qi * kv_layer_rows + g * KV_PAGE;
       if (qsa_kv_fp32) {
-        fn(d_kc + row0 * 512, (size_t)KV_PAGE * 512 * 4);
-        fn(d_vc + row0 * 512, (size_t)KV_PAGE * 512 * 4);
+        fn(d_kc + row0 * 512, (size_t)KV_PAGE * 512 * 4, 'k');
+        fn(d_vc + row0 * 512, (size_t)KV_PAGE * 512 * 4, 'v');
       } else {
-        fn(d_kcb + row0 * 512, (size_t)KV_PAGE * 512 * 2);
-        fn(d_vcb + row0 * 512, (size_t)KV_PAGE * 512 * 2);
+        fn(d_kcb + row0 * 512, (size_t)KV_PAGE * 512 * 2, 'k');
+        fn(d_vcb + row0 * 512, (size_t)KV_PAGE * 512 * 2, 'v');
         if (qsa_wmma_btv)
           fn(vct_layer(qi) + g * KV_PAGE_BLOCKS * 2 * 256 * 4,
-             (size_t)KV_PAGE_BLOCKS * 2 * 256 * 4 * 2);
+             (size_t)KV_PAGE_BLOCKS * 2 * 256 * 4 * 2, 't');
       }
       if (d_ik)
         fn(d_ik + ((size_t)qi * ik_layer_blocks + g * KV_PAGE_BLOCKS) * 128,
-           (size_t)KV_PAGE_BLOCKS * 128 * 4);
+           (size_t)KV_PAGE_BLOCKS * 128 * 4, 'i');
     }
   }
   bool kv_guard_dirty() {
@@ -3232,6 +3278,9 @@ struct GpuModel {
         }
       }
       off += n;
+      // Concurrent serve: prompt prefill hands the GPU over between chunks
+      // (only persistent slot state is live here; spec verify never yields).
+      if (prog_total > 0 && off < N) yield_point();
     }
     return id;
   }
@@ -3672,11 +3721,11 @@ struct GpuModel {
     int k = g_cfg.topk;
     k_router_topk<<<1, 512, 0, g_str>>>(d_router, d_topids, d_topw, g_cfg.experts,
                                         k);
-    CK(hipMemsetAsync(d_moeacc, 0, g_cfg.d * 4, g_str));
     snprintf(buf, sizeof buf, "%s.experts.gate_up_proj.weight", pfx);
     WView gu = wview(ckpt.at(buf));
     snprintf(buf, sizeof buf, "%s.experts.down_proj.weight", pfx);
     WView dn = wview(ckpt.at(buf));
+    if (!moe_down_direct(k, dn)) CK(hipMemsetAsync(d_moeacc, 0, g_cfg.d * 4, g_str));
     const int* topids = d_topids;  // 直读:ids 即专家号,免 D2H 同步
     uint64_t pairs = (uint64_t)k * g_cfg.moe_mid;
     k_q4cp_gemv_gg<<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
@@ -3685,12 +3734,7 @@ struct GpuModel {
         k, 0 /*x_stride*/, 16 /*id_stride*/, k);
     k_silu_mul_g<<<(k * g_cfg.moe_mid + 255) / 256, 256, 0, g_str>>>(
         d_guv, d_hid, g_cfg.moe_mid, k);
-    uint64_t pairs2 = (uint64_t)k * ((g_cfg.d + 1) / 2);
-    k_q4cp_gemv_gd<<<(unsigned)((pairs2 + 15) / 16), 512, 0, g_str>>>(
-        dn.data + 64, dn.data + 64 + dn.rows * dn.cols / 2, (const float*)dn.data,
-        d_hid, d_moeacc, topids, d_topw, (uint64_t)g_cfg.d, dn.cols,
-        dn.scale_stride, (uint64_t)g_cfg.moe_mid, k, 16 /*id_stride*/,
-        0 /*acc_stride*/, k);
+    moe_down1(k, dn, topids);
     snprintf(buf, sizeof buf, "%s.shared_expert.gate_proj.weight", pfx);
     gemv(wview(ckpt.at(buf)), x, d_guv);
     snprintf(buf, sizeof buf, "%s.shared_expert.up_proj.weight", pfx);
@@ -4173,6 +4217,7 @@ struct GpuModel {
       if (!ple_on) chist.insert(chist.end(), tokens.begin(), tokens.end());
     };
     while ((int)out.size() < gen && pos < maxctx) {
+      yield_point();  // round top: only persistent slot state is live
       if (chist.size() != (size_t)pos)
         throw std::runtime_error("ngram: token history and trunk position disagree");
       ngram.observe(chist);
@@ -4279,6 +4324,7 @@ struct GpuModel {
     };
     auto T0 = std::chrono::steady_clock::now();
     while ((int)out.size() < gen) {
+      yield_point();  // round top: mtp_pos == pos-1, d_R == h_{pos-1}
       int q = pos - 1;  // trunk processed through q
       int g = std::min(gamma, gen - (int)out.size());
       size_t chist_sz = chist.size();
@@ -4441,6 +4487,7 @@ struct GpuModel {
     };
     auto T0 = std::chrono::steady_clock::now();
     while ((int)out.size() < gen && pos < maxctx) {
+      yield_point();  // round top: only persistent slot state is live
       if (chist.size() != (size_t)pos)
         throw std::runtime_error(
             "chain: token history and trunk position disagree");
@@ -4747,6 +4794,7 @@ struct GpuModel {
     };
     auto T0 = std::chrono::steady_clock::now();
     while ((int)out.size() < gen) {
+      yield_point();  // round top: mtp_pos == pos-1, d_R == h_{pos-1}
       int q = pos - 1;
       int g = std::min(gamma, gen - (int)out.size());
       size_t chist_sz = chist.size();
@@ -4957,6 +5005,7 @@ struct GpuModel {
     };
     auto T0 = std::chrono::steady_clock::now();
     while ((int)out.size() < gen && pos < maxctx) {
+      yield_point();  // round top: only persistent slot state is live
       if (chist.size() != (size_t)pos)
         throw std::runtime_error(
             "chain-sample: token history and trunk position disagree");
@@ -5372,6 +5421,132 @@ struct GpuModel {
     CK(hipStreamDestroy(cap));
     graphs_ok = true;
     fprintf(stderr, "decode graphs captured (ple=%d)\n", (int)ple_on);
+  }
+
+  // ---- Sequence slots (concurrent serve, GDEC_PARALLEL) ----
+  // Everything one sequence carries from step to step: host mirrors, GDN /
+  // conv / PLE ring / indexer ring state, the page table (the KV pages live
+  // in the shared pool), the MTP KV, per-slot decode graphs (they bake these
+  // pointers) and the request-scoped flags/stats. Weights, prefill/decode
+  // scratch, logits, verify checkpoints and the KV pool are shared: slots
+  // time-slice the GPU and hand it over only at yield_point(), where none of
+  // the shared buffers holds live data. bind(s) swaps slot s into the model
+  // members, so every kernel path runs unchanged on the bound slot.
+  // mrope_gen_ is NOT per slot: it is a global generation for the ropecs
+  // cache key (bind also drops that cache).
+#define GDEC_SLOT_FIELDS(X)                                                    \
+  X(pos) X(ple_ringpos) X(chist) X(ngram) X(mtp_pos) X(kv_seq) X(d_ptab)      \
+  X(mrope_active_) X(rope_delta_) X(mrope_pos_) X(mrope_grids_) X(d_rdelta)   \
+  X(img_inj) X(img_hash_) X(d_img_emb) X(img_emb_rows) X(img_emb_cap)         \
+  X(mtp_tap_capture) X(spec_snap) X(ngram_verify_active)                      \
+  X(prog_total) X(prog_base) X(prog_last_est) X(prog_req) X(prog_t0)          \
+  X(prog_last) X(last_spec_rounds) X(last_spec_commit) X(last_spec_rollbacks) \
+  X(last_spec_proposed) X(live_spec_rounds) X(live_spec_commits)              \
+  X(live_spec_proposed) X(g1_exec) X(g2_exec)                                 \
+  X(d_S) X(d_convst) X(d_ring) X(d_iraw) X(d_R) X(d_pos) X(d_ringpos)         \
+  X(d_mkcf) X(d_mvcf) X(d_mkcb) X(d_mvcb) X(d_mik) X(d_miraw) X(d_mpos)
+  struct SeqState {
+#define GDEC_SLOT_DECL(f) decltype(GpuModel::f) f{};
+    GDEC_SLOT_FIELDS(GDEC_SLOT_DECL)
+#undef GDEC_SLOT_DECL
+  };
+  // Invariant: the bound slot's state is in the members and slots_[bound_]
+  // holds a placeholder; every other slots_[i] holds slot i's state.
+  std::vector<SeqState> slots_;
+  int nslots = 1, bound_ = 0;
+  void swap_slot(SeqState& s) {
+    using std::swap;
+#define GDEC_SLOT_SWAP(f) swap(f, s.f);
+    GDEC_SLOT_FIELDS(GDEC_SLOT_SWAP)
+#undef GDEC_SLOT_SWAP
+  }
+  void bind(int s) {
+    if (s == bound_) return;
+    CK(hipDeviceSynchronize());  // nothing of the outgoing slot still in flight
+    swap_slot(slots_[(size_t)bound_]);  // members <- placeholder
+    swap_slot(slots_[(size_t)s]);       // members <- slot s
+    bound_ = s;
+    ropecs_base_ = -1;   // rope cos/sin table belongs to the previous slot
+    xf16_src = nullptr;  // so does the bf16 conversion cache
+  }
+  // Allocate slots 1..n-1 (slot 0 is the constructor's state) and capture
+  // their decode graphs. Paged KV only: all slots map pages from one pool.
+  void slots_init(int n) {
+    if (n <= 1) return;
+    if (!kv_paged) {
+      fprintf(stderr, "gdec: GDEC_PARALLEL=%d needs paged KV (GDEC_KV_PAGED); "
+                      "running 1 slot\n", n);
+      return;
+    }
+    const size_t rb = (size_t)g_cfg.branches * g_cfg.d;
+    const size_t ngdn = g_cfg.layers - g_cfg.layers / 4, nqsa = g_cfg.layers / 4;
+    const size_t sS = ngdn * 48 * 128 * 128 * 4, sC = ngdn * 3 * 10240 * 4,
+                 sRing = (size_t)9 * 10240 * 4, sIraw = nqsa * 4 * 128 * 4;
+    slots_.resize((size_t)n);
+    for (int i = 1; i < n; i++) {
+      SeqState& t = slots_[(size_t)i];
+      DALLOC(&t.d_R, rb * 4);
+      DALLOC(&t.d_S, sS);
+      DALLOC(&t.d_convst, sC);
+      DALLOC(&t.d_ring, sRing);
+      DALLOC(&t.d_pos, 4);
+      DALLOC(&t.d_ringpos, 4);
+      DALLOC(&t.d_rdelta, 4);
+      CK(hipMemset(t.d_R, 0, rb * 4));
+      CK(hipMemset(t.d_S, 0, sS));
+      CK(hipMemset(t.d_convst, 0, sC));
+      CK(hipMemset(t.d_ring, 0, sRing));
+      CK(hipMemset(t.d_pos, 0, 4));
+      CK(hipMemset(t.d_ringpos, 0, 4));
+      CK(hipMemset(t.d_rdelta, 0, 4));
+      if (d_iraw) {
+        DALLOC(&t.d_iraw, sIraw);
+        CK(hipMemset(t.d_iraw, 0, sIraw));
+      }
+      t.kv_seq.init(kv_lpages, kv_pool.guard());
+      DALLOC(&t.d_ptab, (size_t)kv_lpages * 4);
+      CK(hipMemcpy(t.d_ptab, t.kv_seq.tab.data(), (size_t)kv_lpages * 4,
+                   hipMemcpyHostToDevice));
+      if (mtp_avail) {
+        DALLOC(&t.d_mpos, 4);
+        CK(hipMemset(t.d_mpos, 0, 4));
+        if (d_mkcf) {
+          DALLOC(&t.d_mkcf, (size_t)maxctx * 512 * 4);
+          DALLOC(&t.d_mvcf, (size_t)maxctx * 512 * 4);
+        }
+        if (d_mkcb) {
+          DALLOC(&t.d_mkcb, (size_t)maxctx * 512 * 2);
+          DALLOC(&t.d_mvcb, (size_t)maxctx * 512 * 2);
+        }
+        if (d_mik) DALLOC(&t.d_mik, (size_t)index_blocks * 128 * 4);
+        if (d_miraw) {
+          DALLOC(&t.d_miraw, 4 * 128 * 4);
+          CK(hipMemset(t.d_miraw, 0, 4 * 128 * 4));
+        }
+      }
+      t.prog_req = -1;
+      if (graphs_ok) {  // per-slot decode graphs (they bake the slot pointers)
+        bind(i);
+        build_graphs();
+        bind(0);
+      }
+    }
+    nslots = n;
+    fprintf(stderr, "gdec: %d sequence slots (shared KV pool %d pages = %d tokens)\n",
+            n, kv_pool_pages, kv_pool_pages * KV_PAGE);
+  }
+  // Pages the slot's live sequence maps (bound slot: the members).
+  int slot_pages(int s) const {
+    return s == bound_ ? kv_seq.mapped : slots_[(size_t)s].kv_seq.mapped;
+  }
+  // Drop slot s's sequence (returns its pages to the pool) while `back`
+  // stays the slot the caller runs on.
+  void slot_reset(int s, int back) {
+    bind(s);
+    reset_state();
+    mtp_tap_capture = spec_snap = ngram_verify_active = false;
+    prog_total = 0;
+    bind(back);
   }
 
   // Zero all cross-request state so the next request behaves like a fresh

@@ -14,6 +14,7 @@ source "$ROOT/service.conf"
 # 旧版 service.conf 没有这两项时的缺省值（与 service.conf 相同）
 KV_PAGED="${KV_PAGED:-1}"
 KV_POOL_TOKENS="${KV_POOL_TOKENS:-0}"
+PARALLEL="${PARALLEL:-1}"
 if [[ -f "$ROOT/build/bundled-runtime.conf" ]]; then
   # --bundle 产物优先使用随包库；kernel db 使用绝对路径，不依赖 cwd。
   [[ -d "$ROOT/build/lib" ]] || fail '缺少 build/lib，请重新运行 bash build.sh --bundle'
@@ -38,6 +39,8 @@ for key in KVSNAP_MAX_GB RCKPT_MAX KV_POOL_TOKENS; do
 done
 [[ "$PLE_URING" =~ ^[01]$ ]] || fail 'PLE_URING 必须为 0 或 1'
 [[ "$KV_PAGED" =~ ^[01]$ ]] || fail 'KV_PAGED 必须为 0 或 1'
+[[ "$PARALLEL" =~ ^[1-8]$ ]] || fail 'PARALLEL 范围为 1–8'
+(( PARALLEL == 1 || KV_PAGED )) || fail 'PARALLEL>1 需要 KV_PAGED=1'
 (( ENGINE_PORT <= 65535 && API_PORT <= 65535 && ENGINE_PORT != API_PORT )) || fail '端口必须为不同的 1–65535 整数'
 (( MTP_GAMMA <= 8 )) || fail 'MTP_GAMMA 范围为 1–8'
 for cmd in flock ss systemctl stat awk pgrep setsid; do command -v "$cmd" >/dev/null || fail "缺少命令：$cmd"; done
@@ -84,6 +87,7 @@ if (( KV_PAGED )); then
   export GDEC_KV_PAGED=1
   if (( KV_POOL_TOKENS )); then export GDEC_KV_POOL_TOKENS="$KV_POOL_TOKENS"; fi
 fi
+export GDEC_PARALLEL="$PARALLEL"
 # --serve reads GDEC_SPEC_GAMMA; --gamma is for offline --spec-gen.
 export GDEC_SPEC_GAMMA="$MTP_GAMMA"
 engine=("$ROOT/build/gdec" "$MODEL_FILE")
@@ -96,7 +100,7 @@ echo "项目：$ROOT"
 echo "模型：$MODEL_FILE"
 echo "配置：${MAX_CONTEXT} 上下文，MTP gamma=${MTP_GAMMA}，API ${API_HOST}:${API_PORT}"
 if (( KV_PAGED )); then
-  echo "KV：分页，页池 $(( (KV_POOL_TOKENS > MAX_CONTEXT ? KV_POOL_TOKENS : MAX_CONTEXT) )) token，RAM 检查点 ${RCKPT_MAX} 个"
+  echo "KV：分页，页池 $(( (KV_POOL_TOKENS > MAX_CONTEXT ? KV_POOL_TOKENS : MAX_CONTEXT) )) token（${PARALLEL} 路并发共享），RAM 检查点 ${RCKPT_MAX} 个"
 else
   echo "KV：不分页（KV_PAGED=0）"
 fi

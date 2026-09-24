@@ -74,6 +74,7 @@ static inline sockfd_t sock_tcp() {
   return s == INVALID_SOCKET ? (sockfd_t)-1 : (sockfd_t)s;
 }
 static inline int sock_close(sockfd_t fd) { return closesocket((SOCKET)fd); }
+static inline int sock_shutdown(sockfd_t fd) { return shutdown((SOCKET)fd, SD_BOTH); }
 // flags 仅支持 0 与 MSG_DONTWAIT（后者通过临时切换非阻塞模式实现）
 static inline ssize_t sock_recv(sockfd_t fd, void* buf, size_t n, bool dontwait) {
   SOCKET s = (SOCKET)fd;

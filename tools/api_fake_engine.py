@@ -15,6 +15,9 @@ def send_line(conn, line):
     conn.sendall((line + "\n").encode("ascii"))
 
 
+SLOTS = 1
+
+
 def handle(conn):
     pending = b""
 
@@ -41,7 +44,7 @@ def handle(conn):
                 send_line(conn, "PONG")
                 continue
             if line == "INFO":
-                send_line(conn, "I 1 0 262144 8 1 1 0 0 0 1 262144 0 1")
+                send_line(conn, f"I 1 0 262144 8 1 1 0 0 0 {SLOTS} 262144 0 1")
                 continue
             if line == "MEM":
                 send_line(conn, "M 1 100 120 200 10 20 310 900 1000 100 400 50")
@@ -99,6 +102,10 @@ def handle(conn):
                 return
             if "31337" in fields:
                 time.sleep(2)
+            if "5150" in fields:  # aborted mid-decode (shared KV pool full)
+                send_line(conn, f"T {req} 12675 -0.125")
+                send_line(conn, f"D {req} error 0 0 0.0 0.0 0 0 0 0 0")
+                continue
             if "9001" in fields:
                 tokens = [
                     248069, 271, 248058, 198, 27, 1628, 27362, 67017, 29, 198,
@@ -130,7 +137,10 @@ def handle(conn):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=18730)
+    parser.add_argument("--slots", type=int, default=1, help="INFO kv_slots")
     args = parser.parse_args()
+    global SLOTS
+    SLOTS = args.slots
     with socket.socket() as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind(("127.0.0.1", args.port))

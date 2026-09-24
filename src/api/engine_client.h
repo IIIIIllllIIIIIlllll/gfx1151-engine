@@ -3,11 +3,11 @@
 // Wire format is defined by the engine implementation in
 // src/gpu/gdec.cpp:11220-11860 (its parse_gen + the GEN handler).
 //
-// One TCP connection, one in-flight request (the engine is batch-1: its INFO
-// reply reports kv_slots = 1). The front-end therefore serializes generations
-// with its own slot semaphore; cancelling is the exception -- `X <req>` is
-// written out-of-band while a request is decoding, because the engine polls
-// the same socket for it between tokens.
+// One TCP connection carries one in-flight request: the engine takes one GEN
+// per connection and runs up to INFO kv_slots of them at once (GDEC_PARALLEL),
+// so the front-end keeps a pool of kv_slots clients plus a control client.
+// Cancelling is out-of-band -- `X <req>` is written while a request is
+// decoding; the engine's per-connection reader picks it up at once.
 #pragma once
 
 #include <atomic>

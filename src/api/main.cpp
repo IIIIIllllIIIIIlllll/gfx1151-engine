@@ -23,6 +23,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -64,18 +65,23 @@ struct Config {
 
 Config g_cfg;
 gdec::Tokenizer g_tok;
-gdec::EngineClient g_eng;
 std::mutex g_conn_mtx;  // serialize (re)connects
 std::atomic<long long> g_req_seq{0};
 
-// The engine is batch-1 (INFO reports kv_slots = 1), so requests are
-// serialized here rather than queued engine-side.  Waiting requests stay in
-// this front-end queue until the single engine slot is released.
+// The engine runs INFO kv_slots sequences at once (GDEC_PARALLEL, sharing
+// one KV pool; 1 = batch-1) and takes one GEN per connection.  Up to g_slots
+// generations are in flight here, each on its own pooled engine connection;
+// the rest wait in this front-end queue until a slot is released.  Control
+// queries (MEM/CSTAT) use g_ctl and never wait for a generation slot.
+int g_slots = 1;
+std::vector<std::unique_ptr<gdec::EngineClient>> g_pool;  // g_slots clients
+std::vector<gdec::EngineClient*> g_pool_free;             // under g_slot_mtx
+gdec::EngineClient g_ctl;
 std::mutex g_slot_mtx;
 std::condition_variable g_slot_cv;
 int g_in_flight = 0;
 int g_queued = 0;
-std::chrono::steady_clock::time_point g_busy_since;
+std::chrono::steady_clock::time_point g_busy_since;  // idle -> busy edge
 
 // generation_config.json of this checkpoint.
 const std::vector<int> g_eos = {248046, 248044};
@@ -104,6 +110,13 @@ std::string make_id(const char* prefix) { return std::string(prefix) + hex24(); 
 const char* kEngineRejected =
     "the engine rejected this request. Check /health for what this build "
     "supports, and that the prompt fits the context.";
+const char* kEngineRejectedPar =
+    "the engine rejected this request. Check /health for what this build "
+    "supports, and that the prompt fits the context; the context is shared by "
+    "concurrent requests, so it may also be full right now (retry later).";
+const char* kEngineAborted =
+    "the engine aborted this request: concurrent requests filled the shared "
+    "context (earlier requests keep it). Retry when the server is less busy.";
 
 // ------------------------------------------------------------- slot guard --
 
@@ -111,11 +124,11 @@ class SlotGuard {
   public:
     explicit SlotGuard(const std::function<bool()>& on_wait = {}) {
         std::unique_lock<std::mutex> lk(g_slot_mtx);
-        const bool queued = g_in_flight != 0;
+        const bool queued = g_in_flight >= g_slots;
         if (queued) ++g_queued;
-        while (g_in_flight != 0) {
+        while (g_in_flight >= g_slots) {
             if (!on_wait) {
-                g_slot_cv.wait(lk, [] { return g_in_flight == 0; });
+                g_slot_cv.wait(lk, [] { return g_in_flight < g_slots; });
                 break;
             }
             // Do not hold the slot mutex while writing to the client.  The
@@ -128,31 +141,35 @@ class SlotGuard {
                 g_slot_cv.notify_all();
                 return;
             }
-            if (g_in_flight != 0) g_slot_cv.wait_for(lk, std::chrono::seconds(1));
+            if (g_in_flight >= g_slots) g_slot_cv.wait_for(lk, std::chrono::seconds(1));
         }
         if (queued) --g_queued;
-        g_in_flight = 1;
-        g_busy_since = std::chrono::steady_clock::now();
+        if (g_in_flight++ == 0) g_busy_since = std::chrono::steady_clock::now();
+        eng_ = g_pool_free.back();  // g_in_flight < g_slots: one is free
+        g_pool_free.pop_back();
         acquired_ = true;
     }
     ~SlotGuard() {
         if (!acquired_) return;
         std::lock_guard<std::mutex> lk(g_slot_mtx);
-        g_in_flight = 0;
+        g_pool_free.push_back(eng_);
+        --g_in_flight;
         g_slot_cv.notify_all();
     }
     bool acquired() const { return acquired_; }
+    gdec::EngineClient& engine() const { return *eng_; }
     SlotGuard(const SlotGuard&) = delete;
     SlotGuard& operator=(const SlotGuard&) = delete;
 
   private:
     bool acquired_ = false;
+    gdec::EngineClient* eng_ = nullptr;
 };
 
-bool engine_ready(std::string* err) {
+bool engine_ready(gdec::EngineClient& eng, std::string* err) {
     std::lock_guard<std::mutex> lk(g_conn_mtx);
-    if (g_eng.connected()) return true;
-    return g_eng.connect(g_cfg.engine_addr, err);
+    if (eng.connected()) return true;
+    return eng.connect(g_cfg.engine_addr, err);
 }
 
 // ------------------------------------------------------- incremental text --
@@ -300,8 +317,9 @@ GenOutcome run_generation(GenSpec& spec,
         out.client_gone = true;
         return out;
     }
+    gdec::EngineClient& eng = slot.engine();
     std::string err;
-    if (!engine_ready(&err)) {
+    if (!engine_ready(eng, &err)) {
         fprintf(stderr, "REQ %s 502 engine connect failed: %s\n", log_tag.c_str(), err.c_str());
         http::fail(502, "engine not reachable: " + err, "server_error", "server_error");
     }
@@ -389,7 +407,7 @@ GenOutcome run_generation(GenSpec& spec,
         return deliver(delta);
     };
 
-    gdec::GenResult r = g_eng.generate(p, [&](int tok, float lp) {
+    gdec::GenResult r = eng.generate(p, [&](int tok, float lp) {
         (void)lp;
         ++emitted;
         return emit(detok.push(tok));
@@ -422,7 +440,17 @@ GenOutcome run_generation(GenSpec& spec,
     out.proposed = r.proposed;
     out.logprobs = std::move(r.logprobs);
 
-    if (r.reason == "error") http::fail(400, kEngineRejected);
+    if (r.reason == "error") {
+        // Concurrent requests share one KV pool; when it runs out the engine
+        // fails the later request (the D line carries no reason).  After tokens
+        // have streamed that is the only way a request can fail.
+        if (emitted > 0) {
+            fprintf(stderr, "REQ %lld aborted by the engine after %lld tokens (shared KV "
+                            "context full)\n", req_id, emitted);
+            http::fail(503, kEngineAborted, "server_error", "server_error");
+        }
+        http::fail(400, g_slots > 1 ? kEngineRejectedPar : kEngineRejected);
+    }
     if (out.hit_stop || r.reason == "done") out.reason = "stop";
     else if (r.reason == "length") out.reason = "length";
     else out.reason = "stop";  // "cancel": client gone, or stopped by us
@@ -1131,13 +1159,12 @@ void handle_models(const http::Request&, http::Response* r, http::Stream*) {
 }
 
 void handle_cache(const http::Request&, http::Response* r, http::Stream*) {
-    SlotGuard slot;
     std::string line, err;
     {
         std::lock_guard<std::mutex> lk(g_conn_mtx);
-        if (!g_eng.connected()) g_eng.connect(g_cfg.engine_addr, &err);
+        if (!g_ctl.connected()) g_ctl.connect(g_cfg.engine_addr, &err);
     }
-    if (!g_eng.cstat(&line, &err)) {
+    if (!g_ctl.cstat(&line, &err)) {
         // The live service surfaces an engine-side probe failure this way.
         r->status = 500;
         r->body = http::error_json("internal error: TimeoutError: ", "server_error",
@@ -1150,13 +1177,12 @@ void handle_cache(const http::Request&, http::Response* r, http::Stream*) {
 }
 
 void handle_memory(const http::Request&, http::Response* r, http::Stream*) {
-    SlotGuard slot;
     std::string line, err;
     {
         std::lock_guard<std::mutex> lk(g_conn_mtx);
-        if (!g_eng.connected()) g_eng.connect(g_cfg.engine_addr, &err);
+        if (!g_ctl.connected()) g_ctl.connect(g_cfg.engine_addr, &err);
     }
-    if (!g_eng.memory(&line, &err)) {
+    if (!g_ctl.memory(&line, &err)) {
         r->status = 500;
         r->body = http::error_json("engine memory query failed: " + err,
                                    "server_error", "server_error");
@@ -1222,7 +1248,7 @@ void handle_health(const http::Request&, http::Response* r, http::Stream*) {
                                     .count()
                               : 0;
     }
-    j["slots"] = 1;
+    j["slots"] = g_slots;
     j["slot_ctx"] = g_cfg.context;
     {
         std::lock_guard<std::mutex> lk(g_slot_mtx);
@@ -2037,16 +2063,14 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
 
 void probe_engine() {
     std::string err, line;
-    // Startup must not stall for the generation budget: if another front-end
-    // currently owns the engine's single connection, fall back to the
-    // configured defaults instead of blocking the listen socket for minutes.
-    g_eng.set_timeouts(5.0, 5.0);
-    if (!g_eng.connect(g_cfg.engine_addr, &err)) {
+    // Startup must not stall for the generation budget: an unreachable or
+    // wedged engine falls back to the configured defaults (and one slot)
+    // instead of blocking the listen socket for minutes. The control
+    // connection keeps the short timeouts: MEM/CSTAT answer at once.
+    g_ctl.set_timeouts(5.0, 5.0);
+    if (!g_ctl.connect(g_cfg.engine_addr, &err)) {
         fprintf(stderr, "gdec-api: engine connect failed: %s\n", err.c_str());
-        g_eng.set_timeouts(1800.0, 300.0);
-        return;
-    }
-    if (g_eng.info(&line, &err)) {
+    } else if (g_ctl.info(&line, &err)) {
         // I mtp draft_head ctx spec_rows default drafter_weights dflash2
         //   cache_mb cache_align kv_slots slot_ctx cache_mode sampling
         std::vector<long long> f;
@@ -2058,12 +2082,18 @@ void probe_engine() {
         if (f.size() >= 3) {
             g_cfg.context = (int)f[2];
         }
+        if (f.size() >= 10 && f[9] >= 1 && f[9] <= 64) g_slots = (int)f[9];
         fprintf(stderr, "gdec-api: engine INFO: %s\n", line.c_str());
     } else {
         fprintf(stderr, "gdec-api: engine INFO unavailable (%s); continuing with "
                         "ctx=%d\n", err.c_str(), g_cfg.context);
     }
-    g_eng.set_timeouts(1800.0, 300.0);
+    for (int i = 0; i < g_slots; ++i) {
+        g_pool.push_back(std::make_unique<gdec::EngineClient>());
+        g_pool_free.push_back(g_pool.back().get());
+    }
+    fprintf(stderr, "gdec-api: %d concurrent generation slot%s (shared context %d)\n",
+            g_slots, g_slots > 1 ? "s" : "", g_cfg.context);
 }
 
 }  // namespace
@@ -2115,8 +2145,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "gdec-api: listen: %s\n", err.c_str());
         return 1;
     }
-    fprintf(stderr, "gdec-api: listening on :%d model=%s ctx=%d slots=1\n", srv.port(),
-            g_cfg.model.c_str(), g_cfg.context);
+    fprintf(stderr, "gdec-api: listening on :%d model=%s ctx=%d slots=%d\n", srv.port(),
+            g_cfg.model.c_str(), g_cfg.context, g_slots);
 
     srv.on("GET", "/", handle_dashboard);
     srv.on("GET", "/dashboard", handle_dashboard);

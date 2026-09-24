@@ -5,6 +5,7 @@ typedef int sockfd_t;
 static inline bool wsa_init() { return true; }
 static inline sockfd_t sock_tcp() { return socket(AF_INET, SOCK_STREAM, 0); }
 static inline int sock_close(sockfd_t fd) { return close(fd); }
+static inline int sock_shutdown(sockfd_t fd) { return shutdown(fd, SHUT_RDWR); }
 static inline ssize_t sock_recv(sockfd_t fd, void* buf, size_t n, bool dontwait) {
   return recv(fd, buf, n, dontwait ? MSG_DONTWAIT : 0);
 }

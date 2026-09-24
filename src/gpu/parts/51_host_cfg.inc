@@ -853,6 +853,886 @@ static GenReq parse_gen(std::istringstream& ss) {
   return g;
 }
 
+// ---------------------------------------------------------------------------
+// Concurrent serving (GDEC_PARALLEL=N, paged KV only; 2026-09-24).
+//
+// N sequence slots (GpuModel::slots_init) time-share the GPU. Every
+// connection gets a reader thread -- PING/INFO/MEM/X answer at once, even
+// mid-request -- and each GEN runs on its own worker thread. A FIFO ticket
+// lock (Turnstile) owns the GPU; the owner hands it over at yield points
+// (spec round tops, prompt prefill chunk boundaries, serial decode tokens)
+// when someone is waiting, so sequences interleave but each one computes
+// exactly what it would alone (bit-exact per sequence).
+//
+// All slots map KV pages from ONE pool (default: one maxctx sequence, like
+// llama.cpp's unified KV). When the pool runs dry (GpuModel::kv_evict_one):
+// RAM checkpoints go first, then idle slots' pages (LRU), then the
+// latest-admitted busy request later than the one asking is aborted; if
+// the asker is itself the latest, IT fails (KvOverflow). An earlier request
+// is never sacrificed for a later one.
+//
+// N=1 keeps the old batch-1 semantics: live-state reuse is per connection
+// (a new connection starts with an empty hist), no hooks are installed.
+
+// FIFO ticket lock around the (single-threaded) GpuModel.
+struct Turnstile {
+  std::mutex mu;
+  std::condition_variable cv;
+  uint64_t next = 0, serving = 0;
+  void acquire() {
+    std::unique_lock<std::mutex> lk(mu);
+    const uint64_t t = next++;
+    cv.wait(lk, [&] { return serving == t; });
+  }
+  void release() {
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      serving++;
+    }
+    cv.notify_all();
+  }
+  bool contended() {  // someone besides the owner is queued
+    std::lock_guard<std::mutex> lk(mu);
+    return next - serving > 1;
+  }
+};
+
+struct Slot {
+  bool busy = false;
+  bool abort = false;  // pool-overflow victim: fail at the next GPU acquire
+  // MTP KV continuity: true after a spec-enabled turn (prefill tap capture
+  // + spec decode keep the MTP layer's KV in lockstep with the trunk).
+  // False after kvsnap/rckpt restores and any plain (non-speculative) turn.
+  bool mtp_live = false;
+  // tokens INGESTED by this slot's live state (prompt + every token actually
+  // fed to forward). KV reuse: a GEN whose prompt extends hist exactly
+  // continues from live state instead of re-prefilling.
+  std::vector<int> hist;
+  uint64_t seq = 0;       // admission order of the request it runs
+  uint64_t last_use = 0;  // LRU among idle slots
+  uint64_t owner = 0;     // connection id of the last request (N=1 affinity)
+};
+
+static Turnstile g_turn;
+static std::mutex g_sm;  // g_slots bookkeeping + admission queue
+static std::condition_variable g_scv;
+static std::vector<Slot> g_slots;
+static std::list<uint64_t> g_wait;  // admission tickets, FIFO
+static uint64_t g_ticket = 0, g_seq = 0, g_use = 0;
+static std::atomic<uint64_t> g_conn_id{0};
+static thread_local int tl_slot = -1;  // slot of the GPU-owning worker
+
+// Idle slot for a prompt: the longest hist that is a strict prefix (live
+// continuation), else an empty slot, else the least recently used one whose
+// connection is gone (owner 0), else the least recently used one.
+static int pick_slot(const std::vector<int>& ids) {
+  int best = -1, empty = -1, lru = -1, orphan = -1;
+  size_t bestn = 0;
+  for (int i = 0; i < (int)g_slots.size(); i++) {
+    const Slot& s = g_slots[(size_t)i];
+    if (s.busy) continue;
+    const size_t n = s.hist.size();
+    if (n == 0) {
+      if (empty < 0) empty = i;
+      continue;
+    }
+    if (n < ids.size() && n > bestn &&
+        std::equal(s.hist.begin(), s.hist.end(), ids.begin())) {
+      best = i;
+      bestn = n;
+    }
+    if (lru < 0 || s.last_use < g_slots[(size_t)lru].last_use) lru = i;
+    if (s.owner == 0 && (orphan < 0 || s.last_use < g_slots[(size_t)orphan].last_use))
+      orphan = i;
+  }
+  return best >= 0 ? best : empty >= 0 ? empty : orphan >= 0 ? orphan : lru;
+}
+
+// Wait (FIFO) for an idle slot and claim it; -1 if cancelled while queued.
+static int slot_admit(const std::vector<int>& ids, const std::atomic<bool>& cancel) {
+  std::unique_lock<std::mutex> lk(g_sm);
+  const uint64_t t = g_ticket++;
+  g_wait.push_back(t);
+  for (;;) {
+    if (g_wait.front() == t) {
+      const int s = pick_slot(ids);
+      if (s >= 0) {
+        g_wait.pop_front();
+        Slot& sl = g_slots[(size_t)s];
+        sl.busy = true;
+        sl.abort = false;
+        sl.seq = ++g_seq;
+        g_scv.notify_all();
+        return s;
+      }
+    }
+    if (cancel) {
+      g_wait.remove(t);
+      g_scv.notify_all();
+      return -1;
+    }
+    g_scv.wait_for(lk, std::chrono::milliseconds(50));
+  }
+}
+
+static void slot_leave(int s) {
+  {
+    std::lock_guard<std::mutex> lk(g_sm);
+    g_slots[(size_t)s].busy = false;
+    g_slots[(size_t)s].last_use = ++g_use;
+  }
+  g_scv.notify_all();
+}
+
+// GpuModel::yield_fn: hand the GPU to the next queued worker, then fail
+// this request if a pool overflow picked it as the victim meanwhile.
+static void yield_hook(GpuModel& m) {
+  if (tl_slot < 0) return;
+  if (g_turn.contended()) {
+    g_turn.release();
+    g_turn.acquire();
+    m.bind(tl_slot);
+  }
+  bool ab;
+  {
+    std::lock_guard<std::mutex> lk(g_sm);
+    ab = g_slots[(size_t)tl_slot].abort;
+  }
+  if (ab) throw KvOverflow("aborted: KV pool needed by an earlier request");
+}
+
+// GpuModel::kv_starve_fn (pool dry after rckpt eviction), GPU owner only.
+static bool starve(GpuModel& m) {
+  const int cur = tl_slot;
+  if (cur < 0) return false;
+  std::lock_guard<std::mutex> lk(g_sm);
+  const int n = (int)g_slots.size();
+  int v = -1;
+  for (int i = 0; i < n; i++) {
+    const Slot& s = g_slots[(size_t)i];
+    if (i != cur && !s.busy && m.slot_pages(i) > 0 &&
+        (v < 0 || s.last_use < g_slots[(size_t)v].last_use))
+      v = i;
+  }
+  if (v >= 0) {
+    fprintf(stderr, "%s [kvpage] pool dry: dropped idle slot %d (%zu tokens, %d pages)\n",
+            log_ts(), v, g_slots[(size_t)v].hist.size(), m.slot_pages(v));
+    m.slot_reset(v, cur);
+    g_slots[(size_t)v].hist.clear();
+    g_slots[(size_t)v].mtp_live = false;
+    return true;
+  }
+  const uint64_t mine = g_slots[(size_t)cur].seq;
+  for (int i = 0; i < n; i++) {
+    const Slot& s = g_slots[(size_t)i];
+    if (i != cur && s.busy && !s.abort && s.seq > mine && m.slot_pages(i) > 0 &&
+        (v < 0 || s.seq > g_slots[(size_t)v].seq))
+      v = i;
+  }
+  if (v >= 0) {
+    fprintf(stderr, "%s [kvpage] pool dry: aborting the later request on slot %d "
+            "(%d pages) for slot %d\n", log_ts(), v, m.slot_pages(v), cur);
+    m.slot_reset(v, cur);
+    g_slots[(size_t)v].abort = true;
+    return true;
+  }
+  throw KvOverflow("KV pool exhausted: concurrent contexts exceed the shared pool");
+}
+
+struct Conn {
+  sockfd_t fd;
+  uint64_t id = 0;
+  std::mutex wmu;  // reader (PONG/INFO/...) and worker (T/D) both write
+  std::atomic<bool> cancel{false}, in_flight{false};
+  std::atomic<int64_t> req{0};
+  bool send(const std::string& s) {
+    std::lock_guard<std::mutex> lk(wmu);
+    return send_all(fd, s);
+  }
+};
+
+// One GEN, on its own worker thread. Protocol lines and semantics are the
+// batch-1 ones; only scheduling changed.
+static void gen_one(GpuModel& m, Conn& c, GenReq g,
+                    std::vector<std::vector<float>> vpatches,
+                    const kvsnap::Cfg& kvs) {
+  const std::atomic<bool>& cancel = c.cancel;
+  char db[192];
+  auto err_line = [&]() {
+    snprintf(db, sizeof db, "D %lld error %zu 0 0 0\n", (long long)g.req,
+             g.ids.size());
+    return std::string(db);
+  };
+  // The request's last line. in_flight drops first so the GEN the client
+  // sends the moment it reads D is not taken for a pipelined one.
+  auto finish = [&](const std::string& d) {
+    c.in_flight = false;
+    if (!c.send(d)) sock_shutdown(c.fd);
+  };
+  // Vision request validation (0.5.8 semantics), before state mutation:
+  // patches need a loaded tower and one MROPE grid each; any image
+  // placeholder without a grid is rejected (first position logged).
+  if (g.vimg > 0) {
+    const char* why = nullptr;
+    if (!m.vision_on)
+      why = "vision tower not loaded (start the engine with "
+            "--vision-tower <sidecar.hgn>)";
+    else if ((int)g.mrope_grids.size() != g.vimg)
+      why = "VIMG frame count != MROPE grid count";
+    else
+      for (int i = 0; i < g.vimg; i++) {
+        auto gr = g.mrope_grids[i];
+        if (gr[0] != 1 ||
+            (int)vpatches[i].size() != gr[0] * gr[1] * gr[2] * 1536) {
+          why = "patches/grid size mismatch (or t != 1)";
+          break;
+        }
+      }
+    if (why) {
+      fprintf(stderr, "vision: req %lld rejected: %s\n", (long long)g.req, why);
+      finish(err_line());
+      return;
+    }
+  }
+  if (g.mrope_grids.empty()) {
+    size_t bad = g.ids.size();
+    for (size_t i = 0; i < g.ids.size(); i++)
+      if (g.ids[i] == 248056 || g.ids[i] == 248057) {
+        bad = i;
+        break;
+      }
+    if (bad < g.ids.size()) {
+      fprintf(stderr, "vision: req %lld rejected: image placeholder at "
+              "prompt pos %zu without MROPE/VIMG\n", (long long)g.req, bad);
+      finish(err_line());
+      return;
+    }
+  }
+  const int s = slot_admit(g.ids, cancel);
+  if (s < 0) {
+    snprintf(db, sizeof db, "D %lld cancel 0 0 0.0 0.0\n", (long long)g.req);
+    finish(db);
+    return;
+  }
+  g_turn.acquire();
+  tl_slot = s;
+  m.bind(s);
+  // Leaving: the slot turns idle while this worker still owns the GPU, so a
+  // starving peer never sees a finished request as busy.
+  struct Lease {
+    int s;
+    ~Lease() {
+      tl_slot = -1;
+      slot_leave(s);
+      g_turn.release();
+    }
+  } lease{s};
+  Slot& sl = g_slots[(size_t)s];
+  std::vector<int>& hist = sl.hist;
+  bool& mtp_live = sl.mtp_live;
+  bool victim;
+  {
+    std::lock_guard<std::mutex> lk(g_sm);
+    victim = sl.abort;
+    if (m.nslots == 1 && sl.owner != c.id) {  // batch-1: reuse per connection
+      hist.clear();
+      mtp_live = false;
+    }
+    sl.owner = c.id;
+  }
+  if (victim) {  // reset by a pool overflow while queued for the GPU
+    fprintf(stderr, "%s serve: req %lld aborted: KV pool needed by an earlier "
+            "request\n", log_ts(), (long long)g.req);
+    hist.clear();
+    mtp_live = false;
+    finish(err_line());
+    return;
+  }
+  if (m.nslots > 1)
+    fprintf(stderr, "%s req %lld -> slot %d (%zu live tokens)\n", log_ts(),
+            (long long)g.req, s, hist.size());
+  try {
+    // KV reuse: longest common prefix of live state and this prompt.
+    // Continue only when hist is a STRICT prefix (mcp == hist.size() and
+    // new tokens follow); anything else falls to the SSD snapshot cache
+    // and only then to a full recompute.
+    size_t mcp = 0;
+    while (mcp < hist.size() && mcp < g.ids.size() && hist[mcp] == g.ids[mcp])
+      mcp++;
+    bool cont = !hist.empty() && mcp == hist.size() && mcp < g.ids.size();
+    int n_cached = cont ? (int)mcp : 0;
+    // M-RoPE restrictions, decided before any state mutation:
+    // KV reuse (cont) IS sound for M-RoPE — prefix positions are
+    // suffix-independent and RoPE is applied before K is cached, so the
+    // cached prefix is identical to what a recompute would produce —
+    // but only when the cached image KV came from the SAME pixels:
+    // placeholder ids are pixel-agnostic, so the patch-bytes hash
+    // guards cont; a mismatch (or GDEC_VISION_NOCONT) falls back to a
+    // full recompute. MTP speculation IS allowed for M-RoPE: verify
+    // positions come from the d_ropecs table (ensure_rope_cs handles
+    // base=q+1 out-of-range rows with rope_delta_), and the drafter
+    // paths rotate with *d_rdelta, so only acceptance rate is at stake.
+    if (!g.mrope_grids.empty() && cont &&
+        (fnv1a_patches(vpatches) != m.img_hash_ ||
+         getenv("GDEC_VISION_NOCONT"))) {
+      cont = false;
+      n_cached = 0;
+    }
+    if (!cont && rckpt::enabled()) {
+      // RAM checkpoint tier (llama.cpp-style PARTIAL_ONLY): only GDN
+      // state is stored; validity requires the checkpoint tokens to be a
+      // prefix of the live token stream (m.chist), which guarantees the
+      // QSA KV/indexer prefix is still intact (paged: the checkpoint owns
+      // its pages, any slot may restore it). MTP KV for the restored
+      // prefix is NOT guaranteed -> disable speculation for this turn.
+      const bool is_mrope = !g.mrope_grids.empty();
+      const uint64_t req_ih = is_mrope ? fnv1a_patches(vpatches) : 0;
+      auto r0 = std::chrono::steady_clock::now();
+      int ci = rckpt::match(g.ids, m.chist, is_mrope,
+                            is_mrope ? &g.mrope_grids : nullptr, req_ih);
+      if (ci >= 0 && rckpt::restore(m, ci, &hist)) {
+        mcp = hist.size();
+        cont = true;
+        n_cached = (int)mcp;
+        mtp_live = false;
+        double rs = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - r0)
+                        .count();
+        fprintf(stderr, "%s rckpt: restored %zu tokens in %.2fs\n",
+                log_ts(), mcp, rs);
+      }
+    }
+    if (!cont && !kvs.dir.empty()) {
+      size_t sn = 0;
+      // M-RoPE requests: placeholder ids are pixel-agnostic, so a
+      // snapshot only qualifies when grids AND patch-bytes hash match
+      // (checked inside best_prefix against the KVS3 meta); a mismatch
+      // is simply a cache miss and falls to a full recompute.
+      const bool is_mrope = !g.mrope_grids.empty();
+      const uint64_t req_ih = is_mrope ? fnv1a_patches(vpatches) : 0;
+      std::string sp = kvsnap::best_prefix(
+          kvs, g.ids, &sn, is_mrope ? &g.mrope_grids : nullptr, req_ih);
+      if (!sp.empty()) {
+        auto r0 = std::chrono::steady_clock::now();
+        if (kvsnap::restore(m, sp, hist, kvs)) {  // hist := snapshot tokens
+          mcp = hist.size();
+          cont = true;
+          n_cached = (int)mcp;
+          // the snapshot holds no MTP KV/state: as after an rckpt restore,
+          // the MTP layer is stale for the restored prefix
+          mtp_live = false;
+          double rs = std::chrono::duration<double>(
+                          std::chrono::steady_clock::now() - r0)
+                          .count();
+          fprintf(stderr, "%s kvsnap: restored %zu tokens from %s in %.1fs\n",
+                  log_ts(), mcp, sp.c_str(), rs);
+        }
+      }
+    }
+    if (!cont) m.reset_state();
+    // Ngram proposals are request-local. Clear learned suffixes so a
+    // previous request cannot collide with this prompt's hash history.
+    if (g.drafter == 3 || g.drafter == 4) m.ngram.reset();
+    // Vision requests expand their grids in-engine (validated against the
+    // prompt's image token runs); plain requests drop stale mrope state
+    // (a cont turn skips reset_state).
+    if (!g.mrope_grids.empty()) {
+      if (!m.set_mrope(g.ids, g.mrope_grids)) {
+        fprintf(stderr, "vision: req %lld rejected: grids do not cover "
+                "the image token runs\n", (long long)g.req);
+        finish(err_line());
+        return;
+      }
+      if (g.vimg > 0 &&
+          !m.vision_embeds(g.ids, g.mrope_grids, vpatches, n_cached)) {
+        finish(err_line());
+        return;
+      }
+      vpatches.clear();
+      vpatches.shrink_to_fit();  // ~50 MB/image: release before decode
+    } else {
+      m.clear_mrope();
+    }
+    std::unordered_set<int> eos(g.eos.begin(), g.eos.end());
+    HostSampler smp;
+    std::vector<float> lbuf;
+    if (g.sample) {
+      smp.temp = g.temp;
+      smp.top_p = g.top_p;
+      smp.min_p = g.min_p;
+      smp.top_k = g.top_k;
+      smp.rng = g.seed;
+      smp.presence = g.presence;
+      smp.frequency = g.frequency;
+      smp.bias = g.bias;
+      // penalties count GENERATED tokens only: hist starts empty and
+      // sample() records each emitted token
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    int cur;
+    float cur_lp = 0.0f;
+    // MTP speculation is available for greedy and rejection-sampled
+    // requests when its KV can be made complete. kvsnap restores lack MTP
+    // KV for the prompt, so those requests stay on plain decode.
+    static const int spec_gamma = std::max(
+        1, std::min(8, getenv("GDEC_SPEC_GAMMA")
+                           ? atoi(getenv("GDEC_SPEC_GAMMA"))
+                           : 3));
+    if (g.drafter == 1 && !m.mtp_avail) {
+      finish(err_line());
+      return;
+    }
+    const bool use_ngram = g.drafter == 3 && !g.sample;
+    // Chain mode (llama.cpp-style fallback): ngram drafts every round it
+    // can, MTP takes the rounds where the table has nothing. Sampled
+    // requests run spec_loop_chain_sample (ngram rounds re-draw from the
+    // target distribution; GDEC_NOSPEC_SAMPLE forces plain serial, same
+    // as use_spec). The MTP leg requires a complete MTP KV: a fresh
+    // prefill always has one; a cont/kvsnap turn only if the previous
+    // request left MTP live.
+    const bool use_chain = g.drafter == 4 &&
+                           (!g.sample ||
+                            getenv("GDEC_NOSPEC_SAMPLE") == nullptr);
+    const bool chain_mtp = use_chain && m.mtp_avail &&
+                           (!cont || mtp_live) &&
+                           getenv("GDEC_NOSPEC") == nullptr;
+    const bool use_spec = !use_ngram && !use_chain && m.mtp_avail &&
+                          g.drafter != 0 && g.drafter != 3 &&
+                          g.drafter != 4 &&
+                          (!cont || mtp_live) &&
+                          (!g.sample ||
+                           getenv("GDEC_NOSPEC_SAMPLE") == nullptr) &&
+                          getenv("GDEC_NOSPEC") == nullptr;
+    m.last_spec_rounds = m.last_spec_commit = m.last_spec_rollbacks = 0;
+    // Prompt ingest. A failure here (or a KvOverflow anywhere below) lands
+    // in the catch at the end: the slot is reset, the client gets D error.
+    if (use_spec || chain_mtp) {
+      m.mtp_tap_capture = true;  // prefill_batch ingests MTP per chunk
+      if (cont) {
+        // Boundary: MTP position mcp-1 pairs the live d_R (stream at
+        // the last ingested position) with the first new token.
+        std::vector<int> bt{g.ids[mcp]};
+        m.mtp_ingest_b(m.d_R, bt, 1, (int)mcp - 1);
+      }
+    }
+    // Frontend-hinted snapshot points (SNAPS/SNAP/SNAP2) that fall
+    // inside the uncached range: pause the prefill there, checkpoint,
+    // resume. The next turn re-renders history as TEXT whose ids match
+    // the prompt only up to these boundaries (the assistant opener and
+    // generated text retokenize differently), so they are the cuts
+    // that hit. Checkpoints go to the RAM tier (rckpt): the SSD tier
+    // only takes the prompt-end and request-end states to bound disk
+    // churn.
+    std::vector<size_t> cuts;
+    if (!kvs.dir.empty() || rckpt::enabled()) {
+      for (size_t cc : g.snaps)
+        if (cc > mcp && cc < g.ids.size() && cc >= kvs.min_tokens)
+          cuts.push_back(cc);
+      for (size_t cc : {g.snap2, g.snap})
+        if (cc > mcp && cc < g.ids.size() && cc >= kvs.min_tokens)
+          cuts.push_back(cc);
+    }
+    std::sort(cuts.begin(), cuts.end());
+    cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+    if (!cont) hist.clear();
+    size_t done_upto = cont ? mcp : 0;
+    // Arm the 1s prefill progress reporter for the prompt ingest only
+    // (spec-verify batches never see it armed). prog_base accumulates
+    // across the kvsnap cut segments inside prefill_chunk.
+    m.prog_total = (int)(g.ids.size() - done_upto);
+    m.prog_base = 0;
+    m.prog_last_est = 0;
+    m.prog_req = g.req;
+    m.prog_t0 = m.prog_last = std::chrono::steady_clock::now();
+    // live spec counters reset per request, or a serial decode after a
+    // speculative one would report the previous request's acceptance
+    m.live_spec_rounds = m.live_spec_commits = m.live_spec_proposed = 0;
+    for (size_t cc : cuts) {
+      std::vector<int> seg(g.ids.begin() + done_upto, g.ids.begin() + cc);
+      cur = m.prefill_batch(seg, (int)done_upto);
+      hist.assign(g.ids.begin(), g.ids.begin() + cc);
+      rckpt::save(m, hist);
+      done_upto = cc;
+      m.yield_point();  // consistent state between segments
+    }
+    std::vector<int> seg(g.ids.begin() + done_upto, g.ids.end());
+    cur = m.prefill_batch(seg, (int)done_upto);
+    m.prog_total = 0;
+    m.mtp_tap_capture = false;  // decode/verify must not capture taps
+    hist = g.ids;  // prompt fully ingested on both paths
+    if (use_spec || chain_mtp) mtp_live = true;  // MTP KV complete & in lockstep
+    if (g.sample) {  // d_logits still holds the last position's logits
+      m.get_logits(lbuf);
+      cur = smp.sample(lbuf, &cur_lp);
+    }
+    double pre_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    // Phase 1: snapshot only at end-of-turn. This removes the first-token
+    // stall while the full asynchronous capture path is being designed.
+    rckpt::save(m, hist);  // prompt-end RAM checkpoint (cheap, deduped)
+    auto d0 = std::chrono::steady_clock::now();
+    int ngen = 0;
+    bool dead = false;
+    std::string reason = "length";
+    // 1s-cadence decode stats (2026-09-13): instantaneous + average t/s,
+    // with the live MTP acceptance the spec loops bump every round.
+    // committed drafts = commits - rounds (each round also emits the
+    // verify/bonus token), acceptance = committed / proposed.
+    auto dl_t0 = std::chrono::steady_clock::now();
+    auto dl_last = dl_t0;
+    int dl_last_ngen = 0;
+    auto dl_tick = [&]() {
+      auto now = std::chrono::steady_clock::now();
+      double iv = std::chrono::duration<double>(now - dl_last).count();
+      if (iv < 1.0) return;
+      double el = std::chrono::duration<double>(now - dl_t0).count();
+      if (m.live_spec_rounds > 0) {
+        int acc_n = m.live_spec_commits - m.live_spec_rounds;
+        fprintf(stderr,
+                "%s req %lld | n_decoded = %d | t = %.0f s | tg = %.1f "
+                "tok/s (avg %.1f) | accept %.1f%% (%d/%d)\n",
+                log_ts(), (long long)g.req, ngen, el,
+                (ngen - dl_last_ngen) / iv, el > 0 ? ngen / el : 0.0,
+                m.live_spec_proposed
+                    ? 100.0 * acc_n / m.live_spec_proposed
+                    : 0.0,
+                acc_n, m.live_spec_proposed);
+      } else {
+        fprintf(stderr,
+                "%s req %lld | n_decoded = %d | t = %.0f s | tg = %.1f "
+                "tok/s (avg %.1f)\n",
+                log_ts(), (long long)g.req, ngen, el,
+                (ngen - dl_last_ngen) / iv, el > 0 ? ngen / el : 0.0);
+      }
+      dl_last = now;
+      dl_last_ngen = ngen;
+    };
+    // Token line; the X verb (reader thread) raises `cancel`.
+    auto send_tok = [&](int tok, bool with_lp, float lp) -> bool {
+      char tb[96];
+      int tl = with_lp ? snprintf(tb, sizeof tb, "T %lld %d %.6f\n",
+                                  (long long)g.req, tok, (double)lp)
+                       : snprintf(tb, sizeof tb, "T %lld %d\n",
+                                  (long long)g.req, tok);
+      if (!c.send(std::string(tb, tl))) {
+        dead = true;
+        return false;
+      }
+      ngen++;
+      return true;
+    };
+    if (use_ngram || use_chain) {
+      // chain with a live MTP keeps it live (the loop patches its KV
+      // every ngram round); pure/degraded ngram is trunk-only decode and
+      // invalidates the previous MTP state.
+      const bool chain = use_chain && chain_mtp;
+      if (!chain) mtp_live = false;
+      if (!m.ple_on) m.chist.assign(g.ids.begin(), g.ids.end());
+      if (eos.count(cur)) {
+        reason = "done";
+      } else {
+        send_tok(cur, g.sample && g.logprobs, cur_lp);
+      }
+      auto emit_ng = [&](int tok) -> bool {
+        if (ngen >= g.max_tokens) return false;
+        if (eos.count(tok)) { reason = "done"; return false; }
+        if (!send_tok(tok, false, 0.0f)) return false;
+        dl_tick();
+        return !cancel;
+      };
+      auto emit_ng_smp = [&](int tok, float lp) -> bool {
+        if (ngen >= g.max_tokens) return false;
+        if (eos.count(tok)) { reason = "done"; return false; }
+        if (!send_tok(tok, g.logprobs, lp)) return false;
+        dl_tick();
+        return !cancel;
+      };
+      if (!dead && !eos.count(cur)) {
+        if (g.sample)
+          m.spec_loop_chain_sample(cur, g.max_tokens - 1, spec_gamma, smp,
+                                   chain_mtp, emit_ng_smp);
+        else if (chain) m.spec_loop_chain(cur, g.max_tokens - 1, spec_gamma, emit_ng);
+        else m.spec_loop_ngram(cur, g.max_tokens - 1, m.ngram.n_max, emit_ng);
+      }
+      hist.assign(m.chist.begin(), m.chist.end());
+    } else if (use_spec) {
+      // Stream each token as the spec loop commits it. eos/cancel/length
+      // return false, rolling the round back so trunk and MTP stop at the
+      // last token actually sent to the client.
+      if (eos.count(cur)) {
+        reason = "done";
+      } else if (send_tok(cur, g.sample && g.logprobs, cur_lp)) {
+        if (g.sample) {
+          auto emit = [&](int tok, float lp) -> bool {
+            if (ngen >= g.max_tokens) return false;
+            if (eos.count(tok)) {
+              reason = "done";
+              return false;
+            }
+            if (!send_tok(tok, g.logprobs, lp)) return false;
+            dl_tick();
+            return !cancel;
+          };
+          m.spec_loop_sample(cur, g.max_tokens - 1, spec_gamma, smp, emit);
+        } else {
+          auto emit = [&](int tok) -> bool {
+            if (ngen >= g.max_tokens) return false;
+            if (eos.count(tok)) {
+              reason = "done";
+              return false;
+            }
+            if (!send_tok(tok, false, 0.0f)) return false;
+            dl_tick();
+            return !cancel;
+          };
+          m.spec_loop(cur, g.max_tokens - 1, spec_gamma, emit);
+        }
+        // Trunk ingested exactly chist tokens; hist must match for the
+        // next turn's KV-reuse prefix check.
+        hist.assign(m.chist.begin(), m.chist.end());
+      }
+    } else {
+      mtp_live = false;  // plain decode leaves the MTP layer stale
+    }
+    if (!use_spec && !use_ngram && !use_chain)
+      for (int i = 0; i < g.max_tokens; i++) {
+        if (eos.count(cur)) {
+          reason = "done";
+          break;
+        }
+        if (!send_tok(cur, g.logprobs, cur_lp)) break;
+        if (i + 1 < g.max_tokens) {
+          int fed = cur;  // the token forward() ingests (pre-sampling)
+          cur = m.forward(fed);
+          hist.push_back(fed);
+          if (g.sample) {
+            m.get_logits(lbuf);
+            cur = smp.sample(lbuf, &cur_lp);
+          }
+        }
+        dl_tick();
+        if (cancel) break;
+        m.yield_point();
+      }
+    if (dead) {  // client gone: no D line, no end-of-turn snapshot
+      c.in_flight = false;
+      sock_shutdown(c.fd);
+      return;
+    }
+    double dec_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - d0)
+                        .count();
+    if (cancel)
+      snprintf(db, sizeof db, "D %lld cancel 0 0 0.0 0.0\n", (long long)g.req);
+    else if ((use_spec || use_ngram || use_chain) && m.last_spec_rounds > 0)
+      snprintf(db, sizeof db,
+               "D %lld %s %zu %d %.1f %.1f %d %d %d %d %d\n",
+               (long long)g.req, reason.c_str(), g.ids.size(), ngen, pre_ms,
+               ngen > 1 ? dec_ms : 0.0,
+               use_chain ? (chain_mtp ? 4 : 3) : (use_ngram ? 3 : 1),
+               m.last_spec_rounds,
+               m.last_spec_commit, n_cached, m.last_spec_proposed);
+    else
+      // trailing "0 0 0 <n_cached> 0": drafter/rounds/commit placeholders
+      // so n_cached lands in the protocol's cache column (parts[10]);
+      // the last 0 is the proposed-drafts column (parts[11])
+      snprintf(db, sizeof db, "D %lld %s %zu %d %.1f %.1f 0 0 0 %d 0\n",
+               (long long)g.req, reason.c_str(), g.ids.size(), ngen, pre_ms,
+               ngen > 1 ? dec_ms : 0.0, n_cached);
+    finish(db);
+    {
+      // llama.cpp-style per-request timing block (human-facing; the wire
+      // D line above stays the machine-readable record).
+      size_t n_proc =
+          g.ids.size() - (n_cached > 0 ? (size_t)n_cached : 0);
+      fprintf(stderr,
+              "%s req %lld | prompt eval = %.1f ms / %zu tokens "
+              "(%.2f ms/token, %.1f tok/s)%s\n",
+              log_ts(), (long long)g.req, pre_ms, n_proc,
+              n_proc ? pre_ms / n_proc : 0.0,
+              pre_ms > 0 ? n_proc / (pre_ms / 1000.0) : 0.0,
+              n_cached ? " | cached" : "");
+      if (ngen > 0)
+        fprintf(stderr,
+                "%s req %lld | decode eval = %.1f ms / %d tokens "
+                "(%.2f ms/token, %.1f tok/s) | %s\n",
+                log_ts(), (long long)g.req, dec_ms, ngen,
+                dec_ms > 0 ? dec_ms / ngen : 0.0,
+                dec_ms > 0 ? ngen / (dec_ms / 1000.0) : 0.0,
+                cancel ? "cancel" : reason.c_str());
+      else
+        fprintf(stderr, "%s req %lld | decode eval = no tokens | %s\n",
+                log_ts(), (long long)g.req,
+                cancel ? "cancel" : reason.c_str());
+      if ((use_spec || use_ngram || use_chain) && m.last_spec_rounds > 0) {
+        int acc_n = m.live_spec_commits - m.live_spec_rounds;
+        fprintf(stderr,
+                "%s req %lld | draft acceptance = %.3f (%d accepted / %d "
+                "proposed), mean len = %.2f, drafter %s\n",
+                log_ts(), (long long)g.req,
+                m.live_spec_proposed
+                    ? (double)acc_n / m.live_spec_proposed
+                    : 0.0,
+                acc_n, m.live_spec_proposed,
+                m.last_spec_rounds
+                    ? (double)m.live_spec_commits / m.last_spec_rounds
+                    : 0.0,
+                use_chain ? (chain_mtp ? "chain" : "ngram")
+                          : (use_ngram ? "ngram" : "mtp"));
+      }
+    }
+    // SSD prompt cache: snapshot the end-of-turn state for future
+    // sessions. Cancelled turns are valid too -- hist tracks exactly the
+    // ingested tokens, and short states are skipped inside save().
+    // M-RoPE states carry the KVS3 grids/img-hash meta (see above).
+    if (!kvs.dir.empty() && hist.size() >= kvs.min_tokens)
+      kvsnap::save(m, hist, kvs);
+  } catch (const std::exception& e) {
+    // prefill/decode failure, or KvOverflow (pool exhausted by concurrent
+    // requests: this one is the later): the partial state is unknown, so
+    // drop it (returning the slot's pages to the pool) and fail the request
+    fprintf(stderr, "%s serve: req %lld failed: %s\n", log_ts(),
+            (long long)g.req, e.what());
+    m.prog_total = 0;
+    m.mtp_tap_capture = m.spec_snap = m.ngram_verify_active = false;
+    m.reset_state();
+    hist.clear();
+    mtp_live = false;
+    finish(err_line());
+  }
+}
+
+// Connection reader: control verbs inline, GEN handed to a worker thread.
+static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
+  Conn c;
+  c.fd = cfd;
+  c.id = ++g_conn_id;
+  LineBuf lb{cfd, {}};
+  std::thread worker;
+  std::string line;
+  bool alive = true;
+  while (alive && lb.readline(line)) {
+    if (line.empty()) continue;
+    std::istringstream ss(line);
+    std::string verb;
+    ss >> verb;
+    if (verb == "PING") {
+      alive = c.send("PONG\n");
+    } else if (verb == "INFO") {
+      char ib[160];
+      // fields: mtp draft_head ctx spec_rows default drafter_weights dflash2
+      //         cache_mb cache_align kv_slots slot_ctx cache_mode sampling
+      // The default drafter is the chain (ngram first, MTP fallback) unless
+      // GDEC_DRAFTER overrides; draft_head is a separate shortlist readout
+      // and is not part of this checkpoint. kv_slots: concurrent sequences.
+      snprintf(ib, sizeof ib, "I %d 0 %d 8 %d %d 0 0 0 %d %d 1 1\n",
+               m.mtp_avail ? 1 : 0, m.maxctx,
+               env_default_drafter() >= 0 ? env_default_drafter()
+                                          : (m.mtp_avail ? 1 : 0),
+               m.mtp_avail ? 1 : 0, m.nslots, m.maxctx);
+      alive = c.send(ib);
+    } else if (verb == "MEM") {
+      EngineMemStats ms = memstats_snapshot();
+      char mb[512];
+      // M version device_cur device_peak registered_cur pinned_cur
+      //   pinned_peak committed_cur hip_free hip_total hip_delta rss locked
+      snprintf(mb, sizeof mb,
+               "M 1 %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
+               (unsigned long long)ms.device_current,
+               (unsigned long long)ms.device_peak,
+               (unsigned long long)ms.registered_current,
+               (unsigned long long)ms.pinned_current,
+               (unsigned long long)ms.pinned_peak,
+               (unsigned long long)ms.committed_current,
+               (unsigned long long)ms.hip_free,
+               (unsigned long long)ms.hip_total,
+               (unsigned long long)ms.hip_used_since_start,
+               (unsigned long long)ms.process_rss,
+               (unsigned long long)ms.process_locked);
+      alive = c.send(mb);
+    } else if (verb == "X") {
+      int64_t req = 0;
+      ss >> req;
+      if (c.in_flight && req == c.req) {
+        c.cancel = true;  // the worker ends it with its own D cancel line
+      } else {
+        char db[96];
+        snprintf(db, sizeof db, "D %lld cancel 0 0 0.0 0.0\n", (long long)req);
+        alive = c.send(db);
+      }
+    } else if (verb == "GEN") {
+      GenReq g = parse_gen(ss);
+      if (g.reject || (int)g.ids.size() + g.max_tokens > m.maxctx) {
+        char db[128];
+        snprintf(db, sizeof db, "D %lld error %zu 0 0 0\n", (long long)g.req,
+                 g.ids.size());
+        alive = c.send(db);
+        continue;
+      }
+      // VIMG binary frames follow the GEN line immediately and must be
+      // drained before ANY reply path, or their bytes desync the line
+      // protocol. 120 s ceiling on the bulk transfer (~50 MB per 1080p
+      // image over loopback is sub-second; the ceiling only guards against
+      // a stalled client wedging this connection).
+      std::vector<std::vector<float>> vpatches;
+      if (g.vimg > 0) {
+        bool ok = true;
+        sock_rcvtimeo(cfd, 120);
+        vpatches.resize(g.vimg);
+        for (int i = 0; i < g.vimg && ok; i++) {
+          struct {
+            uint32_t magic, P;
+            uint64_t nbytes;
+          } fh;
+          ok = lb.read_full(&fh, sizeof fh) && fh.magic == 0x56494D31u &&
+               fh.P > 0 && fh.P <= 65536 &&
+               fh.nbytes == (uint64_t)fh.P * 1536 * 4;
+          if (!ok) break;
+          vpatches[i].resize((size_t)fh.P * 1536);
+          ok = lb.read_full(vpatches[i].data(), fh.nbytes);
+        }
+        sock_rcvtimeo(cfd, 0);
+        if (!ok) {
+          fprintf(stderr, "vision: frame read failed for req %lld "
+                  "(timeout/short/garbled); dropping the connection\n",
+                  (long long)g.req);
+          char db[128];
+          snprintf(db, sizeof db, "D %lld error %zu 0 0 0\n",
+                   (long long)g.req, g.ids.size());
+          c.send(db);
+          break;  // protocol desync: cannot trust anything after this
+        }
+      }
+      if (c.in_flight) {  // one GEN at a time per connection
+        fprintf(stderr, "serve: req %lld rejected: another GEN is in flight "
+                "on this connection\n", (long long)g.req);
+        char db[128];
+        snprintf(db, sizeof db, "D %lld error %zu 0 0 0\n", (long long)g.req,
+                 g.ids.size());
+        alive = c.send(db);
+        continue;
+      }
+      if (worker.joinable()) worker.join();  // previous request's post-D tail
+      c.cancel = false;
+      c.req = g.req;
+      c.in_flight = true;
+      worker = std::thread(gen_one, std::ref(m), std::ref(c), std::move(g),
+                           std::move(vpatches), std::cref(kvs));
+    }
+    // unknown verbs: drop
+  }
+  c.cancel = true;  // disconnect cancels the request in flight
+  if (worker.joinable()) worker.join();
+  {  // its slots become the first LRU victims (live conversations keep theirs)
+    std::lock_guard<std::mutex> lk(g_sm);
+    for (Slot& s : g_slots)
+      if (s.owner == c.id) s.owner = 0;
+  }
+  sock_close(cfd);
+  fprintf(stderr, "%s serve: client disconnected\n", log_ts());
+}
+
 static int run(GpuModel& m, int port) {
 #ifndef _WIN32
   signal(SIGPIPE, SIG_IGN);
@@ -864,13 +1744,20 @@ static int run(GpuModel& m, int port) {
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
   addr.sin_port = htons(port);
-  if (bind(lfd, (sockaddr*)&addr, sizeof addr) || listen(lfd, 4)) {
+  if (bind(lfd, (sockaddr*)&addr, sizeof addr) || listen(lfd, 16)) {
     fprintf(stderr, "serve: bind/listen failed on :%d: %s\n", port,
             sock_strerror(sock_errno()));
     return 1;
   }
-  fprintf(stderr, "serve: listening on :%d (maxctx %d)\n", port, m.maxctx);
-  kvsnap::Cfg kvs;
+  m.slots_init(eff_parallel());
+  g_slots.assign((size_t)m.nslots, Slot{});
+  if (m.nslots > 1) {
+    m.kv_starve_fn = &starve;
+    m.yield_fn = &yield_hook;
+  }
+  fprintf(stderr, "serve: listening on :%d (maxctx %d, %d slot%s)\n", port,
+          m.maxctx, m.nslots, m.nslots > 1 ? "s" : "");
+  static kvsnap::Cfg kvs;  // read-only once serving; workers share it
   kvs.dir = "data/kvsnap";
   if (const char* v = getenv("GDEC_KVSNAP_DIR")) kvs.dir = v;
   if (const char* v = getenv("GDEC_KVSNAP"))
@@ -887,659 +1774,7 @@ static int run(GpuModel& m, int port) {
     if (cfd < 0) continue;
     setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof one);
     fprintf(stderr, "%s serve: client connected\n", log_ts());
-    LineBuf lb{cfd, {}};
-    std::string line;
-    bool alive = true;
-    // tokens INGESTED on this connection (prompt + every token actually fed
-    // to forward). KV reuse: a GEN whose prompt extends hist exactly
-    // continues from live state instead of re-prefilling.
-    std::vector<int> hist;
-    // MTP KV continuity: true after a spec-enabled turn (prefill tap capture
-    // + spec decode keep the MTP layer's KV in lockstep with the trunk).
-    // False after kvsnap restores and any plain (non-speculative) turn.
-    bool mtp_live = false;
-    while (alive && lb.readline(line)) {
-      if (line.empty()) continue;
-      std::istringstream ss(line);
-      std::string verb;
-      ss >> verb;
-      if (verb == "PING") {
-        alive = send_all(cfd, "PONG\n");
-      } else if (verb == "INFO") {
-        char ib[160];
-        // fields: mtp draft_head ctx spec_rows default drafter_weights dflash2
-        //         cache_mb cache_align kv_slots slot_ctx cache_mode sampling
-        // The default drafter is the chain (ngram first, MTP fallback) unless
-        // GDEC_DRAFTER overrides; draft_head is a separate shortlist readout
-        // and is not part of this checkpoint.
-        snprintf(ib, sizeof ib, "I %d 0 %d 8 %d %d 0 0 0 1 %d 1 1\n",
-                 m.mtp_avail ? 1 : 0, m.maxctx,
-                 env_default_drafter() >= 0 ? env_default_drafter()
-                                            : (m.mtp_avail ? 1 : 0),
-                 m.mtp_avail ? 1 : 0, m.maxctx);
-        alive = send_all(cfd, ib);
-      } else if (verb == "MEM") {
-        EngineMemStats ms = memstats_snapshot();
-        char mb[512];
-        // M version device_cur device_peak registered_cur pinned_cur
-        //   pinned_peak committed_cur hip_free hip_total hip_delta rss locked
-        snprintf(mb, sizeof mb,
-                 "M 1 %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
-                 (unsigned long long)ms.device_current,
-                 (unsigned long long)ms.device_peak,
-                 (unsigned long long)ms.registered_current,
-                 (unsigned long long)ms.pinned_current,
-                 (unsigned long long)ms.pinned_peak,
-                 (unsigned long long)ms.committed_current,
-                 (unsigned long long)ms.hip_free,
-                 (unsigned long long)ms.hip_total,
-                 (unsigned long long)ms.hip_used_since_start,
-                 (unsigned long long)ms.process_rss,
-                 (unsigned long long)ms.process_locked);
-        alive = send_all(cfd, mb);
-      } else if (verb == "X") {
-        // no GEN in flight at this point (mid-decode cancel is polled below)
-        int64_t req = 0;
-        ss >> req;
-        char db[96];
-        snprintf(db, sizeof db, "D %lld cancel 0 0 0.0 0.0\n", (long long)req);
-        alive = send_all(cfd, db);
-      } else if (verb == "GEN") {
-        GenReq g = parse_gen(ss);
-        if (g.reject || (int)g.ids.size() + g.max_tokens > m.maxctx) {
-          char db[128];
-          snprintf(db, sizeof db, "D %lld error %zu 0 0 0\n", (long long)g.req,
-                   g.ids.size());
-          alive = send_all(cfd, db);
-          continue;
-        }
-        // VIMG binary frames follow the GEN line immediately and must be
-        // drained before ANY reply path below, or their bytes desync the
-        // line protocol. 120 s ceiling on the bulk transfer (~50 MB per
-        // 1080p image over loopback is sub-second; the ceiling only guards
-        // against a stalled client wedging the batch-1 server).
-        std::vector<std::vector<float>> vpatches;
-        if (g.vimg > 0) {
-          bool ok = true;
-          sock_rcvtimeo(cfd, 120);
-          vpatches.resize(g.vimg);
-          for (int i = 0; i < g.vimg && ok; i++) {
-            struct {
-              uint32_t magic, P;
-              uint64_t nbytes;
-            } fh;
-            ok = lb.read_full(&fh, sizeof fh) && fh.magic == 0x56494D31u &&
-                 fh.P > 0 && fh.P <= 65536 &&
-                 fh.nbytes == (uint64_t)fh.P * 1536 * 4;
-            if (!ok) break;
-            vpatches[i].resize((size_t)fh.P * 1536);
-            ok = lb.read_full(vpatches[i].data(), fh.nbytes);
-          }
-          sock_rcvtimeo(cfd, 0);
-          if (!ok) {
-            fprintf(stderr, "vision: frame read failed for req %lld "
-                    "(timeout/short/garbled); dropping the connection\n",
-                    (long long)g.req);
-            char db[128];
-            snprintf(db, sizeof db, "D %lld error %zu 0 0 0\n",
-                     (long long)g.req, g.ids.size());
-            send_all(cfd, db);
-            break;  // protocol desync: cannot trust anything after this
-          }
-        }
-        // Vision request validation (0.5.8 semantics), before state mutation:
-        // patches need a loaded tower and one MROPE grid each; any image
-        // placeholder without a grid is rejected (first position logged).
-        if (g.vimg > 0) {
-          const char* why = nullptr;
-          if (!m.vision_on)
-            why = "vision tower not loaded (start the engine with "
-                  "--vision-tower <sidecar.hgn>)";
-          else if ((int)g.mrope_grids.size() != g.vimg)
-            why = "VIMG frame count != MROPE grid count";
-          else
-            for (int i = 0; i < g.vimg; i++) {
-              auto gr = g.mrope_grids[i];
-              if (gr[0] != 1 ||
-                  (int)vpatches[i].size() != gr[0] * gr[1] * gr[2] * 1536) {
-                why = "patches/grid size mismatch (or t != 1)";
-                break;
-              }
-            }
-          if (why) {
-            fprintf(stderr, "vision: req %lld rejected: %s\n",
-                    (long long)g.req, why);
-            char db[128];
-            snprintf(db, sizeof db, "D %lld error %zu 0 0 0\n",
-                     (long long)g.req, g.ids.size());
-            alive = send_all(cfd, db);
-            continue;
-          }
-        }
-        if (g.mrope_grids.empty()) {
-          size_t bad = g.ids.size();
-          for (size_t i = 0; i < g.ids.size(); i++)
-            if (g.ids[i] == 248056 || g.ids[i] == 248057) {
-              bad = i;
-              break;
-            }
-          if (bad < g.ids.size()) {
-            fprintf(stderr, "vision: req %lld rejected: image placeholder at "
-                    "prompt pos %zu without MROPE/VIMG\n", (long long)g.req,
-                    bad);
-            char db[128];
-            snprintf(db, sizeof db, "D %lld error %zu 0 0 0\n",
-                     (long long)g.req, g.ids.size());
-            alive = send_all(cfd, db);
-            continue;
-          }
-        }
-        // KV reuse: longest common prefix of live state and this prompt.
-        // Continue only when hist is a STRICT prefix (mcp == hist.size() and
-        // new tokens follow); anything else falls to the SSD snapshot cache
-        // and only then to a full recompute.
-        size_t mcp = 0;
-        while (mcp < hist.size() && mcp < g.ids.size() && hist[mcp] == g.ids[mcp])
-          mcp++;
-        bool cont = !hist.empty() && mcp == hist.size() && mcp < g.ids.size();
-        int n_cached = cont ? (int)mcp : 0;
-        // M-RoPE restrictions, decided before any state mutation:
-        // KV reuse (cont) IS sound for M-RoPE — prefix positions are
-        // suffix-independent and RoPE is applied before K is cached, so the
-        // cached prefix is identical to what a recompute would produce —
-        // but only when the cached image KV came from the SAME pixels:
-        // placeholder ids are pixel-agnostic, so the patch-bytes hash
-        // guards cont; a mismatch (or GDEC_VISION_NOCONT) falls back to a
-        // full recompute. MTP speculation IS allowed for M-RoPE: verify
-        // positions come from the d_ropecs table (ensure_rope_cs handles
-        // base=q+1 out-of-range rows with rope_delta_), and the drafter
-        // paths rotate with *d_rdelta, so only acceptance rate is at stake.
-        if (!g.mrope_grids.empty() && cont &&
-            (fnv1a_patches(vpatches) != m.img_hash_ ||
-             getenv("GDEC_VISION_NOCONT"))) {
-          cont = false;
-          n_cached = 0;
-        }
-        if (!cont && rckpt::enabled()) {
-          // RAM checkpoint tier (llama.cpp-style PARTIAL_ONLY): only GDN
-          // state is stored; validity requires the checkpoint tokens to be a
-          // prefix of the live token stream (m.chist), which guarantees the
-          // QSA KV/indexer prefix is still intact. MTP KV for the restored
-          // prefix is NOT guaranteed -> disable speculation for this turn.
-          const bool is_mrope = !g.mrope_grids.empty();
-          const uint64_t req_ih = is_mrope ? fnv1a_patches(vpatches) : 0;
-          auto r0 = std::chrono::steady_clock::now();
-          int ci = rckpt::match(g.ids, m.chist, is_mrope,
-                                is_mrope ? &g.mrope_grids : nullptr, req_ih);
-          if (ci >= 0 && rckpt::restore(m, ci, &hist)) {
-            mcp = hist.size();
-            cont = true;
-            n_cached = (int)mcp;
-            mtp_live = false;
-            double rs = std::chrono::duration<double>(
-                            std::chrono::steady_clock::now() - r0)
-                            .count();
-            fprintf(stderr, "%s rckpt: restored %zu tokens in %.2fs\n",
-                    log_ts(), mcp, rs);
-          }
-        }
-        if (!cont && !kvs.dir.empty()) {
-          size_t sn = 0;
-          // M-RoPE requests: placeholder ids are pixel-agnostic, so a
-          // snapshot only qualifies when grids AND patch-bytes hash match
-          // (checked inside best_prefix against the KVS3 meta); a mismatch
-          // is simply a cache miss and falls to a full recompute.
-          const bool is_mrope = !g.mrope_grids.empty();
-          const uint64_t req_ih = is_mrope ? fnv1a_patches(vpatches) : 0;
-          std::string sp = kvsnap::best_prefix(
-              kvs, g.ids, &sn, is_mrope ? &g.mrope_grids : nullptr, req_ih);
-          if (!sp.empty()) {
-            auto r0 = std::chrono::steady_clock::now();
-            if (kvsnap::restore(m, sp, hist, kvs)) {  // hist := snapshot tokens
-              mcp = hist.size();
-              cont = true;
-              n_cached = (int)mcp;
-              // the snapshot holds no MTP KV/state: as after an rckpt restore,
-              // the MTP layer is stale for the restored prefix
-              mtp_live = false;
-              double rs = std::chrono::duration<double>(
-                              std::chrono::steady_clock::now() - r0)
-                              .count();
-              fprintf(stderr, "%s kvsnap: restored %zu tokens from %s in %.1fs\n",
-                      log_ts(), mcp, sp.c_str(), rs);
-            }
-          }
-        }
-        if (!cont) m.reset_state();
-        // Ngram proposals are request-local. Clear learned suffixes so a
-        // previous request cannot collide with this prompt's hash history.
-        if (g.drafter == 3 || g.drafter == 4) m.ngram.reset();
-        // Vision requests expand their grids in-engine (validated against the
-        // prompt's image token runs); plain requests drop stale mrope state
-        // (a cont turn skips reset_state).
-        if (!g.mrope_grids.empty()) {
-          if (!m.set_mrope(g.ids, g.mrope_grids)) {
-            fprintf(stderr, "vision: req %lld rejected: grids do not cover "
-                    "the image token runs\n", (long long)g.req);
-            char db[128];
-            snprintf(db, sizeof db, "D %lld error %zu 0 0 0\n",
-                     (long long)g.req, g.ids.size());
-            alive = send_all(cfd, db);
-            continue;
-          }
-          if (g.vimg > 0 &&
-              !m.vision_embeds(g.ids, g.mrope_grids, vpatches, n_cached)) {
-            char db[128];
-            snprintf(db, sizeof db, "D %lld error %zu 0 0 0\n",
-                     (long long)g.req, g.ids.size());
-            alive = send_all(cfd, db);
-            continue;
-          }
-          vpatches.clear();
-          vpatches.shrink_to_fit();  // ~50 MB/image: release before decode
-        } else {
-          m.clear_mrope();
-        }
-        std::unordered_set<int> eos(g.eos.begin(), g.eos.end());
-        HostSampler smp;
-        std::vector<float> lbuf;
-        if (g.sample) {
-          smp.temp = g.temp;
-          smp.top_p = g.top_p;
-          smp.min_p = g.min_p;
-          smp.top_k = g.top_k;
-          smp.rng = g.seed;
-          smp.presence = g.presence;
-          smp.frequency = g.frequency;
-          smp.bias = g.bias;
-          // penalties count GENERATED tokens only: hist starts empty and
-          // sample() records each emitted token
-        }
-        auto t0 = std::chrono::steady_clock::now();
-        int cur;
-        float cur_lp = 0.0f;
-        // MTP speculation is available for greedy and rejection-sampled
-        // requests when its KV can be made complete. kvsnap restores lack MTP
-        // KV for the prompt, so those requests stay on plain decode.
-        static const int spec_gamma = std::max(
-            1, std::min(8, getenv("GDEC_SPEC_GAMMA")
-                               ? atoi(getenv("GDEC_SPEC_GAMMA"))
-                               : 3));
-        if (g.drafter == 1 && !m.mtp_avail) {
-          char db[128];
-          snprintf(db, sizeof db, "D %lld error %zu 0 0 0\n",
-                   (long long)g.req, g.ids.size());
-          alive = send_all(cfd, db);
-          continue;
-        }
-        const bool use_ngram = g.drafter == 3 && !g.sample;
-        // Chain mode (llama.cpp-style fallback): ngram drafts every round it
-        // can, MTP takes the rounds where the table has nothing. Sampled
-        // requests run spec_loop_chain_sample (ngram rounds re-draw from the
-        // target distribution; GDEC_NOSPEC_SAMPLE forces plain serial, same
-        // as use_spec). The MTP leg requires a complete MTP KV: a fresh
-        // prefill always has one; a cont/kvsnap turn only if the previous
-        // request left MTP live.
-        const bool use_chain = g.drafter == 4 &&
-                               (!g.sample ||
-                                getenv("GDEC_NOSPEC_SAMPLE") == nullptr);
-        const bool chain_mtp = use_chain && m.mtp_avail &&
-                               (!cont || mtp_live) &&
-                               getenv("GDEC_NOSPEC") == nullptr;
-        const bool use_spec = !use_ngram && !use_chain && m.mtp_avail &&
-                              g.drafter != 0 && g.drafter != 3 &&
-                              g.drafter != 4 &&
-                              (!cont || mtp_live) &&
-                              (!g.sample ||
-                               getenv("GDEC_NOSPEC_SAMPLE") == nullptr) &&
-                              getenv("GDEC_NOSPEC") == nullptr;
-        m.last_spec_rounds = m.last_spec_commit = m.last_spec_rollbacks = 0;
-        try {
-          if (use_spec || chain_mtp) {
-            m.mtp_tap_capture = true;  // prefill_batch ingests MTP per chunk
-            if (cont) {
-              // Boundary: MTP position mcp-1 pairs the live d_R (stream at
-              // the last ingested position) with the first new token.
-              std::vector<int> bt{g.ids[mcp]};
-              m.mtp_ingest_b(m.d_R, bt, 1, (int)mcp - 1);
-            }
-          }
-          // Frontend-hinted snapshot points (SNAPS/SNAP/SNAP2) that fall
-          // inside the uncached range: pause the prefill there, checkpoint,
-          // resume. The next turn re-renders history as TEXT whose ids match
-          // the prompt only up to these boundaries (the assistant opener and
-          // generated text retokenize differently), so they are the cuts
-          // that hit. Checkpoints go to the RAM tier (rckpt): the SSD tier
-          // only takes the prompt-end and request-end states to bound disk
-          // churn.
-          std::vector<size_t> cuts;
-          if (!kvs.dir.empty() || rckpt::enabled()) {
-            for (size_t c : g.snaps)
-              if (c > mcp && c < g.ids.size() && c >= kvs.min_tokens)
-                cuts.push_back(c);
-            for (size_t c : {g.snap2, g.snap})
-              if (c > mcp && c < g.ids.size() && c >= kvs.min_tokens)
-                cuts.push_back(c);
-          }
-          std::sort(cuts.begin(), cuts.end());
-          cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
-          if (!cont) hist.clear();
-          size_t done_upto = cont ? mcp : 0;
-          // Arm the 1s prefill progress reporter for the prompt ingest only
-          // (spec-verify batches never see it armed). prog_base accumulates
-          // across the kvsnap cut segments inside prefill_chunk.
-          m.prog_total = (int)(g.ids.size() - done_upto);
-          m.prog_base = 0;
-          m.prog_last_est = 0;
-          m.prog_req = g.req;
-          m.prog_t0 = m.prog_last = std::chrono::steady_clock::now();
-          // live spec counters reset per request, or a serial decode after a
-          // speculative one would report the previous request's acceptance
-          m.live_spec_rounds = m.live_spec_commits = m.live_spec_proposed = 0;
-          for (size_t c : cuts) {
-            std::vector<int> seg(g.ids.begin() + done_upto, g.ids.begin() + c);
-            cur = m.prefill_batch(seg, (int)done_upto);
-            hist.assign(g.ids.begin(), g.ids.begin() + c);
-            rckpt::save(m, hist);
-            done_upto = c;
-          }
-          std::vector<int> seg(g.ids.begin() + done_upto, g.ids.end());
-          cur = m.prefill_batch(seg, (int)done_upto);
-          m.prog_total = 0;
-          m.mtp_tap_capture = false;  // decode/verify must not capture taps
-          hist = g.ids;  // prompt fully ingested on both paths
-          if (use_spec || chain_mtp) mtp_live = true;  // MTP KV complete & in lockstep
-          if (g.sample) {  // d_logits still holds the last position's logits
-            m.get_logits(lbuf);
-            cur = smp.sample(lbuf, &cur_lp);
-          }
-        } catch (const std::exception& e) {
-          m.prog_total = 0;
-          m.mtp_tap_capture = false;
-          fprintf(stderr, "serve: prefill failed: %s\n", e.what());
-          hist.clear();  // partial prefill left unknown state: force fresh
-          char db[128];
-          snprintf(db, sizeof db, "D %lld error %zu 0 0 0\n", (long long)g.req,
-                   g.ids.size());
-          alive = send_all(cfd, db);
-          continue;
-        }
-        double pre_ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - t0)
-                            .count();
-        // Phase 1: snapshot only at end-of-turn. This removes the first-token
-        // stall while the full asynchronous capture path is being designed.
-        rckpt::save(m, hist);  // prompt-end RAM checkpoint (cheap, deduped)
-        auto d0 = std::chrono::steady_clock::now();
-        int ngen = 0;
-        bool cancel = false, dead = false;
-        std::string reason = "length";
-        // mid-decode control poll: X cancels this request, PING stays alive
-        auto poll_ctrl = [&]() {
-          std::string cl;
-          while (lb.try_readline(cl)) {
-            std::istringstream cs(cl);
-            std::string cv;
-            int64_t cr = 0;
-            cs >> cv;
-            if (cv == "X" && (cs >> cr) && cr == g.req)
-              cancel = true;
-            else if (cv == "PING")
-              send_all(cfd, "PONG\n");
-            // other verbs mid-request: drop (batch-1)
-          }
-        };
-        // 1s-cadence decode stats (2026-09-13): instantaneous + average t/s,
-        // with the live MTP acceptance the spec loops bump every round.
-        // committed drafts = commits - rounds (each round also emits the
-        // verify/bonus token), acceptance = committed / proposed.
-        auto dl_t0 = std::chrono::steady_clock::now();
-        auto dl_last = dl_t0;
-        int dl_last_ngen = 0;
-        auto dl_tick = [&]() {
-          auto now = std::chrono::steady_clock::now();
-          double iv = std::chrono::duration<double>(now - dl_last).count();
-          if (iv < 1.0) return;
-          double el = std::chrono::duration<double>(now - dl_t0).count();
-          if (m.live_spec_rounds > 0) {
-            int acc_n = m.live_spec_commits - m.live_spec_rounds;
-            fprintf(stderr,
-                    "%s req %lld | n_decoded = %d | t = %.0f s | tg = %.1f "
-                    "tok/s (avg %.1f) | accept %.1f%% (%d/%d)\n",
-                    log_ts(), (long long)g.req, ngen, el,
-                    (ngen - dl_last_ngen) / iv, el > 0 ? ngen / el : 0.0,
-                    m.live_spec_proposed
-                        ? 100.0 * acc_n / m.live_spec_proposed
-                        : 0.0,
-                    acc_n, m.live_spec_proposed);
-          } else {
-            fprintf(stderr,
-                    "%s req %lld | n_decoded = %d | t = %.0f s | tg = %.1f "
-                    "tok/s (avg %.1f)\n",
-                    log_ts(), (long long)g.req, ngen, el,
-                    (ngen - dl_last_ngen) / iv, el > 0 ? ngen / el : 0.0);
-          }
-          dl_last = now;
-          dl_last_ngen = ngen;
-        };
-        if (use_ngram || use_chain) {
-          // chain with a live MTP keeps it live (the loop patches its KV
-          // every ngram round); pure/degraded ngram is trunk-only decode and
-          // invalidates the previous MTP state.
-          const bool chain = use_chain && chain_mtp;
-          if (!chain) mtp_live = false;
-          if (!m.ple_on) m.chist.assign(g.ids.begin(), g.ids.end());
-          if (eos.count(cur)) { reason="done"; }
-          else {
-            char tb0[96];
-            int tl0 = g.sample && g.logprobs
-                          ? snprintf(tb0, sizeof tb0, "T %lld %d %.6f\n",
-                                     (long long)g.req, cur, (double)cur_lp)
-                          : snprintf(tb0, sizeof tb0, "T %lld %d\n",
-                                     (long long)g.req, cur);
-            if(!send_all(cfd,std::string(tb0,tl0))){dead=true;} else ngen++;
-          }
-          auto emit_ng = [&](int tok) -> bool {
-            if (ngen >= g.max_tokens) return false;
-            if (eos.count(tok)) { reason="done"; return false; }
-            char tb2[96]; int tl2=snprintf(tb2,sizeof tb2,"T %lld %d\n",(long long)g.req,tok);
-            if(!send_all(cfd,std::string(tb2,tl2))){dead=true;return false;} ngen++; poll_ctrl(); dl_tick(); return !cancel;
-          };
-          auto emit_ng_smp = [&](int tok, float lp) -> bool {
-            if (ngen >= g.max_tokens) return false;
-            if (eos.count(tok)) { reason="done"; return false; }
-            char tb2[96];
-            int tl2 = g.logprobs
-                          ? snprintf(tb2, sizeof tb2, "T %lld %d %.6f\n",
-                                     (long long)g.req, tok, (double)lp)
-                          : snprintf(tb2, sizeof tb2, "T %lld %d\n",
-                                     (long long)g.req, tok);
-            if(!send_all(cfd,std::string(tb2,tl2))){dead=true;return false;} ngen++; poll_ctrl(); dl_tick(); return !cancel;
-          };
-          if (!dead && !eos.count(cur)) {
-            if (g.sample)
-              m.spec_loop_chain_sample(cur, g.max_tokens - 1, spec_gamma, smp,
-                                       chain_mtp, emit_ng_smp);
-            else if (chain) m.spec_loop_chain(cur, g.max_tokens - 1, spec_gamma, emit_ng);
-            else m.spec_loop_ngram(cur,g.max_tokens-1,m.ngram.n_max,emit_ng);
-          }
-          hist.assign(m.chist.begin(),m.chist.end());
-        } else if (use_spec) {
-          // Stream each token as the spec loop commits it. eos/cancel/length
-          // return false, rolling the round back so trunk and MTP stop at the
-          // last token actually sent to the client.
-          if (eos.count(cur)) {
-            reason = "done";
-          } else {
-            char tb[96];
-            int tl = g.sample && g.logprobs
-                         ? snprintf(tb, sizeof tb, "T %lld %d %.6f\n",
-                                    (long long)g.req, cur, (double)cur_lp)
-                         : snprintf(tb, sizeof tb, "T %lld %d\n",
-                                    (long long)g.req, cur);
-            if (!send_all(cfd, std::string(tb, tl))) {
-              dead = true;
-            } else {
-              ngen++;
-              if (g.sample) {
-                auto emit = [&](int tok, float lp) -> bool {
-                  if (ngen >= g.max_tokens) return false;
-                  if (eos.count(tok)) {
-                    reason = "done";
-                    return false;
-                  }
-                  char tb2[96];
-                  int tl2 = g.logprobs
-                                ? snprintf(tb2, sizeof tb2,
-                                           "T %lld %d %.6f\n",
-                                           (long long)g.req, tok, (double)lp)
-                                : snprintf(tb2, sizeof tb2, "T %lld %d\n",
-                                           (long long)g.req, tok);
-                  if (!send_all(cfd, std::string(tb2, tl2))) {
-                    dead = true;
-                    return false;
-                  }
-                  ngen++;
-                  poll_ctrl();
-                  dl_tick();
-                  return !cancel;
-                };
-                m.spec_loop_sample(cur, g.max_tokens - 1, spec_gamma, smp,
-                                   emit);
-              } else {
-                auto emit = [&](int tok) -> bool {
-                  if (ngen >= g.max_tokens) return false;
-                  if (eos.count(tok)) {
-                    reason = "done";
-                    return false;
-                  }
-                  char tb2[96];
-                  int tl2 = snprintf(tb2, sizeof tb2, "T %lld %d\n",
-                                     (long long)g.req, tok);
-                  if (!send_all(cfd, std::string(tb2, tl2))) {
-                    dead = true;
-                    return false;
-                  }
-                  ngen++;
-                  poll_ctrl();
-                  dl_tick();
-                  return !cancel;
-                };
-                m.spec_loop(cur, g.max_tokens - 1, spec_gamma, emit);
-              }
-              // Trunk ingested exactly chist tokens; hist must match for the
-              // next turn's KV-reuse prefix check.
-              hist.assign(m.chist.begin(), m.chist.end());
-            }
-          }
-        } else {
-          mtp_live = false;  // plain decode leaves the MTP layer stale
-        }
-        if (!use_spec && !use_ngram && !use_chain)
-        for (int i = 0; i < g.max_tokens; i++) {
-          if (eos.count(cur)) {
-            reason = "done";
-            break;
-          }
-          char tb[96];
-          int tl = g.logprobs
-                       ? snprintf(tb, sizeof tb, "T %lld %d %.6f\n",
-                                  (long long)g.req, cur, (double)cur_lp)
-                       : snprintf(tb, sizeof tb, "T %lld %d\n",
-                                  (long long)g.req, cur);
-          if (!send_all(cfd, std::string(tb, tl))) {
-            dead = true;
-            break;
-          }
-          ngen++;
-          if (i + 1 < g.max_tokens) {
-            int fed = cur;  // the token forward() ingests (pre-sampling)
-            cur = m.forward(fed);
-            hist.push_back(fed);
-            if (g.sample) {
-              m.get_logits(lbuf);
-              cur = smp.sample(lbuf, &cur_lp);
-            }
-          }
-          poll_ctrl();
-          dl_tick();
-          if (cancel) break;
-        }
-        if (dead) break;
-        double dec_ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - d0)
-                            .count();
-        char db[192];
-        if (cancel)
-          snprintf(db, sizeof db, "D %lld cancel 0 0 0.0 0.0\n", (long long)g.req);
-        else if ((use_spec || use_ngram || use_chain) && m.last_spec_rounds > 0)
-          snprintf(db, sizeof db,
-                   "D %lld %s %zu %d %.1f %.1f %d %d %d %d %d\n",
-                   (long long)g.req, reason.c_str(), g.ids.size(), ngen, pre_ms,
-                   ngen > 1 ? dec_ms : 0.0,
-                   use_chain ? (chain_mtp ? 4 : 3) : (use_ngram ? 3 : 1),
-                   m.last_spec_rounds,
-                   m.last_spec_commit, n_cached, m.last_spec_proposed);
-        else
-          // trailing "0 0 0 <n_cached> 0": drafter/rounds/commit placeholders
-          // so n_cached lands in the protocol's cache column (parts[10]);
-          // the last 0 is the proposed-drafts column (parts[11])
-          snprintf(db, sizeof db, "D %lld %s %zu %d %.1f %.1f 0 0 0 %d 0\n",
-                   (long long)g.req, reason.c_str(), g.ids.size(), ngen, pre_ms,
-                   ngen > 1 ? dec_ms : 0.0, n_cached);
-        alive = send_all(cfd, db);
-        {
-          // llama.cpp-style per-request timing block (human-facing; the wire
-          // D line above stays the machine-readable record).
-          size_t n_proc =
-              g.ids.size() - (n_cached > 0 ? (size_t)n_cached : 0);
-          fprintf(stderr,
-                  "%s req %lld | prompt eval = %.1f ms / %zu tokens "
-                  "(%.2f ms/token, %.1f tok/s)%s\n",
-                  log_ts(), (long long)g.req, pre_ms, n_proc,
-                  n_proc ? pre_ms / n_proc : 0.0,
-                  pre_ms > 0 ? n_proc / (pre_ms / 1000.0) : 0.0,
-                  n_cached ? " | cached" : "");
-          if (ngen > 0)
-            fprintf(stderr,
-                    "%s req %lld | decode eval = %.1f ms / %d tokens "
-                    "(%.2f ms/token, %.1f tok/s) | %s\n",
-                    log_ts(), (long long)g.req, dec_ms, ngen,
-                    dec_ms > 0 ? dec_ms / ngen : 0.0,
-                    dec_ms > 0 ? ngen / (dec_ms / 1000.0) : 0.0,
-                    cancel ? "cancel" : reason.c_str());
-          else
-            fprintf(stderr, "%s req %lld | decode eval = no tokens | %s\n",
-                    log_ts(), (long long)g.req,
-                    cancel ? "cancel" : reason.c_str());
-          if ((use_spec || use_ngram || use_chain) && m.last_spec_rounds > 0) {
-            int acc_n = m.live_spec_commits - m.live_spec_rounds;
-            fprintf(stderr,
-                    "%s req %lld | draft acceptance = %.3f (%d accepted / %d "
-                    "proposed), mean len = %.2f, drafter %s\n",
-                    log_ts(), (long long)g.req,
-                    m.live_spec_proposed
-                        ? (double)acc_n / m.live_spec_proposed
-                        : 0.0,
-                    acc_n, m.live_spec_proposed,
-                    m.last_spec_rounds
-                        ? (double)m.live_spec_commits / m.last_spec_rounds
-                        : 0.0,
-                    use_chain ? (chain_mtp ? "chain" : "ngram")
-                              : (use_ngram ? "ngram" : "mtp"));
-          }
-        }
-        // SSD prompt cache: snapshot the end-of-turn state for future
-        // sessions. Cancelled turns are valid too -- hist tracks exactly the
-        // ingested tokens, and short states are skipped inside save().
-        // M-RoPE states carry the KVS3 grids/img-hash meta (see above).
-        if (!kvs.dir.empty() && hist.size() >= kvs.min_tokens)
-          kvsnap::save(m, hist, kvs);
-      }
-      // unknown verbs: drop
-    }
-    sock_close(cfd);
-    fprintf(stderr, "%s serve: client disconnected\n", log_ts());
+    std::thread(conn_main, std::ref(m), cfd, std::cref(kvs)).detach();
   }
   return 0;
 }

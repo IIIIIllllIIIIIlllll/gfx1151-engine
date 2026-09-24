@@ -105,6 +105,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <list>
 #include <map>
 #include <mutex>
 #include <sstream>

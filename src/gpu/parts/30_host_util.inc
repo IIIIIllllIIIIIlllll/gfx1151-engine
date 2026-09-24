@@ -62,6 +62,13 @@ static int eff_tail_slack() {
 #endif
 }
 
+// 并发序列槽数（GDEC_PARALLEL，serve 模式；1..8）。槽共享同一个 KV 页池，
+// 每多一个槽只多 GDN/卷积/环形状态、页表和 MTP KV（见 GpuModel::slots_init）。
+static int eff_parallel() {
+  const char* e = getenv("GDEC_PARALLEL");
+  return e ? std::max(1, std::min(8, atoi(e))) : 1;
+}
+
 // 镜像 GpuModel 构造函数的分配公式（含相同 env 分支），用于 arena 精确 sizing。
 // 每项 256B 对齐后求和；估少了一律有 dalloc_arena 的 hipMalloc 回退兜底。
 static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
@@ -186,7 +193,24 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
                            !getenv("GDEC_MOE_HOST_ROUTE") &&
                            !getenv("GDEC_MOE_UNTILED") &&
                            !getenv("GDEC_MOE_FP32_IO");
-  if (ck.find("mtp.fc_hidden.weight") && moe_default) {
+  const bool mtp_on = ck.find("mtp.fc_hidden.weight") && moe_default;
+  // 额外序列槽（GpuModel::slots_init，仅分页 KV）：每槽一份序列状态
+  if (kv_paged)
+    for (int i = 1; i < eff_parallel(); i++) {
+      add(rb * 4);                                     // d_R
+      add(ngdn * 48 * 128 * 128 * 4);                  // d_S
+      add(ngdn * 3 * 10240 * 4);                       // d_convst
+      add(9 * 10240 * 4);                              // d_ring
+      add(4); add(4); add(4);                          // d_pos d_ringpos d_rdelta
+      if (!qsa_dense) add(nqsa * 4 * 128 * 4);         // d_iraw
+      add(kvpg * 4);                                   // d_ptab
+      if (mtp_on) {
+        add(4);                                        // d_mpos
+        add(mc * 512 * (kv_fp32 ? 4 : 2)); add(mc * 512 * (kv_fp32 ? 4 : 2));  // MTP KV
+        if (!qsa_dense) { add(ib * 128 * 4); add(4 * 128 * 4); }  // mik miraw
+      }
+    }
+  if (mtp_on) {
     add(rb * 4 * 3 + (size_t)g_cfg.d * 4 * 5 + 8);  // mR mRhat mh me meo mt mnorm_*
     add(2 * mc * 512 * (kv_fp32 ? 4 : 2));          // MTP KV
     add(3 * BP * 10240 * 4);                        // mRb mRhatb mtap
