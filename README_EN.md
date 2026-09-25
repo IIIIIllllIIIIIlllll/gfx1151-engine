@@ -54,12 +54,14 @@ gfx1151)**, 122 GiB RAM:
 ## Quick Start
 
 ```bash
-bash build.sh     # Build engine + API, output goes to build/
-bash start.sh     # Load the model and start the service (reads service.conf)
+bash build.sh        # Build engine + API, output goes to build/
+bash start_hgn.sh    # hgn weights: load the model and start the service (reads service.conf)
+bash start_gguf.sh   # or GGUF weights (Unsloth UD-Q4_K_XL, the same files llama.cpp uses)
 ```
 
-Model files are read from `./models` by default; configuration is
-centralized in `service.conf`. See [QUICKSTART_EN.md](QUICKSTART_EN.md)
+Both launchers read weights from `./models` and list any missing files before
+exiting; configuration is centralized in `service.conf` (one section each for
+hgn and GGUF; GGUF details in [GGUF.md](GGUF.md)). See [QUICKSTART_EN.md](QUICKSTART_EN.md)
 for details.
 
 Converting your own fine-tuned model (HF safetensors, same architecture):
@@ -104,7 +106,7 @@ Differences from the Linux version:
   shown in console/logs)
 - The launchers do not enable `GDEC_GEMM_WMMA` or `GDEC_GDN_FUSED` (the
   self-written WMMA GEMM and fused GDN kernel already promoted on Linux
-  start.sh, worth ~8-10% PP combined but unverified under TheRock — so
+  launchers, worth ~8-10% PP combined but unverified under TheRock — so
   Windows prefill uses hipBLASLt plus the legacy GDN path)
 
 Build details are in [BUILD_EN.md](BUILD_EN.md).

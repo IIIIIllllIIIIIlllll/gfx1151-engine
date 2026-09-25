@@ -12,7 +12,7 @@ export PROBE_CAP_GB=${PROBE_CAP_GB:-100}
 N=${N:-512}
 TOK=logs/g3_tok$N.txt
 tr -s ' ,\t' '\n' <"$HOME/ppbench/tok8192.txt" | grep -E '^[0-9]+$' | head -$N >"$TOK"
-chk="$(bash start.sh --check 2>&1)" || { echo "$chk"; exit 1; }
+chk="$(bash start_hgn.sh --check 2>&1)" || { echo "$chk"; exit 1; }
 mapfile -t PENV < <(sed -n 's/^ENV //p' <<<"$chk")
 eval "C=($(sed -n 's/^CMD //p' <<<"$chk"))"
 M=${C[1]}; O=${C[2]}; [[ "$O" == --* ]] && O=""

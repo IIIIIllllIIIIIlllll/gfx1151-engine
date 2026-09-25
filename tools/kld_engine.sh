@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# 引擎侧 KLD：生产环境变量（start.sh --check）下读 llama.cpp 的 logits 基准文件。
+# 引擎侧 KLD：生产环境变量（start_hgn.sh --check）下读 llama.cpp 的 logits 基准文件。
 #   bash tools/kld_engine.sh <ref.kld> [标签] [K=V ...]
 #     CHUNKS=N            只算前 N 个 chunk（默认文件里全部）
 #     SAVE=out.kld        同时把引擎自己的 logits 写成 llama.cpp 格式（可给 llama 读）
 #     BIN=build/gdec      换二进制
-#     MODEL= OVERLAY=     覆盖 start.sh 的权重；OVERLAY=none 去掉 overlay
+#     LAUNCHER=start_gguf.sh  改取 GGUF 启动器的权重与环境
+#     MODEL= OVERLAY=     覆盖启动器的权重；OVERLAY=none 去掉 overlay
 #     UNSET="GDEC_A ..."  从生产 env 去掉这些变量
 #   bash tools/kld_engine.sh --tokens IDS.txt <out.kld> [标签]   无基准：只写引擎 logits 文件
 #     CTX=512 CHUNKS=N
 # 输出：logs/kld_<标签>.log（stdout 为 llama.cpp 同格式摘要 + kld_summary 行）。
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-[[ $# -ge 1 ]] || { sed -n '2,12p' "$0"; exit 1; }
+[[ $# -ge 1 ]] || { sed -n '2,13p' "$0"; exit 1; }
 KARGS=()
 if [[ $1 == --tokens ]]; then
   [[ $# -ge 3 ]] || { echo "用法: --tokens IDS.txt out.kld [标签]"; exit 1; }
@@ -28,8 +29,9 @@ fi
 [[ -n "${CHUNKS:-}" ]] && KARGS+=(--kld-chunks "$CHUNKS")
 BIN=${BIN:-build/gdec}
 
-for f in start.sh service.conf; do grep -q $'\r' "$f" && sed -i 's/\r$//' "$f"; done
-chk="$(bash start.sh --check 2>&1)" || { echo "$chk"; echo "start.sh --check 失败"; exit 1; }
+for f in start_hgn.sh start_gguf.sh tools/serve_common.sh service.conf; do grep -q $'\r' "$f" && sed -i 's/\r$//' "$f"; done
+LAUNCHER=${LAUNCHER:-start_hgn.sh}
+chk="$(bash "$LAUNCHER" --check 2>&1)" || { echo "$chk"; echo "$LAUNCHER --check 失败"; exit 1; }
 mapfile -t PENV < <(sed -n 's/^ENV //p' <<<"$chk")
 CMDLINE="$(sed -n 's/^CMD //p' <<<"$chk")"
 eval "C=($CMDLINE)"

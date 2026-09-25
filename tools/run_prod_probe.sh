@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Start ONE engine (no API front end) with the production kernel env of
-# start.sh, on a test port, for protocol-level A/B tests (kvsnap_ab.py etc.).
-# Keep the export block in sync with start.sh:103-115.
+# start_hgn.sh, on a test port, for protocol-level A/B tests (kvsnap_ab.py etc.).
+# Keep the export block in sync with tools/serve_common.sh (serve_run).
 #   PROBE_TAG=name PROBE_CONTEXT=65536 KVSNAP_DIR=data/kvsnap-ab \
 #   MTP_FILE=models/xxx-mtp.hgn bash tools/run_prod_probe.sh
 set -euo pipefail

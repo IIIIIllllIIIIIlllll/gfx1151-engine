@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 生产环境变量下的离线 prefill 基准（env 取自 start.sh --check，含 KV_PAGED 等）。
+# 生产环境变量下的离线 prefill 基准（env 取自 start_hgn.sh --check，含 KV_PAGED 等）。
+#     LAUNCHER=start_gguf.sh  改取 GGUF 启动器的权重与环境
 #   bash tools/pp_prod.sh <tokfile|32k|64k|...> [标签] [K=V ...]
 #     BIN=build/gdec.base     换二进制做 A/B（默认 build/gdec）
 #     KTRACE=1                包 rocprofv3 --kernel-trace --stats，打印 kernel 耗时前 25
@@ -11,7 +12,7 @@
 # 输出：logs/<标签>.log；打印 phase / prefill / prof 行与总耗时。
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-[[ $# -ge 1 ]] || { sed -n '2,10p' "$0"; exit 1; }
+[[ $# -ge 1 ]] || { sed -n '2,11p' "$0"; exit 1; }
 arg=$1; shift
 case "$arg" in
   *[kK]) n=$(( ${arg%[kK]} * 1024 ))
@@ -25,8 +26,9 @@ NTOK=$(wc -w <"$TOK")
 MAXCTX=${MAXCTX:-$(( (NTOK + 8192 + 255) / 256 * 256 ))}
 BIN=${BIN:-build/gdec}
 
-for f in start.sh service.conf; do grep -q $'\r' "$f" && sed -i 's/\r$//' "$f"; done
-chk="$(bash start.sh --check 2>&1)" || { echo "$chk"; echo "start.sh --check 失败"; exit 1; }
+for f in start_hgn.sh start_gguf.sh tools/serve_common.sh service.conf; do grep -q $'\r' "$f" && sed -i 's/\r$//' "$f"; done
+LAUNCHER=${LAUNCHER:-start_hgn.sh}
+chk="$(bash "$LAUNCHER" --check 2>&1)" || { echo "$chk"; echo "$LAUNCHER --check 失败"; exit 1; }
 mapfile -t PENV < <(sed -n 's/^ENV //p' <<<"$chk")
 CMDLINE="$(sed -n 's/^CMD //p' <<<"$chk")"
 eval "C=($CMDLINE)"

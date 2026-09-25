@@ -61,7 +61,7 @@ HIPCC=/opt/rocm/bin/hipcc GPU_ARCH=gfx1151 bash build.sh
   用户态运行库和 API 所需的
   libpng/libjpeg/libwebp 依赖闭包复制到 `build/lib/`，并仅复制
   `GPU_ARCH` 对应的 rocBLAS/hipBLASLt kernel db。二进制带
-  `$ORIGIN/lib` RPATH，`start.sh` 也会显式使用这套私有库；部署时把整个
+  `$ORIGIN/lib` RPATH，`start_hgn.sh` / `start_gguf.sh` 也会显式使用这套私有库；部署时把整个
   `build/` 一起复制即可，目标机器不需要另装这些运行库。
 
 ## 编译选项(供参考)
@@ -93,7 +93,8 @@ API:C++17,`-O2 -Wall -Wextra -Wpedantic -Werror`,链接
 模型权重、overlay、tokenizer 和可选视觉塔不在源码仓库中,用
 `tools/flashnext2hgn.py` 从 HF 模型转换(见 CONVERT.md)。
 实际推理前检查 `free -g`:只运行一个引擎,可用内存应至少 100 GiB。
-日常服务直接用根目录 `start.sh`(见 QUICKSTART.md);以下是手动方式。
+日常服务直接用根目录 `start_hgn.sh`(hgn 权重)或 `start_gguf.sh`(GGUF 权重,见 GGUF.md),
+说明见 QUICKSTART.md;以下是 hgn 的手动方式。
 
 生产选项(部分优化由环境变量开启):
 
@@ -135,7 +136,7 @@ build/gdec-api --tokenizer ./models/tokenizer \
 
 ## Windows（TheRock）
 
-Windows 版有独立入口，与 build.sh / start.sh 并列，覆盖引擎与 API 前端
+Windows 版有独立入口，与 build.sh / start_hgn.sh 并列，覆盖引擎与 API 前端
 （多模态已支持 PNG/JPEG，仅 WebP 未接，见 PORTING-WINDOWS.md）：
 
 ```bash
@@ -149,7 +150,8 @@ bash start_win.sh           # Git Bash 下起引擎(行协议 8730) + API(8731) 
 **日常启动用 `start_win.exe`**：原生 Win32 启动器，双击即用，不需要
 Git Bash / PowerShell / 任何脚本宿主。拉起引擎 + API 双进程，子进程输出
 实时显示在控制台并写入 `logs\`；Ctrl+C 或关窗同时收掉两者。
-**配置改根目录 `service.conf`**（与 Linux `start.sh` 同一个文件）：换模型
+**配置改根目录 `service.conf`**（与 Linux 启动器同一个文件；Windows 目前只支持 hgn，
+读其中"hgn 权重"一段，GGUF 一段不生效）：换模型
 文件名、调上下文窗口、改端口都编辑它；优先级为 环境变量 > service.conf
 > 内置默认（`set MAX_CONTEXT=131072 && start_win.exe` 临时覆盖；
 `start_win.exe --check` 只检查配置不启动）。客户端连
@@ -167,7 +169,7 @@ Git Bash。首次构建会把运行期全部依赖备进 `build/`：TheRock DLL 
 1.2G）。**产物自包含：`build/` 拷到任何同架构 Windows 机器即用，无需安装
 ROCm/TheRock，也不设 HIP_PATH/ROCM_PATH**（断根实测见 PORTING-WINDOWS.md）。
 GPU 需 BIOS 划分足够显存（heretic 68 GiB 权重 + 256K 上下文实测顶格 95 GiB，
-划分 96 GiB）。`start_win.exe` / `start_win.sh` 与 Linux `start.sh` 共用根目录
+划分 96 GiB）。`start_win.exe` / `start_win.sh` 与 Linux 启动器共用根目录
 `service.conf`（模型路径、端口、上下文窗口等都在里面改，环境变量可临时覆盖）。
 
 ## 可选工具与常见编译问题

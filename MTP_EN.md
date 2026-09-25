@@ -5,13 +5,13 @@
 The service currently defaults to a draft length of 3, with a range of 1–8. Start by comparing 1, 2, and 3, changing only the length each time:
 
 ```bash
-MTP_GAMMA=1 bash start.sh
+MTP_GAMMA=1 bash start_hgn.sh    # start_gguf.sh for GGUF weights
 ```
 
 After stopping that round of the service, replace 1 with 2 or 3. You can also change the default value of `MTP_GAMMA` in `service.conf`.
 **Changing the draft length requires restarting the engine, not recompiling.** This round did not restart or alter any running service on your behalf.
 
-Script fix note: service mode actually reads `GDEC_SPEC_GAMMA`; the old script only passed `--gamma`, which applies solely to offline `--spec-gen`. The fixed start.sh exports `MTP_GAMMA` as `GDEC_SPEC_GAMMA`. When launching the engine manually you can write `GDEC_SPEC_GAMMA=2 bash tools/run_capped.sh ...`. Do not use the gamma field in the request JSON; the current API does not support per-request draft length changes.
+Script fix note: service mode actually reads `GDEC_SPEC_GAMMA`; the old script only passed `--gamma`, which applies solely to offline `--spec-gen`. The launchers (start_hgn.sh / start_gguf.sh) export `MTP_GAMMA` as `GDEC_SPEC_GAMMA`. When launching the engine manually you can write `GDEC_SPEC_GAMMA=2 bash tools/run_capped.sh ...`. Do not use the gamma field in the request JSON; the current API does not support per-request draft length changes.
 
 ## Request Parameters
 

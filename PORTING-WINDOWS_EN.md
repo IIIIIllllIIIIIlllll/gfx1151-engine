@@ -19,7 +19,7 @@ parallel to the Linux `build.sh`), producing `build/gdec-win.exe` +
 the engine and API processes in one step (a native Win32 launcher,
 double-click to use, no Git Bash / PowerShell needed; clients connect to
 port 8731 via the standard OpenAI interface). Under Git Bash, `start_win.sh`
-is the counterpart of the Linux `start.sh`.
+is the counterpart of the Linux `start_hgn.sh` (Windows supports hgn weights only).
 
 Verification matrix (all PASS):
 

@@ -2,7 +2,7 @@
 # 一键验证 gdec-api 服务端参数覆盖（/admin/overrides）与控制台页面。
 #   bash tools/api_override_verify.sh           # 先 bash build.sh api，再测
 #   SKIP_BUILD=1 bash tools/api_override_verify.sh
-# 用生产环境变量（start.sh --check）起测试引擎 :8732 + 测试 API :8733，覆盖表写到临时文件，
+# 用生产环境变量（start_hgn.sh --check）起测试引擎 :8732 + 测试 API :8733，覆盖表写到临时文件，
 # 不碰生产的 data/api-overrides.json。三段：功能 / 重启后持久化 / 管理密钥鉴权。
 # 最后一行：API OVERRIDE VERIFY: PASS 或 FAIL。
 set -uo pipefail
@@ -15,8 +15,8 @@ probe_precheck || exit 1
 if [[ "${SKIP_BUILD:-0}" != 1 ]]; then
   bash build.sh api >/dev/null 2>&1 || { echo "bash build.sh api 失败"; exit 1; }
 fi
-for f in start.sh service.conf; do grep -q $'\r' "$f" && sed -i 's/\r$//' "$f"; done
-chk="$(bash start.sh --check 2>&1)" || { echo "$chk"; echo "start.sh --check 失败"; exit 1; }
+for f in start_hgn.sh start_gguf.sh tools/serve_common.sh service.conf; do grep -q $'\r' "$f" && sed -i 's/\r$//' "$f"; done
+chk="$(bash start_hgn.sh --check 2>&1)" || { echo "$chk"; echo "start_hgn.sh --check 失败"; exit 1; }
 mapfile -t PENV < <(sed -n 's/^ENV //p' <<<"$chk")
 CMDLINE="$(sed -n 's/^CMD //p' <<<"$chk")"
 eval "ENGINE=($CMDLINE)"

@@ -18,7 +18,7 @@ N="${N:-32768}"
   echo "缺少 data/qsa-oracle/$N.json；先试 git checkout HEAD -- data/qsa-oracle" >&2; exit 1; }
 probe_precheck || exit 1
 
-# 与 start.sh:103-115 保持一致
+# 与 tools/serve_common.sh 的生产环境变量保持一致
 export GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1
 export GDEC_GEMM_WMMA=1 GDEC_GDN_FUSED=1
 export GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1

@@ -11,7 +11,7 @@
 | 项 | 默认 | 说明 |
 |---|---|---|
 | `PARALLEL` | 4 | 同时运行的请求数，1–8。1 = 旧的单路行为 |
-| `KV_PAGED` | 1 | 必须为 1（`PARALLEL>1` 时 start.sh 会拒绝 0） |
+| `KV_PAGED` | 1 | 必须为 1（`PARALLEL>1` 时启动器会拒绝 0） |
 | `KV_POOL_TOKENS` | 0 | 共享 KV 页池大小，取 `max(KV_POOL_TOKENS, MAX_CONTEXT)`；默认即一条 256K |
 
 引擎读 `GDEC_PARALLEL`，API 启动时从引擎 `INFO` 的 `kv_slots` 字段得知路数并开同样

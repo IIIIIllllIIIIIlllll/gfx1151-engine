@@ -11,7 +11,7 @@ PROBE_PAT='(^|/)(gdec[^/[:space:]]*|flash_serve|serve_api\.py)([[:space:]]|$)'
 probe_precheck() {
   local p
   if p="$(pgrep -af "$PROBE_PAT")"; then
-    echo "已有引擎或 API 在运行，请先停掉（生产服务 start.sh 按 Ctrl+C）：" >&2
+    echo "已有引擎或 API 在运行，请先停掉（生产服务 start_hgn.sh / start_gguf.sh 按 Ctrl+C）：" >&2
     echo "$p" >&2
     return 1
   fi

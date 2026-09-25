@@ -44,11 +44,13 @@
 ## 快速开始
 
 ```bash
-bash build.sh     # 编译引擎 + API,输出在 build/
-bash start.sh     # 加载模型并启动服务(读取 service.conf)
+bash build.sh        # 编译引擎 + API,输出在 build/
+bash start_hgn.sh    # hgn 权重:加载模型并启动服务(读取 service.conf)
+bash start_gguf.sh   # 或 GGUF 权重(Unsloth UD-Q4_K_XL,与 llama.cpp 同一份文件)
 ```
 
-模型文件默认从 `./models` 读取,配置集中在 `service.conf`。
+两个启动器都从 `./models` 读取权重,缺文件时列出缺失项并退出;配置集中在
+`service.conf`(hgn、GGUF 各一段)。GGUF 见 [GGUF.md](GGUF.md)。
 详见 [QUICKSTART.md](QUICKSTART.md)。
 
 自有微调模型(HF safetensors,同架构)转换:
@@ -85,7 +87,7 @@ bash build_win.sh launcher  # 免脚本启动器 start_win.exe
 - 图片解码经 stb_image 支持 PNG/JPEG(WebP 未接)
 - prefill chunk 默认 8192
 - 冷加载为整权重读盘(分钟级,进度见控制台/日志)
-- 启动器未开 `GDEC_GEMM_WMMA` 与 `GDEC_GDN_FUSED`(Linux start.sh 已转正的
+- 启动器未开 `GDEC_GEMM_WMMA` 与 `GDEC_GDN_FUSED`(Linux 启动器已转正的
   自写 WMMA GEMM 与 GDN 融合 kernel,合计约 8-10% PP,TheRock 下未验证——
   故 Windows 端 prefill 走 hipBLASLt + 旧 GDN 路径)
 

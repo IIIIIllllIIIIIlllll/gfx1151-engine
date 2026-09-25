@@ -5,13 +5,13 @@
 目前服务默认草稿长度是 3，范围 1–8。最先比较 1、2、3，每次只改变长度：
 
 ```bash
-MTP_GAMMA=1 bash start.sh
+MTP_GAMMA=1 bash start_hgn.sh    # GGUF 权重用 start_gguf.sh
 ```
 
 停止该轮服务后，再把 1 换成 2 或 3。也可以在 `service.conf` 中修改 `MTP_GAMMA` 的默认值。
 **修改草稿长度需要重启引擎，不需要重新编译。** 本次没有替你重启或改变正在运行的服务。
 
-脚本修正说明：服务模式实际读取 `GDEC_SPEC_GAMMA`，旧脚本只传入的 `--gamma` 仅作用于离线 `--spec-gen`。修正版 start.sh 会把 `MTP_GAMMA` 导出为 `GDEC_SPEC_GAMMA`。手动启动引擎时可以写 `GDEC_SPEC_GAMMA=2 bash tools/run_capped.sh ...`。不要用请求 JSON 的 gamma 字段；当前 API 不支持逐请求修改草稿长度。
+脚本修正说明：服务模式实际读取 `GDEC_SPEC_GAMMA`，旧脚本只传入的 `--gamma` 仅作用于离线 `--spec-gen`。启动器（start_hgn.sh / start_gguf.sh）会把 `MTP_GAMMA` 导出为 `GDEC_SPEC_GAMMA`。手动启动引擎时可以写 `GDEC_SPEC_GAMMA=2 bash tools/run_capped.sh ...`。不要用请求 JSON 的 gamma 字段；当前 API 不支持逐请求修改草稿长度。
 
 ## 请求参数
 

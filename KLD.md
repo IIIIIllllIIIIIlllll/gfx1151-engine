@@ -29,7 +29,7 @@ gdec BASE OVL --tokens-file IDS --kld-save OUT.kld [--kld-ctx 512] [--kld-chunks
 |---|---|
 | `tools/kld_verify.sh` | 一键自检，不需要 BF16：用 llama Q4_K_XL 当临时基准，检查双向文件兼容、PPL 口径一致和引擎确定性。末行 `KLD VERIFY: PASS/FAIL` |
 | `tools/kld_llama.sh base\|cmp` | llama.cpp 侧：`base` 写基准，`cmp` 让候选 GGUF 对比基准 |
-| `tools/kld_engine.sh REF` | 引擎侧，使用 `start.sh --check` 的生产 env（同 pp_prod.sh） |
+| `tools/kld_engine.sh REF` | 引擎侧，使用 `start_hgn.sh --check` 的生产 env（同 pp_prod.sh；`LAUNCHER=start_gguf.sh` 测 GGUF） |
 | `tools/kld_bench.sh REF` | 正式对比：引擎 + UD-Q4_K_XL + UD-IQ1_S，输出对比表并附 unsloth 公布值 |
 | `tools/kld_table.py` | 解析上面任意日志并出表 |
 

@@ -67,8 +67,8 @@ HIPCC=/opt/rocm/bin/hipcc GPU_ARCH=gfx1151 bash build.sh
   `--bundle`; the script follows the ELF dependencies and copies the ROCm
   user-space runtime plus the libpng/libjpeg/libwebp dependency closure
   into `build/lib/`. It also copies only the rocBLAS/hipBLASLt kernel database
-  for `GPU_ARCH`. The binaries contain an `$ORIGIN/lib` RPATH and `start.sh`
-  explicitly selects the bundled files, so deployments should copy the whole
+  for `GPU_ARCH`. The binaries contain an `$ORIGIN/lib` RPATH and `start_hgn.sh` /
+  `start_gguf.sh` explicitly select the bundled files, so deployments should copy the whole
   `build/` directory and do not need these runtimes installed separately.
 
 ## Compile options (for reference)
@@ -103,8 +103,9 @@ the source repository; convert them from the HF model with
 `tools/flashnext2hgn.py` (see CONVERT_EN.md).
 Before actual inference check `free -g`: running only one engine, available
 memory should be at least 100 GiB.
-For daily serving use the root `start.sh` directly (see QUICKSTART_EN.md); the
-following is the manual approach.
+For daily serving use the root `start_hgn.sh` (hgn weights) or `start_gguf.sh`
+(GGUF weights, see GGUF.md) directly (see QUICKSTART_EN.md); the following is the
+manual approach for hgn.
 
 Production options (some optimizations are enabled via environment variables):
 
@@ -150,7 +151,7 @@ be taken directly as steady-state prefill performance.
 ## Windows (TheRock)
 
 The Windows version has its own entry points, parallel to build.sh /
-start.sh, covering the engine and the API frontend
+start_hgn.sh, covering the engine and the API frontend
 (multimodal already supports PNG/JPEG, only WebP is not wired up; see
 PORTING-WINDOWS_EN.md):
 
@@ -167,8 +168,9 @@ double-click and go, no Git Bash / PowerShell / any script host needed. It
 brings up the engine + API as two processes; child process output is shown
 live on the console and written to `logs\`; Ctrl+C or closing the window
 takes both down together.
-**Configuration lives in the root `service.conf`** (the same file as Linux
-`start.sh`): edit it to change the model filename, adjust the context window,
+**Configuration lives in the root `service.conf`** (the same file as the Linux
+launchers; Windows currently supports hgn only and reads the "hgn" section, the
+GGUF section has no effect): edit it to change the model filename, adjust the context window,
 or change ports; precedence is environment variables > service.conf >
 built-in defaults (`set MAX_CONTEXT=131072 && start_win.exe` overrides
 temporarily; `start_win.exe --check` only checks the configuration without
@@ -194,7 +196,7 @@ HIP_PATH/ROCM_PATH is set** (see PORTING-WINDOWS_EN.md for de-rooted
 real-world testing). The GPU needs enough VRAM partitioned in BIOS (heretic
 68 GiB weights + 256K context measured at a full 95 GiB, so partition 96
 GiB). `start_win.exe` / `start_win.sh` share the root `service.conf` with
-Linux `start.sh` (model paths, ports, context window, etc. are all edited
+the Linux launchers (hgn section only) (model paths, ports, context window, etc. are all edited
 there; environment variables can override temporarily).
 
 ## Optional tools and common build problems

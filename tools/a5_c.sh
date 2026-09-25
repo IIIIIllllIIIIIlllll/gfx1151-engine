@@ -54,8 +54,8 @@ ORDER=(base serial t2serial nosnap mtp ngram norckpt nokvsnap oldsel)
 (( $# )) && ORDER=("$@")
 
 probe_precheck || exit 1
-for f in start.sh service.conf; do grep -q $'\r' "$f" && sed -i 's/\r$//' "$f"; done
-chk="$(bash start.sh --check 2>&1)" || { echo "$chk"; echo "start.sh --check 失败"; exit 1; }
+for f in start_hgn.sh start_gguf.sh tools/serve_common.sh service.conf; do grep -q $'\r' "$f" && sed -i 's/\r$//' "$f"; done
+chk="$(bash start_hgn.sh --check 2>&1)" || { echo "$chk"; echo "start_hgn.sh --check 失败"; exit 1; }
 mapfile -t PENV < <(sed -n 's/^ENV //p' <<<"$chk")
 CMDLINE="$(sed -n 's/^CMD //p' <<<"$chk")"
 eval "ENGINE=($CMDLINE)"

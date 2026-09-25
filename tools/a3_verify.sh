@@ -16,7 +16,7 @@
 #   5. 池满淘汰场景（rckpt_ab.py evict），maxctx 16384（64 页）：off vs p2
 #      A(8100) → B2(6000) → C2(12000) → A+问题2：p2 至少淘汰 2 个检查点，输出与 off 一致
 #   6. 所有日志无 GUARD PAGE WRITTEN / FATAL
-# 前提：生产服务已停（start.sh Ctrl+C）。
+# 前提：生产服务已停（start_hgn.sh / start_gguf.sh 按 Ctrl+C）。
 # 回报：从 "==== A3 汇总 ====" 往下的内容。
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."

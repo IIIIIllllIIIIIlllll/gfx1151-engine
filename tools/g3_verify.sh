@@ -57,7 +57,7 @@ else bad "KLD=$kld 不低于 G2 的 0.1494"; fi
 # ---- 2/3. PPL --------------------------------------------------------------
 TOK=logs/g3_tok1024.txt
 tr -s ' ,\t' '\n' <"$TOKSRC" | grep -E '^[0-9]+$' | head -1024 >"$TOK"
-chk="$(bash start.sh --check 2>&1)" || { echo "$chk"; echo FAIL; exit 1; }
+chk="$(bash start_hgn.sh --check 2>&1)" || { echo "$chk"; echo FAIL; exit 1; }
 mapfile -t PENV < <(sed -n 's/^ENV //p' <<<"$chk")
 eval "C=($(sed -n 's/^CMD //p' <<<"$chk"))"
 M=${C[1]}; O=${C[2]}; [[ "$O" == --* ]] && O=""

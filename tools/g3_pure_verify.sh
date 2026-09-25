@@ -8,7 +8,7 @@
 #     BIN=build/gdec-gguf     REF=build/gdec-head（hgn 生产路径的参照二进制，HEAD 编出）
 #     QUICK=1                 KLD 只跑 16 chunk，跳过速度
 # 检查项：
-#   0. start.sh --check：MODEL_FILE=*.gguf 时命令行无 overlay、MTP 走 GDEC_GGUF_MTP、视觉塔用 mmproj
+#   0. start_gguf.sh --check：命令行只有第 1 个分片（无 overlay）、MTP 走 GDEC_GGUF_MTP、视觉塔用 mmproj
 #   1. KLD（BF16 基准 64×512），纯 GGUF < KMAX（默认 0.055）。纯 GGUF 与 llama.cpp 用的是
 #      同一份权重（llama.cpp 0.049），差别只剩计算路径（bf16 KV 等）；G3.2 的 0.0453 用的是
 #      hgn 的 fp8 PLE 表（比 GGUF 的 IQ4_NL 准），纯 GGUF 拿不到
@@ -30,8 +30,8 @@ KMAX=${KMAX:-0.055}
 export PROBE_CAP_GB=${PROBE_CAP_GB:-100}
 KREF=data/kld/bf16_c512.kld
 TOKSRC=$HOME/ppbench/tok8192.txt
-# 纯 GGUF 的 service.conf 覆盖（start.sh --check / pp_prod.sh / kld_engine.sh 都读它）
-PURE=(MODEL_FILE="$GG" MTP_FILE="$MTP" VISION_FILE="$MMPROJ")
+# 纯 GGUF：start_gguf.sh + service.conf 的 GGUF_* 覆盖（pp_prod.sh / kld_engine.sh 按 LAUNCHER 取启动器）
+PURE=(LAUNCHER=start_gguf.sh GGUF_FILE="$GG" GGUF_MTP_FILE="$MTP" GGUF_VISION_FILE="$MMPROJ")
 # G3.2 的混合启动：hgn 基座 + overlay，GGUF 覆盖全部张量但 PLE 表仍是 hgn fp8
 G32=(GDEC_GGUF="$GG" GDEC_GGUF_DENSE=1 GDEC_GGUF_MTP="$MTP")
 fail=0
@@ -46,9 +46,9 @@ if pgrep -af '(^|/)(gdec[^/[:space:]]*|flash_serve|serve_api\.py|llama-server|ll
 fi
 mkdir -p logs
 
-# ---- 0. start.sh --check ---------------------------------------------------
-note "0. start.sh --check（MODEL_FILE=*.gguf）"
-pchk="$(env "${PURE[@]}" bash start.sh --check 2>&1)" || { echo "$pchk"; bad "start.sh --check 失败"; }
+# ---- 0. start_gguf.sh --check ----------------------------------------------
+note "0. start_gguf.sh --check"
+pchk="$(env "${PURE[@]}" bash start_gguf.sh --check 2>&1)" || { echo "$pchk"; bad "start_gguf.sh --check 失败"; }
 pcmd=$(sed -n 's/^CMD //p' <<<"$pchk")
 eval "PC=($pcmd)"
 echo "CMD $pcmd" | cut -c1-240
@@ -77,7 +77,7 @@ else bad "KLD=$kld 不低于 $KMAX"; fi
 # ---- 2/3/4. PPL ------------------------------------------------------------
 TOK=logs/g3_tok1024.txt
 tr -s ' ,\t' '\n' <"$TOKSRC" | grep -E '^[0-9]+$' | head -1024 >"$TOK"
-chk="$(bash start.sh --check 2>&1)" || { echo "$chk"; echo FAIL; exit 1; }
+chk="$(bash start_hgn.sh --check 2>&1)" || { echo "$chk"; echo FAIL; exit 1; }
 mapfile -t PENV < <(sed -n 's/^ENV //p' <<<"$chk")
 eval "C=($(sed -n 's/^CMD //p' <<<"$chk"))"
 M=${C[1]}; O=${C[2]}; [[ "$O" == --* ]] && O=""
@@ -116,7 +116,7 @@ if [[ -n "${rnb:-}" && "${rnb:-}" == "${nnb:-}" && -n "${rnd:-}" && "${rnd:-}" =
 else bad "hgn 路径结果与 $REF 不同"; fi
 
 # ---- 5. MTP 投机 -------------------------------------------------------------
-spec() {  # label bin [env overrides for start.sh] -- extra...
+spec() {  # label bin [启动器 / service.conf 覆盖] -- extra...
   local label=$1 bin=$2; shift 2
   local pre=()
   while (($#)) && [[ $1 != -- ]]; do pre+=("$1"); shift; done
@@ -135,7 +135,7 @@ elif awk -v a="$cg" -v b="$ch" 'BEGIN{exit !(a >= 0.9*b)}'; then echo "OK"
 else bad "纯 GGUF MTP commit/round 低于 hgn 的 0.9 倍"; fi
 
 # ---- 6. 速度 -----------------------------------------------------------------
-speed() {  # label bin tok gen [start.sh overrides] -- extra...
+speed() {  # label bin tok gen [启动器 / service.conf 覆盖] -- extra...
   local label=$1 bin=$2 tok=$3 gen=$4; shift 4
   local pre=()
   while (($#)) && [[ $1 != -- ]]; do pre+=("$1"); shift; done

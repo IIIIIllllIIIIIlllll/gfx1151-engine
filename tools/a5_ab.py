@@ -1,4 +1,4 @@
-"""A5: paged KV under the full production engine (start.sh env, MTP weights, vision
+"""A5: paged KV under the full production engine (start_hgn.sh env, MTP weights, vision
 tower, production maxctx, kvsnap + rckpt on).
 
 Every earlier paged test (a1..a3) decoded serially (drafter 0). Production runs the

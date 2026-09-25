@@ -1,36 +1,57 @@
 # GGUF 权重（hgn → GGUF 迁移）
 
 目标：引擎直接加载 llama.cpp / Unsloth 的 `Qwen3.8-Flash-Next-UD-Q4_K_XL` GGUF，用户不再需要
-维护 hgn 这类两个超大的专用权重文件。G3.3 起可以完全不用 hgn 启动；service.conf 的默认仍是 hgn，
-切换只需改四行配置。
+维护 hgn 这类两个超大的专用权重文件。G3.3 起可以完全不用 hgn 启动。
 
 ## 用法：纯 GGUF（G3.3，不需要任何 .hgn）
 
-service.conf 里取消 GGUF 那四行的注释（或用同名环境变量覆盖）：
+Linux 上 hgn 和 GGUF 各有一个启动器，都读项目根目录 `models/`：
 
 ```bash
-GGUF_DIR="$HOME/App/llama.cpp/models/Qwen3.8-Flash-Next-UD-Q4_K_XL"
-MODEL_FILE="$GGUF_DIR/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"   # 第 1 个分片
-MTP_FILE="$GGUF_DIR/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"               # MTP sidecar
-VISION_FILE="$GGUF_DIR/mmproj-BF16.gguf"                                   # 视觉塔
+bash start_hgn.sh    # hgn 权重
+bash start_gguf.sh   # GGUF 权重（本文）
 ```
 
-- MODEL_FILE 以 `.gguf` 结尾时 start.sh 不传 overlay，MTP_FILE 以 `GDEC_GGUF_MTP` 传给引擎。
-- 命令行 `gdec <第 1 个分片>.gguf ...` 等价于 `GDEC_GGUF=<该分片> GDEC_GGUF_DENSE=1`，基座 Checkpoint 为空，
-  全部张量来自 GGUF；没设 `GDEC_GGUF_MTP` 时自动使用分片目录里唯一的 `mtp-*.gguf`（设成空串则不用 sidecar）。
+把 Unsloth 的 Qwen3.8-Flash-Next UD-Q4_K_XL 全部文件放进 `models/`（与 llama.cpp 用的是同一份文件，
+可以直接软链过去），另需 `models/tokenizer/tokenizer.json`（与 hgn 共用）：
+
+```text
+models/
+  Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf  … 00004-of-00004.gguf   # 4 个分片都要
+  mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf                                     # MTP sidecar
+  mmproj-BF16.gguf                                                            # 视觉塔
+  tokenizer/tokenizer.json
+```
+
+对应 service.conf 的"GGUF 权重"一段（同名环境变量优先）：
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `GGUF_FILE` | `$MODEL_DIR/…-00001-of-00004.gguf` | 第 1 个分片；其余分片须在同一目录，启动器逐个检查 |
+| `GGUF_MTP_FILE` | `$MODEL_DIR/mtp-…-Q8_0.gguf` | 设 `""` 不做 MTP 投机 |
+| `GGUF_VISION_FILE` | `$MODEL_DIR/mmproj-BF16.gguf` | 设 `""` 纯文本 |
+
+缺任何一个文件时启动器列出全部缺失项并退出 1，不会启动引擎；`bash start_gguf.sh --check` 只检查。
+`start_gguf.sh` 只接受 `.gguf`，`start_hgn.sh` 只接受 `.hgn`；两者都会清掉外部残留的 `GDEC_GGUF*`，
+权重格式只由所用的启动器决定。
+
+- 启动器执行 `gdec <第 1 个分片>.gguf ...`，引擎看到 `.gguf` 基座即为纯 GGUF 启动，等价于
+  `GDEC_GGUF=<该分片> GDEC_GGUF_DENSE=1`，基座 Checkpoint 为空，全部张量来自 GGUF。MTP sidecar 由启动器
+  以 `GDEC_GGUF_MTP` 显式传入（空串 = 不用）；直接运行引擎且没设 `GDEC_GGUF_MTP` 时，引擎自动使用分片
+  目录里唯一的 `mtp-*.gguf`。
 - PLE n-gram 表直接用 GGUF 里的 IQ4_NL（90 B/行，约 27 GiB；hgn fp8 为 160 B/行 47.7 GiB），
   prefill 在 GPU 上解量化（`k_ple_iq4nl_dequant`），decode 在 CPU 上解量化；`PLE_URING=1` 的 io_uring 批量读
   改为指向表所在的分片。
-- 目前只支持 Linux（`GDEC_GGUF_DENSE` 还没移植到 Windows）。
+- 目前只支持 Linux（`GDEC_GGUF_DENSE` 还没移植到 Windows；Windows 启动器只读 service.conf 的 hgn 一段）。
 
-## 用法：混合模式（过渡，仍需 hgn）
+## 用法：混合模式（过渡，仍需 hgn；只用于验证脚本直接运行引擎，启动器会清掉这些变量）
 
 ```bash
 D=~/App/llama.cpp/models/Qwen3.8-Flash-Next-UD-Q4_K_XL
 export GDEC_GGUF=$D/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf   # G2：路由专家来自 GGUF
 export GDEC_GGUF_DENSE=1                                                 # G3.1：其余非专家张量也来自 GGUF
 export GDEC_GGUF_MTP=$D/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf          # G3.1/G3.2：MTP 头（含路由专家）
-export VISION_FILE=$D/mmproj-BF16.gguf                                   # G3.2：视觉塔（start.sh → --vision-tower）
+# G3.2：视觉塔在命令行给 --vision-tower $D/mmproj-BF16.gguf
 ```
 
 | 变量 | 作用 |
@@ -125,8 +146,9 @@ export VISION_FILE=$D/mmproj-BF16.gguf                                   # G3.2�
 - `tools/g2_verify.sh` — G2（专家）
 - `tools/g3_verify.sh` — G3.1：KLD、decode/prefill PPL、hgn 路径逐位不变、MTP、速度
 - `tools/g3_vision_verify.sh` — G3.2 视觉塔：张量逐位对照 + 端到端前向 dump 逐字节对照
-- `tools/g3_pure_verify.sh` — G3.3 纯 GGUF：start.sh 配置、KLD、与混合启动逐位相同、decode/prefill、
+- `tools/g3_pure_verify.sh` — G3.3 纯 GGUF：start_gguf.sh 配置、KLD、与混合启动逐位相同、decode/prefill、
   hgn 路径逐位不变、MTP、速度
+- `tools/launcher_verify.sh` — 两个启动器：--check 命令行/环境、缺文件报错、格式互斥、端到端起停
 - `tools/g3_smoke.sh [ENV=...]` — 512 token PPL 冒烟（可带过滤器等 env）
 - `tools/moe_gguf_test.cu` — MoE kernel vs CPU 参考
 - `tools/moe_gguf_gemv_test.cu` — 小 P 专家 GEMV（含去重路径逐位对照）vs CPU 参考

@@ -13,7 +13,7 @@
 #      有 "released" 释放记录；所有日志里没有 GUARD PAGE WRITTEN / FATAL
 #   5. btv_kvsnap_verify.sh 两轮：不分页保存→分页(2)恢复；分页(2)保存→不分页恢复
 #   6. A1_CTX=131072 下 prod prodp2 再比一次（页表 512 项）
-# 前提：生产服务已停（start.sh Ctrl+C）。
+# 前提：生产服务已停（start_hgn.sh / start_gguf.sh 按 Ctrl+C）。
 # 回报：从 "==== A2 汇总 ====" 往下的内容。
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."

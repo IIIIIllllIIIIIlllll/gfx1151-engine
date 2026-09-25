@@ -14,7 +14,7 @@
 #        含 MTP/chain/采样/SNAPS 切点/多轮切回
 #   ab   tools/b0_ab.py：drafter 1/4 的切换对话场景，NEW 恢复 rckpt 后仍投机，
 #        两次恢复同一检查点逐位一致，接受率与整段重算相当；SNAPS 切点检查点同样可投机
-# 前提：生产服务已停（start.sh Ctrl+C）。
+# 前提：生产服务已停（start_hgn.sh / start_gguf.sh 按 Ctrl+C）。
 # 回报：从 "==== B0 汇总 ====" 往下的内容。
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -27,10 +27,10 @@ T0=$SECONDS
 export PROBE_BINARY="$NEW_BIN"
 probe_precheck || exit 1
 [[ -x "$REF_BIN" ]] || { echo "找不到 REF_BIN=$REF_BIN（B0 之前的引擎二进制）" >&2; exit 1; }
-for f in start.sh start_win.sh service.conf; do
+for f in start_hgn.sh start_gguf.sh tools/serve_common.sh start_win.sh service.conf; do
   [[ -f $f ]] && grep -q $'\r' "$f" && sed -i 's/\r$//' "$f"
 done
-chk="$(bash start.sh --check 2>&1)" || { echo "$chk"; echo "B0 VERIFY: FAIL（start.sh --check 失败）"; exit 1; }
+chk="$(bash start_hgn.sh --check 2>&1)" || { echo "$chk"; echo "B0 VERIFY: FAIL（start_hgn.sh --check 失败）"; exit 1; }
 mapfile -t PENV < <(sed -n 's/^ENV //p' <<<"$chk")
 CMDLINE="$(sed -n 's/^CMD //p' <<<"$chk")"
 eval "BASE=($CMDLINE)"

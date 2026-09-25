@@ -7,7 +7,7 @@
 #   A5_BIN=build/gdec.conc SKIP_BUILD=1 bash tools/a5_verify.sh   # 测另一个引擎二进制
 # 之前 A1–A3 的分页测试全是串行解码。生产实际走的是 chain/MTP 投机 + 验证回滚、
 # 采样、多轮续写、SNAPS 切点、kvsnap + rckpt 同时开、MTP 权重和视觉塔都加载、
-# maxctx 256K。本脚本用 start.sh 的真实环境变量和命令行（只换端口 8732）跑三个引擎：
+# maxctx 256K。本脚本用 start_hgn.sh 的真实环境变量和命令行（只换端口 8732）跑三个引擎：
 #   off = KV_PAGED=0（不分页，基准）
 #   p1  = 生产默认（GDEC_KV_PAGED=1）
 #   p2  = GDEC_KV_PAGED=2（打乱物理页 + FIFO 自检）
@@ -15,7 +15,7 @@
 # 多轮对话 A→B→切回 A）+ tools/ngram_regress.py（投机回滚/EOS/取消/续写/采样回退）。
 # 判定：p1、p2 与 off 逐 token 一致、spec 统计一致（切回 A 的两轮只比较 p1 vs p2，
 # 且必须命中缓存）；日志里页表启动行正确、切回时 rckpt 恢复、无守卫页/FATAL。
-# 前提：生产服务已停（start.sh Ctrl+C）。
+# 前提：生产服务已停（start_hgn.sh / start_gguf.sh 按 Ctrl+C）。
 # 回报：从 "==== A5 汇总 ====" 往下的内容。
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -56,34 +56,34 @@ for n in 8192 32768; do
 done
 
 echo
-echo "================ 3/5 start.sh --check：取生产环境 ================"
+echo "================ 3/5 start_hgn.sh --check：取生产环境 ================"
 # 在 Windows 上编辑过的文件可能带 CRLF 换行，bash 会报 "set: pipefail 无效的选项名"，
 # source service.conf 也会把 \r 带进每个值。这里直接转成 LF。
-for f in start.sh start_win.sh service.conf; do
+for f in start_hgn.sh start_gguf.sh tools/serve_common.sh start_win.sh service.conf; do
   if [[ -f $f ]] && grep -q $'\r' "$f"; then
     sed -i 's/\r$//' "$f" && echo "已把 $f 的 CRLF 换行转成 LF"
   fi
 done
-# start.sh 要求 build/gdec 和 build/gdec-api 都在；测试用的 checkout 往往只编过引擎。
+# start_hgn.sh 要求 build/gdec 和 build/gdec-api 都在；测试用的 checkout 往往只编过引擎。
 # 本脚本不启动 API，这里只是为了让 --check 通过（SKIP_BUILD=1 时也会补编）。
 if [[ ! -x build/gdec-api ]]; then
-  echo "build/gdec-api 不存在（start.sh --check 需要），编译 API 中……"
+  echo "build/gdec-api 不存在（start_hgn.sh --check 需要），编译 API 中……"
   bash build.sh api 2>&1 | tail -n 5
   rc=${PIPESTATUS[0]}
   [[ $rc == 0 && -x build/gdec-api ]] || die "build api" "API 编译失败，把上面的错误贴回来"
-  step "build api（start.sh 需要）" PASS
+  step "build api（start_hgn.sh 需要）" PASS
 fi
-chk="$(bash start.sh --check 2>&1)"; rc=$?
+chk="$(bash start_hgn.sh --check 2>&1)"; rc=$?
 echo "$chk" | grep -v '^ENV \|^CMD '
-[[ $rc == 0 ]] || die "start.sh --check" "start.sh --check 失败，见上面的错误"
+[[ $rc == 0 ]] || die "start_hgn.sh --check" "start_hgn.sh --check 失败，见上面的错误"
 mapfile -t PENV < <(sed -n 's/^ENV //p' <<<"$chk")
 CMDLINE="$(sed -n 's/^CMD //p' <<<"$chk")"
-[[ ${#PENV[@]} -gt 0 && -n "$CMDLINE" ]] || die "start.sh --check" "没有 ENV/CMD 输出（start.sh 是旧版？）"
+[[ ${#PENV[@]} -gt 0 && -n "$CMDLINE" ]] || die "start_hgn.sh --check" "没有 ENV/CMD 输出（启动器是旧版？）"
 printf '  %s\n' "${PENV[@]}"
 if printf '%s\n' "${PENV[@]}" | grep -qx 'GDEC_KV_PAGED=1'; then
   step "生产环境默认 GDEC_KV_PAGED=1" PASS
 else
-  die "生产环境默认 GDEC_KV_PAGED=1" "start.sh 没有导出 GDEC_KV_PAGED=1，检查 service.conf 里的 KV_PAGED"
+  die "生产环境默认 GDEC_KV_PAGED=1" "start_hgn.sh 没有导出 GDEC_KV_PAGED=1，检查 service.conf 里的 KV_PAGED"
 fi
 eval "ENGINE=($CMDLINE)"
 [[ -n "${A5_BIN:-}" ]] && ENGINE[0]="$A5_BIN"   # 测试其他引擎二进制（如 build/gdec.conc）

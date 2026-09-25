@@ -11,7 +11,7 @@
 #   bash tools/a1_verify.sh prod prodp1 prodp2
 #       # A1c：生产配置（BF16+WMMA+BTV）下关闭分页 / 恒等页表 / 反转页表，必须逐字一致
 # 注意：off/p1/p2 走 FP32 KV，prod* 走 BF16，两组数值本来就不同，不要放在同一次里比较。
-# 前提：生产服务已停（start.sh Ctrl+C）；已 bash build.sh engine。
+# 前提：生产服务已停（start_hgn.sh / start_gguf.sh 按 Ctrl+C）；已 bash build.sh engine。
 # 结果：logs/a1-<cfg>.log（引擎日志）、logs/a1-<cfg>.txt / .json（回归输出）。
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -45,7 +45,7 @@ export GDEC_NGRAM_MIN="${GDEC_NGRAM_MIN:-4}" GDEC_NGRAM_MAX="${GDEC_NGRAM_MAX:-1
 PROD_VARS=(GDEC_QSA_KV_BF16 GDEC_QSA_WMMA GDEC_QSA_WMMA_BTV GDEC_GEMM_WMMA GDEC_GDN_FUSED
            GDEC_MOE_LT GDEC_MOE_LT_BF16 GDEC_GR_BF16 GDEC_GDN_STREAM GDEC_GDN_WAVE
            GDEC_NOWARMUP GDEC_INDEX_FUSED2 GDEC_PP_MOE_OUT GDEC_INDEX_STREAM_SELECT)
-# prod / prodold：start.sh:103-115 的生产 kernel 配置（BF16 KV + WMMA + BTV，16K chunk）
+# prod / prodold：tools/serve_common.sh 的生产 kernel 配置（BF16 KV + WMMA + BTV，16K chunk）
 set_env() {
   unset GDEC_KV_PAGED GDEC_PREFILL_CHUNK "${PROD_VARS[@]}"
   [[ -z "${A1_CHUNK:-}" ]] || export GDEC_PREFILL_CHUNK="$A1_CHUNK"

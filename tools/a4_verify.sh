@@ -17,7 +17,7 @@
 #   bad  把所有页文件各翻一个字节：恢复失败（bad page）不致命，请求整段重算完成，
 #        坏检查点和页被删掉并重写
 #   a5   tools/a5_verify.sh（A5_BIN=NEW）：分页/不分页逐位一致，含 kvsnap + rckpt 同开
-# 前提：生产服务已停（start.sh Ctrl+C）。
+# 前提：生产服务已停（start_hgn.sh / start_gguf.sh 按 Ctrl+C）。
 # 回报：从 "==== A4 汇总 ====" 往下的内容。
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -28,10 +28,10 @@ want() { [[ "$A4_STAGES" == *" $1 "* ]]; }
 T0=$SECONDS
 export PROBE_BINARY="$NEW_BIN"
 probe_precheck || exit 1
-for f in start.sh start_win.sh service.conf; do
+for f in start_hgn.sh start_gguf.sh tools/serve_common.sh start_win.sh service.conf; do
   [[ -f $f ]] && grep -q $'\r' "$f" && sed -i 's/\r$//' "$f"
 done
-chk="$(bash start.sh --check 2>&1)" || { echo "$chk"; echo "A4 VERIFY: FAIL（start.sh --check 失败）"; exit 1; }
+chk="$(bash start_hgn.sh --check 2>&1)" || { echo "$chk"; echo "A4 VERIFY: FAIL（start_hgn.sh --check 失败）"; exit 1; }
 mapfile -t PENV < <(sed -n 's/^ENV //p' <<<"$chk")
 CMDLINE="$(sed -n 's/^CMD //p' <<<"$chk")"
 eval "BASE=($CMDLINE)"

@@ -2,7 +2,7 @@
 # 正式对比：同一个基准文件（应由 BF16 GGUF 生成，见 KLD.md）上跑引擎和 unsloth 量化。
 #   bash tools/kld_bench.sh <ref.kld>
 #     ONLY="eng q4 iq1"   选择要跑的项（默认全部）
-#     ENG_VARIANTS="prod" 引擎变体，prod = start.sh 生产配置；
+#     ENG_VARIANTS="prod" 引擎变体，prod = start_hgn.sh 生产配置；
 #                         再加 "name:K=V,K=V" 形式可做 env A/B（如 "nomtp:GDEC_X=1"）
 #     BIN=build/gdec      引擎二进制
 # 输出：每项 logs/kld_b_<项>.log，最后打印对比表（含 unsloth 公布值）。

@@ -1,52 +1,76 @@
 # Build and Launch
 *中文版:[QUICKSTART.md](QUICKSTART.md)*
 
-On a Linux / ROCm machine, enter the project directory and run:
+On a Linux / ROCm machine, enter the project directory, build, then start with the launcher that matches
+the weight format you have:
 
 ```bash
 bash build.sh
-bash start.sh
+bash start_hgn.sh    # hgn weights (converted with tools/flashnext2hgn.py)
+bash start_gguf.sh   # or GGUF weights (Unsloth UD-Q4_K_XL, the same files llama.cpp uses)
 ```
 
 `build.sh` compiles the GPU engine and the native API in one pass, producing `build/gdec` and `build/gdec-api`.
-`start.sh` loads the engine first, then starts the API once it is ready. Defaults: 256K context, MTP gamma 3.
-Press **Ctrl+C** to stop both the API and the engine started this time. Startup does not exit the terminal; keep the
-SSH session open, or run it in tmux.
+Apart from which weights they read, the two launchers are identical: they load the engine first, then start the
+API once it is ready. Defaults: 256K context, MTP gamma 3. Press **Ctrl+C** to stop both the API and the engine
+started this time. Startup does not exit the terminal; keep the SSH session open, or run it in tmux. The old
+`start.sh` only prints the choice above and exits.
 
 After startup, the API is available at `http://<host>:8731/v1` by default.
 Logs for each launch are saved under `logs/datetime-PID/engine.log` and `api.log`.
 
 ## Model Files
 
-Edit `service.conf` in the root directory; usually you only need to change `MODEL_DIR` (default `./models`):
-
-```bash
-MODEL_DIR="./models"
-```
-
-The directory should contain:
+Both launchers read weights from `models/` in the project root (`MODEL_DIR` in `service.conf`, default
+`./models`). `tokenizer/` is shared by both formats (only `tokenizer.json` is needed, taken from the original
+model's HF repo). Only the format you use needs to be present:
 
 ```text
 models/
-  qwen38-flash-next-w4b.hgn
-  qwen38-flash-next-w4b.overlay.hgn
-  qwen38-flash-next-mtp.hgn
-  qwen38-flash-next-vision.hgn
-  tokenizer/tokenizer.json
+  tokenizer/tokenizer.json                              # needed by both
+  # --- bash start_hgn.sh ---
+  qwen38-flash-next-w4b.hgn                             # main model
+  qwen38-flash-next-w4b.overlay.hgn                     # overlay
+  qwen38-flash-next-mtp.hgn                             # 8-bit MTP draft
+  qwen38-flash-next-vision.hgn                          # vision tower
+  # --- bash start_gguf.sh ---
+  Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf     # main model, all 4 shards
+  Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf
+  Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf
+  Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf
+  mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf               # MTP draft sidecar
+  mmproj-BF16.gguf                                      # vision tower
 ```
 
-If your model names differ, edit `MODEL_FILE`, `OVERLAY_FILE`, `MTP_FILE`,
-`VISION_FILE`, and `TOKENIZER_DIR` directly. For text-only use, set `VISION_FILE=""`; if you don't need an
-overlay, set `OVERLAY_FILE=""`; `MTP_FILE` is a standalone 8-bit MTP speculative
-draft weights file — setting `MTP_FILE=""` falls back to the 4-bit draft head built into the overlay.
-Converting your own model with `tools/flashnext2hgn.py` generates this set of files automatically;
-see CONVERT_EN.md.
+If files are missing the launcher does not start; it lists every missing file with its config key and exits
+with code 1, e.g.:
 
-All relative paths are based on the project directory containing the scripts, regardless of where the terminal was opened.
-You can also override the configuration temporarily without editing the file:
+```text
+错误：start_gguf.sh（GGUF 权重）缺少以下文件：
+  分片 3/4：./models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf
+```
+
+`start_hgn.sh` only accepts `.hgn` and `start_gguf.sh` only accepts `.gguf`; a file of the wrong format points
+you to the other launcher. If your filenames differ, edit the matching section of `service.conf`:
+
+- hgn: `MODEL_FILE`, `OVERLAY_FILE`, `MTP_FILE`, `VISION_FILE`. Set `OVERLAY_FILE=""` if you don't need an
+  overlay; `MTP_FILE` is a standalone 8-bit MTP speculative draft weights file — setting `MTP_FILE=""` falls
+  back to the 4-bit draft head built into the overlay. Converting your own model with `tools/flashnext2hgn.py`
+  generates this set of files automatically; see CONVERT_EN.md.
+- GGUF: `GGUF_FILE` (the first shard; the other shards must be in the same directory), `GGUF_MTP_FILE`,
+  `GGUF_VISION_FILE`. `GGUF_MTP_FILE=""` disables MTP speculation (the ngram drafter still works). See GGUF.md
+  for accuracy and performance.
+
+For text-only serving either format can drop the vision tower (`VISION_FILE=""` / `GGUF_VISION_FILE=""`).
+`TOKENIZER_DIR` is shared.
+
+All relative paths are based on the project directory containing the scripts, regardless of where the terminal
+was opened. You can also override the configuration temporarily without editing the file (environment variables
+of the same name win):
 
 ```bash
-MODEL_DIR=./models VISION_FILE="" bash start.sh
+MODEL_DIR=/data/models VISION_FILE="" bash start_hgn.sh
+GGUF_VISION_FILE="" bash start_gguf.sh
 ```
 
 ## Speculative Decoding
@@ -56,16 +80,16 @@ arguments needed; both greedy and sampling requests go through chain. The HTTP A
 a `drafter` field in the request body is silently ignored. Environment variable `GDEC_DRAFTER=ngram` selects pure ngram,
 `=mtp` pure MTP, `=serial` the serial baseline.
 
-`MTP_GAMMA=1 bash start.sh` tries a draft length of 1 per round; the range is 1–8, default 3;
+`MTP_GAMMA=1 bash start_hgn.sh` (or `start_gguf.sh`) tries a draft length of 1 per round; the range is 1–8, default 3;
 after changing it you must restart the engine, no rebuild needed. See MTP_EN.md for the meaning of the parameters and acceptance rate.
 
 ## Other Common Commands
 
 ```bash
-bash start.sh --check   # only check files, ports, memory, etc.; do not start the service
-bash build.sh engine   # build the engine only
-bash build.sh api      # build the API only
-bash build.sh test     # build and run kernel unit tests without loading the model
+bash start_hgn.sh --check    # only check files, ports, memory, etc.; do not start (same for start_gguf.sh)
+bash build.sh engine         # build the engine only
+bash build.sh api            # build the API only
+bash build.sh test           # build and run kernel unit tests without loading the model
 ```
 
 Port, listen address, context, MTP, and memory cap are centralized in `service.conf`. By default the API

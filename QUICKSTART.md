@@ -2,52 +2,73 @@
 
 *English: [QUICKSTART_EN.md](QUICKSTART_EN.md)*
 
-在 Linux / ROCm 机器上进入项目目录,执行:
+在 Linux / ROCm 机器上进入项目目录,先编译,再按手上的权重格式二选一启动:
 
 ```bash
 bash build.sh
-bash start.sh
+bash start_hgn.sh    # hgn 权重(tools/flashnext2hgn.py 转换得到)
+bash start_gguf.sh   # 或 GGUF 权重(Unsloth UD-Q4_K_XL,与 llama.cpp 同一份文件)
 ```
 
 `build.sh` 一次编译 GPU 引擎和原生 API,输出 `build/gdec`、`build/gdec-api`。
-`start.sh` 先加载引擎,等就绪后启动 API。默认 256K 上下文、MTP gamma 3。
-按 **Ctrl+C** 同时停止本次启动的 API 和引擎。启动不会退出终端;保持
-SSH 会话打开,或在 tmux 中运行。
+两个启动器除了读哪份权重之外完全相同:先加载引擎,等就绪后启动 API。
+默认 256K 上下文、MTP gamma 3。按 **Ctrl+C** 同时停止本次启动的 API 和引擎。
+启动不会退出终端;保持 SSH 会话打开,或在 tmux 中运行。旧的 `start.sh`
+只打印上面的选择提示并退出。
 
 启动后 API 默认在 `http://<主机>:8731/v1`。
 日志按每次启动保存在 `logs/日期时间-PID/engine.log` 和 `api.log`。
 
 ## 模型文件
 
-编辑根目录 `service.conf`,通常只需要改 `MODEL_DIR`(默认 `./models`):
-
-```bash
-MODEL_DIR="./models"
-```
-
-目录里应有:
+两个启动器都从项目根目录的 `models/` 读取权重(`service.conf` 的
+`MODEL_DIR`,默认 `./models`),`tokenizer/` 两种格式共用(只需
+`tokenizer.json`,取自原模型 HF 仓库)。只需放自己要用的那一种:
 
 ```text
 models/
-  qwen38-flash-next-w4b.hgn
-  qwen38-flash-next-w4b.overlay.hgn
-  qwen38-flash-next-mtp.hgn
-  qwen38-flash-next-vision.hgn
-  tokenizer/tokenizer.json
+  tokenizer/tokenizer.json                              # 两种都要
+  # --- bash start_hgn.sh ---
+  qwen38-flash-next-w4b.hgn                             # 主模型
+  qwen38-flash-next-w4b.overlay.hgn                     # overlay
+  qwen38-flash-next-mtp.hgn                             # 8-bit MTP 草稿
+  qwen38-flash-next-vision.hgn                          # 视觉塔
+  # --- bash start_gguf.sh ---
+  Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf     # 主模型,4 个分片都要
+  Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf
+  Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf
+  Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf
+  mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf               # MTP 草稿 sidecar
+  mmproj-BF16.gguf                                      # 视觉塔
 ```
 
-模型名不同时,直接修改 `MODEL_FILE`、`OVERLAY_FILE`、`MTP_FILE`、
-`VISION_FILE`、`TOKENIZER_DIR`。纯文本可设 `VISION_FILE=""`;不需要
-overlay 可设 `OVERLAY_FILE=""`;`MTP_FILE` 是独立的 8-bit MTP 投机草稿
-权重,设 `MTP_FILE=""` 则退回 overlay 内置的 4-bit 草稿头。
-用 `tools/flashnext2hgn.py` 转换自有模型时会自动生成这套文件,
-见 CONVERT.md。
+缺文件时启动器不会启动,而是一次列出全部缺失的文件和配置项,退出码 1,例如:
+
+```text
+错误：start_gguf.sh（GGUF 权重）缺少以下文件：
+  分片 3/4：./models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf
+```
+
+`start_hgn.sh` 只接受 `.hgn`、`start_gguf.sh` 只接受 `.gguf`,放错会提示
+改用另一个启动器。文件名不同时修改 `service.conf` 里对应的一段:
+
+- hgn:`MODEL_FILE`、`OVERLAY_FILE`、`MTP_FILE`、`VISION_FILE`。不需要
+  overlay 可设 `OVERLAY_FILE=""`;`MTP_FILE` 是独立的 8-bit MTP 投机草稿
+  权重,设 `MTP_FILE=""` 则退回 overlay 内置的 4-bit 草稿头。用
+  `tools/flashnext2hgn.py` 转换自有模型时会自动生成这套文件,见 CONVERT.md。
+- GGUF:`GGUF_FILE`(填第 1 个分片,其余分片须在同一目录)、
+  `GGUF_MTP_FILE`、`GGUF_VISION_FILE`。设 `GGUF_MTP_FILE=""` 则不做 MTP 投机
+  (仍有 ngram 草稿)。精度与性能对比见 GGUF.md。
+
+两者纯文本服务都可以把视觉塔设为空(`VISION_FILE=""` / `GGUF_VISION_FILE=""`)。
+`TOKENIZER_DIR` 两者共用。
 
 所有相对路径都以脚本所在项目目录为基准,不受打开终端的位置影响。
-也可临时指定配置,无需修改文件:
+也可临时指定配置,无需修改文件(同名环境变量优先):
 
 ```bash
-MODEL_DIR=./models VISION_FILE="" bash start.sh
+MODEL_DIR=/data/models VISION_FILE="" bash start_hgn.sh
+GGUF_VISION_FILE="" bash start_gguf.sh
 ```
 
 ## 投机解码
@@ -57,16 +78,16 @@ MODEL_DIR=./models VISION_FILE="" bash start.sh
 发 `drafter` 字段会被静默忽略。环境变量 `GDEC_DRAFTER=ngram` 纯 ngram、
 `=mtp` 纯 MTP、`=serial` 串行基线。
 
-`MTP_GAMMA=1 bash start.sh` 可试一轮草稿长度 1,范围 1–8,默认 3;
+`MTP_GAMMA=1 bash start_hgn.sh`(或 `start_gguf.sh`)可试一轮草稿长度 1,范围 1–8,默认 3;
 修改后需重启引擎,不需要编译。参数和接受率的含义见 MTP.md。
 
 ## 其他常用命令
 
 ```bash
-bash start.sh --check   # 仅检查文件、端口、内存等,不启动服务
-bash build.sh engine   # 只编译引擎
-bash build.sh api      # 只编译 API
-bash build.sh test     # 编译并运行 kernel 单测,不加载模型
+bash start_hgn.sh --check    # 仅检查文件、端口、内存等,不启动服务(start_gguf.sh 同)
+bash build.sh engine         # 只编译引擎
+bash build.sh api            # 只编译 API
+bash build.sh test           # 编译并运行 kernel 单测,不加载模型
 ```
 
 端口、监听地址、上下文、MTP、内存上限集中在 `service.conf`。默认 API

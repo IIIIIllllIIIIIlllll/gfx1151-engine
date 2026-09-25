@@ -10,7 +10,7 @@
 #   3. a1_verify.sh prod prodp1 prodp2 [prodold]：不分页 / 恒等页表 / 反转页表 [/ 改动前二进制]
 #      snapshot_regress 9 个用例逐字一致
 #   4. btv_kvsnap_verify.sh 两轮：不分页保存→反转页表恢复；反转页表保存→不分页恢复
-# 前提：生产服务已停（start.sh Ctrl+C）。
+# 前提：生产服务已停（start_hgn.sh / start_gguf.sh 按 Ctrl+C）。
 # 回报：从 "==== A1c 汇总 ====" 往下的内容。
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
