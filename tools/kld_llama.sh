@@ -10,13 +10,15 @@
 #   CHUNKS=100         base 取多少个 chunk（-1 = 全部，wikitext-2 test 约 580 个）
 #   BATCH=2048         一次并行 BATCH/CTX 个 chunk；UBATCH 默认同 BATCH
 #   LLAMA_ARGS="-ngl 999 -fa on --threads 16"  额外参数（同 launch_config 的 Q4_K_XL 配置）。
-#                      BF16（354 GB）放不进内存：用 "-ngl 0 -fa on --threads 16 --load-mode mmap
+#                      BF16（354 GB）放不进内存：用 "-ngl 0 -nkvo -fa on --threads 16 --load-mode mmap
 #                      --no-host --no-repack --no-op-offload"（auto 会整块分配 354 GB 锁页内存，
-#                      op offload 要 482 GB GPU 缓冲），BATCH=8192，每一遍只从 SSD 流一次权重
+#                      op offload 要 482 GB GPU 缓冲），BATCH=8192，每一遍只从 SSD 流一次权重。
+#                      -nkvo 在 CTX>2048 时必须加：否则 CPU 也走 maskless 块选择路径（只有 HIP 的
+#                      qsa3 kernel 自己做因果掩码），CPU 会看到未来 token，PPL≈1.01（见 KLD.md）
 # 输出：logs/kld_<标签>.log；打印 PPL/KLD/Same top 摘要行。ref 文件每 chunk ≈126 MB（CTX=512）。
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-[[ $# -ge 3 ]] || { sed -n '2,17p' "$0"; exit 1; }
+[[ $# -ge 3 ]] || { sed -n '2,19p' "$0"; exit 1; }
 mode=$1 model=$2 file=$3
 LABEL=${4:-${mode}_$(basename "$model" .gguf)_$(date +%H%M%S)}
 LLAMA_PPL=${LLAMA_PPL:-$HOME/App/llama.cpp/llamacpp/llama.cpp-strix-halo/llama-perplexity}

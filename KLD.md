@@ -40,7 +40,7 @@ gdec BASE OVL --tokens-file IDS --kld-save OUT.kld [--kld-ctx 512] [--kld-chunks
 bash tools/kld_verify.sh
 # 1) 下载 unsloth BF16 GGUF（约 355 GB，放 ~/App/llama.cpp/models/ 下，不要放引擎 models/）
 # 2) BF16 写基准：内存放不下，走 CPU + mmap 从 SSD 流权重；把 batch 调大，让每一遍覆盖多个 chunk
-LLAMA_ARGS="-ngl 0 -fa on --threads 16 --load-mode mmap --no-host --no-repack --no-op-offload" \
+LLAMA_ARGS="-ngl 0 -nkvo -fa on --threads 16 --load-mode mmap --no-host --no-repack --no-op-offload" \
   BATCH=8192 CHUNKS=64 \
   bash tools/kld_llama.sh base ~/Models/BF16/Qwen3.8-Flash-Next-BF16/Qwen3.8-Flash-Next-BF16-00001-of-00008.gguf \
   data/kld/bf16_c512.kld bf16_base
@@ -50,6 +50,13 @@ BIN=build/gdec.conc bash tools/kld_bench.sh data/kld/bf16_c512.kld
 
 - 这几个 llama 参数缺一不可：load-mode 默认 auto，在 ROCm 上会退回整块分配 354 GB 锁页主机内存
   （失败）；op offload 默认开，会为临时搬到 GPU 的权重申请 482 GB 计算缓冲（失败）。
+- **CTX > 2048 时 CPU 必须加 `-nkvo`。** 本机 llama.cpp 分支（qwen4exp.cpp 的
+  `qwen4exp_use_block_selection`）只要 `flash_attn && offload_kqv` 就走 maskless 块选择：
+  不上传逐 cell 的因果掩码，由 HIP 的 qsa3 kernel 自己做。`-ngl 0` 时 offload_kqv 默认仍为 true，
+  CPU 的通用 attention 就会看到未来 token。实测（Q4_K_XL，wikitext 第 1 段）：
+  2K 时 GPU 1.394 / CPU 1.376（尚无稀疏，一致）；4K 时 GPU 1.261 / CPU 1.011 / CPU+`-nkvo` 1.259；
+  8K 时 GPU 2.10 / CPU 1.008。引擎全量注意力（`GDEC_QSA_DENSE=1`）8K 前 2 段 PPL 2.024，
+  所以 1.01 不可能是真实值。512 的表不受影响（全量注意力）。
 - 实测耗时（2026-09-24）：加载 2.5 分钟（完整读一遍），BATCH=8192 一遍 16 个 chunk、192 s，
   瓶颈是 CPU 计算（13 核跑满，缺页读盘只有 0.5–2 GB/s）。64 chunk 共 13.4 分钟；
   随后 kld_bench 三项约 5.5 分钟（引擎 139 s、Q4_K_XL 106 s、IQ1_S 83 s）。
@@ -91,18 +98,41 @@ BIN=build/gdec.conc bash tools/kld_bench.sh data/kld/bf16_c512.kld
 - 引擎各行都是生产 env，KV cache 为 BF16（`GDEC_QSA_KV_BF16=1`，代码默认是 FP32）。
   "fp32 激活"一行只改了激活，KV 仍是 BF16；KV 精度的影响尚未单独测。
 
-### 覆盖范围与待测
+### 覆盖范围
 
-- **本表不含长上下文。** n_ctx=512，统计位置最多到 511；QSA 从位置 2051 起才做稀疏选择
-  （512 个 4-token block + 尾部），之前两种模式都是全量注意力。所以 indexer / 稀疏选择
-  及其与权重量化叠加的误差都没有被覆盖，本表只衡量权重量化（加 BF16 KV）。
-- 待测（以后再做）：
-  1. 长上下文 KLD：CTX ≥ 4096（最好 8192）的 BF16 基准。BF16 纯 CPU，token 数是现在的
-     数倍到十几倍，写基准估计 1–3.5 小时；ref 文件大小与统计位置数成正比，注意空间。
-  2. FP32 KV 对照：不设 `GDEC_QSA_KV_BF16` 跑一次 kld_engine（约 2 分钟）。
-  3. 量化误差逐项隔离：MoE 专家 / fp8 PLE / 稠密层各贡献多少。
+- 上表 n_ctx=512，统计位置最多到 511；QSA 从位置 2051 起才做稀疏选择
+  （512 个 4-token block + 尾部），之前两种模式都是全量注意力。长上下文见下一节。
+
+## 长上下文结果（2026-09-25，BF16 基准，CTX=8192 × 8 chunk，32760 个统计位置）
+
+统计位置 4096…8190，全部在稀疏选择区间内。基准：`-ngl 0 -nkvo`（见上文），
+写基准 28 分钟（加载 3 分钟 + 每遍 192 s），文件 16.3 GB（`data/kld/bf16_c8192.kld`）。
+引擎：`BIN=build/gdec.conc MAXCTX=8448`，每 chunk 一次 prefill（生产 WMMA 路径）。
+
+| 项 | top-1 % | Mean KLD | 99.9% KLD | 中位数 | PPL(Q) |
+|---|---|---|---|---|---|
+| BF16（基准） | — | — | — | — | 3.2654 |
+| llama UD-Q4_K_XL | 93.83 ± 0.13 | 0.0358 ± 0.0006 | 1.309 | 0.0070 | 3.2790 |
+| **引擎 生产（BF16 KV）** | **88.25 ± 0.18** | **0.1219 ± 0.0015** | 3.117 | 0.0335 | 3.3642 |
+| 引擎 FP32 KV（去掉 `GDEC_QSA_KV_BF16`） | 88.16 ± 0.18 | 0.1213 ± 0.0015 | 3.043 | 0.0336 | 3.3649 |
+| llama UD-IQ1_S | 80.43 ± 0.22 | 0.3566 ± 0.0041 | 7.402 | 0.1061 | 3.9670 |
+
+- 长上下文下所有量化的 KLD 都比 512 低（上下文越长预测越确定）。相对位置不变：
+  引擎/Q4_K_XL 的 KLD 比值 8K 为 3.40，512 为 3.32，所以引擎的稀疏注意力实现
+  （indexer + 块选择 + WMMA）没有在权重量化之外额外引入可见误差。
+- BF16 KV 与 FP32 KV 的差在误差条内（0.1219 对 0.1213），生产用 BF16 KV 没有精度问题。
+- 引擎全量注意力（`GDEC_QSA_DENSE=1`）与稀疏前 2 段 PPL 为 2.024 对 2.031：
+  稀疏选择本身对这个模型损失很小。
+- 偏差仍然主要来自权重：PPL 高 3.0%（Q4_K_XL 高 0.4%）。
+
+### 待测
+
+1. 量化误差逐项隔离：MoE 专家 / fp8 PLE / 稠密层各贡献多少。
+2. 更长的上下文（32K）：BF16 CPU 每遍时间随注意力增长，需要单独评估。
 - `GDEC_QSA_DENSE=1` 不能当长上下文的"精确对照"：它按全量注意力计算，2051 以上与参考模型
-  语义不同；还会让 MoE 退回 atomic 累加（非确定），decode 走旧的 k_qsa_step。
+  语义不同。（2026-09-25 起 dense 不再强制 atomic MoE，保留 MoE_LT 确定性路径；decode 从
+  k_qsa_step 改为 split flash（selected=nullptr），8K decode 0.9 → 30.6 tok/s，32K 0.2 → 23.6，
+  生成 token 与旧实现一致。prefill 仍是 SIMT O(n²)：32K 第二个 chunk 209 tok/s，生产约 1230。）
 
 ## 注意
 
