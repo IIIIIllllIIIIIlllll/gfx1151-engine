@@ -9,17 +9,20 @@
 D=~/App/llama.cpp/models/Qwen3.8-Flash-Next-UD-Q4_K_XL
 export GDEC_GGUF=$D/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf   # G2：路由专家来自 GGUF
 export GDEC_GGUF_DENSE=1                                                 # G3.1：其余非专家张量也来自 GGUF
-export GDEC_GGUF_MTP=$D/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf          # G3.1：MTP 头的非专家张量
+export GDEC_GGUF_MTP=$D/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf          # G3.1/G3.2：MTP 头（含路由专家）
+export VISION_FILE=$D/mmproj-BF16.gguf                                   # G3.2：视觉塔（start.sh → --vision-tower）
 ```
 
 | 变量 | 作用 |
 |---|---|
 | `GDEC_GGUF=<第 1 个分片>` | trunk 48 层路由专家直接读 GGUF（hipHostRegister 原地映射，不复制），跑 `26_kernels_moe_gguf.inc` 的 WMMA kernel（移植自 gufo，MIT） |
 | `GDEC_GGUF_DENSE=1` | 加载期把 dense / norm / router / HC / embed / lm_head / PLE 投影从 GGUF 转成引擎格式（`src/gguf_map.h`），按 hgn 名覆盖 hgn 记录 |
-| `GDEC_GGUF_MTP=<sidecar>` | MTP 头的非专家张量从 Q8_0 sidecar 读 |
+| `GDEC_GGUF_MTP=<sidecar>` | MTP 头从 Q8_0 sidecar 读：非专家张量需 `GDEC_GGUF_DENSE=1`；路由专家（Q8_0 gate/up/down）只要同时设了 `GDEC_GGUF` 就原地映射，走同一套 MoE kernel |
+| `GDEC_GGUF_MTP_EXPERTS=0` | 调试用：MTP 路由专家仍取 hgn |
+| `--vision-tower <mmproj.gguf>` | 路径以 `.gguf` 结尾时按 llama.cpp mmproj（clip / qwen3vl_merger）加载，转成与 hgn 视觉文件相同的 bf16 张量（`gguf_map::build_vision`） |
 | `GDEC_GGUF_DENSE_FILTER=a,b,...` | 调试用：只有名字包含其中某个子串的张量来自 GGUF（`!` 前缀表示取反），用于二分定位 |
 
-仍然来自 hgn：PLE n-gram 表（fp8，GGUF 里是 IQ4_NL）、MTP 路由专家。去掉这两项后才能纯 GGUF 启动（G3.2 / G3.3）。
+仍然来自 hgn：PLE n-gram 表（fp8，GGUF 里是 IQ4_NL）。去掉它后才能纯 GGUF 启动（G3.3）。
 
 ## 转换规则（gguf_map.h）
 
@@ -29,6 +32,10 @@ export GDEC_GGUF_MTP=$D/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf          # G3.1�
 - `A_log = log(-ssm_a)`；零中心 RMSNorm 权重在 GGUF 里已 +1（ssm_norm 除外），加载时减 1。
 - indexer q_proj(512) + k_proj(128) 拼成 index_qk_proj(640)；MTP eh_proj = [embedding 列 | hidden 列]。
 - 逐张量对照检查：`tools/g3_map_check.cpp`（vs 生产 hgn）。
+- 视觉塔：Conv3d patch embed 被转换器拆成两个时间切片 `v.patch_embd.weight` / `.weight.1`
+  （各 [1152][3][16][16]），拼回引擎的 [1152][1536]（列 = c*512 + t*256 + y*16 + x）；
+  其余是改名（`attn_qkv`→`attn.qkv`，`ffn_up/down`→`mlp.linear_fc1/2`，`ln1/2`→`norm1/2`，
+  `post_ln`→`merger.norm`，`mm.0/2`→`merger.linear_fc1/2`）。F32 张量是 bf16 原值的上转，转回 bf16 无损。
 
 ## 结果（2026-09-25，gfx1151，`tools/g3_verify.sh` PASS）
 
@@ -65,10 +72,24 @@ export GDEC_GGUF_MTP=$D/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf          # G3.1�
   剩余差距主要是 Q8_0 dense 的字节数（约为 q4cp 的 2 倍），带宽已接近上限；
   只有重新量化（牺牲 KLD）才能消除，暂不做。
 
+- **G3.2（MTP 路由专家 + 视觉塔）。**
+  MTP sidecar 的路由专家是 Q8_0 gate/up/down（主体是 Q4_K/Q5_K + Q5_1），MoE kernel 加了 Q8_0 gate/up
+  实例（WMMA 与小 P GEMV 两条路径，`tools/moe_gguf_*test* --layer 48` PASS）。P=1 每步比 hgn q4cp 多约 100 µs
+  （Q8_0 字节多），占一轮投机 <1%。
+
+  | 投机 γ=3，同机 | MTP 专家来自 hgn | 来自 sidecar |
+  |---|---|---|
+  | 8K prompt tok/s（commit/round） | 46.0 / 46.2（3.82） | 46.3 / 46.1（3.82） |
+  | 512 prompt tok/s（commit/round） | 33.9（2.88） | 35.0（2.99） |
+
+  视觉塔：333 个张量与 hgn 视觉文件逐位相同；离线 `--vision-test` 前向的 35 个层 dump 逐字节相同
+  （`tools/g3_vision_verify.sh`）。加载 1.2 s（hgn 1.0 s）。
+
 ## 验证脚本
 
 - `tools/g2_verify.sh` — G2（专家）
 - `tools/g3_verify.sh` — G3.1：KLD、decode/prefill PPL、hgn 路径逐位不变、MTP、速度
+- `tools/g3_vision_verify.sh` — G3.2 视觉塔：张量逐位对照 + 端到端前向 dump 逐字节对照
 - `tools/g3_smoke.sh [ENV=...]` — 512 token PPL 冒烟（可带过滤器等 env）
 - `tools/moe_gguf_test.cu` — MoE kernel vs CPU 参考
 - `tools/moe_gguf_gemv_test.cu` — 小 P 专家 GEMV（含去重路径逐位对照）vs CPU 参考

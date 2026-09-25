@@ -772,7 +772,13 @@ struct VisionTower {
   }
 
   void load(const char* path) {
-    Checkpoint ck(path);
+    // *.gguf = llama.cpp mmproj (clip / qwen3vl_merger), mapped to the same
+    // visual.* bf16 tensors in memory (gguf_map::build_vision, bit-exact vs hgn).
+    const size_t pl = strlen(path);
+    const bool is_gguf = pl > 5 && strcmp(path + pl - 5, ".gguf") == 0;
+    std::unique_ptr<Checkpoint> ckp(is_gguf ? new Checkpoint() : new Checkpoint(path));
+    Checkpoint& ck = *ckp;
+    if (is_gguf) gguf_map::build_vision(ck, gguf::File(path));
     // GEMM weights bf16 -> fp16 host-side (exact at normal magnitudes).
     auto bf = [&](const char* name) -> uint16_t* {
       const Tensor& t = ck.at(name);

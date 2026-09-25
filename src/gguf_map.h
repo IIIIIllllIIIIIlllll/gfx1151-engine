@@ -316,4 +316,75 @@ inline size_t build(hgn::Checkpoint& ck, const gguf::File& g, const gguf::File* 
   return ck.synthetic_count() - n0;
 }
 
+// mmproj GGUF (general.architecture clip, projector qwen3vl_merger, e.g.
+// mmproj-BF16.gguf) -> the vision tower's hgn names (visual.*), all bf16
+// (dtype 0) like the hgn vision file; 31_vision.inc then loads it unchanged.
+// Only the Conv3d patch embed needs a transform: the converter split it into
+// its two temporal slices v.patch_embd.weight / .weight.1 (each torch
+// [1152][3][16][16]); the engine wants [1152][3*2*16*16], column
+// c*512 + t*256 + y*16 + x. The F32 tensors (biases, norms, patch/pos embed)
+// were upcast from bf16 sources, so bf16 is lossless
+// (tools/g3_vision_check.cpp: bit-exact vs the hgn vision file).
+inline size_t build_vision(hgn::Checkpoint& ck, const gguf::File& g) {
+  const size_t n0 = ck.synthetic_count();
+  need(g.arch() == "clip" && g.kv_s("clip.projector_type") == "qwen3vl_merger",
+       "mmproj: expected a clip / qwen3vl_merger GGUF");
+  const int nb = (int)g.kv_i("clip.vision.block_count", 0);
+  const uint64_t H = (uint64_t)g.kv_i("clip.vision.embedding_length", 0);
+  const uint64_t F = (uint64_t)g.kv_i("clip.vision.feed_forward_length", 0);
+  const uint64_t O = (uint64_t)g.kv_i("clip.vision.projection_dim", 0);
+  need(nb == 27 && H == 1152 && F == 4304 && O == 2560, "mmproj: unexpected vision dims");
+  const uint64_t M = 4 * H;  // 2x2 spatial merge
+  auto mat = [&](const std::string& n, const std::string& gn, uint64_t r, uint64_t c) {
+    const gguf::Tensor& t = g.at(gn);
+    need(t.ne[0] == c && t.rows() == r, n + " <- " + gn + ": shape");
+    add_bf16(ck, n, t, {r, c});
+  };
+  auto vec = [&](const std::string& n, const std::string& gn, uint64_t c) {
+    const gguf::Tensor& t = g.at(gn);
+    need(t.numel() == c, n + " <- " + gn + ": shape");
+    add_bf16(ck, n, t, {c});
+  };
+  {
+    const gguf::Tensor& t0 = g.at("v.patch_embd.weight");
+    const gguf::Tensor& t1 = g.at("v.patch_embd.weight.1");
+    need(t0.ne[0] == 16 && t0.ne[1] == 16 && t0.ne[2] == 3 && t0.ne[3] == H &&
+             t1.numel() == t0.numel(),
+         "v.patch_embd: shape");
+    const std::vector<float> a = rows_f32(t0), b = rows_f32(t1);
+    std::vector<float> w(H * 1536);
+    for (uint64_t o = 0; o < H; o++)
+      for (uint64_t c = 0; c < 3; c++)
+        for (uint64_t t = 0; t < 2; t++)
+          memcpy(&w[o * 1536 + c * 512 + t * 256], &(t ? b : a)[(o * 3 + c) * 256],
+                 256 * sizeof(float));
+    add_bf16v(ck, "visual.patch_embed.proj.weight", w, {H, 1536});
+  }
+  vec("visual.patch_embed.proj.bias", "v.patch_embd.bias", H);
+  mat("visual.pos_embed.weight", "v.position_embd.weight", 2304, H);
+  for (int i = 0; i < nb; i++) {
+    const std::string P = "visual.blocks." + std::to_string(i) + ".";
+    const std::string B = "v.blk." + std::to_string(i) + ".";
+    mat(P + "attn.qkv.weight", B + "attn_qkv.weight", 3 * H, H);
+    vec(P + "attn.qkv.bias", B + "attn_qkv.bias", 3 * H);
+    mat(P + "attn.proj.weight", B + "attn_out.weight", H, H);
+    vec(P + "attn.proj.bias", B + "attn_out.bias", H);
+    mat(P + "mlp.linear_fc1.weight", B + "ffn_up.weight", F, H);
+    vec(P + "mlp.linear_fc1.bias", B + "ffn_up.bias", F);
+    mat(P + "mlp.linear_fc2.weight", B + "ffn_down.weight", H, F);
+    vec(P + "mlp.linear_fc2.bias", B + "ffn_down.bias", H);
+    vec(P + "norm1.weight", B + "ln1.weight", H);
+    vec(P + "norm1.bias", B + "ln1.bias", H);
+    vec(P + "norm2.weight", B + "ln2.weight", H);
+    vec(P + "norm2.bias", B + "ln2.bias", H);
+  }
+  vec("visual.merger.norm.weight", "v.post_ln.weight", H);
+  vec("visual.merger.norm.bias", "v.post_ln.bias", H);
+  mat("visual.merger.linear_fc1.weight", "mm.0.weight", M, M);
+  vec("visual.merger.linear_fc1.bias", "mm.0.bias", M);
+  mat("visual.merger.linear_fc2.weight", "mm.2.weight", O, M);
+  vec("visual.merger.linear_fc2.bias", "mm.2.bias", O);
+  return ck.synthetic_count() - n0;
+}
+
 }  // namespace gguf_map
