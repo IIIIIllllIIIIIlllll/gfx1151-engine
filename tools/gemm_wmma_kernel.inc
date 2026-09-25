@@ -39,11 +39,40 @@ __device__ __forceinline__ void gwmma_sync() {
       "s_barrier" ::
           : "memory");
 }
+// Same as f2bf/bf2f at the top of this file; repeated inside the markers so
+// the sed-extracted tools/gemm_wmma_kernel.inc stays self-contained.
+__device__ __forceinline__ uint16_t gw_f2bf(float f) {
+  uint32_t u;
+  memcpy(&u, &f, 4);
+  u += 0x7FFF + ((u >> 16) & 1);
+  return (uint16_t)(u >> 16);
+}
+__device__ __forceinline__ float gw_bf2f(uint16_t b) {
+  uint32_t u = (uint32_t)b << 16;
+  float f;
+  memcpy(&f, &u, 4);
+  return f;
+}
 
-template <int BM, int BP, int MW, int PW, int WM, int WP, int KST, int NT>
+// Epi == 1: HC mix-up + combine fusion (replaces the (10240,320) G GEMM plus
+// k_gr_combine_b_hc_bf16). W is the [4*d, K] input_mix_weight_up, logically
+// permuted at staging time so logical column r maps to W row
+//   ((r >> 4) & 3) * d + (r >> 6) * 16 + (r & 15),  d = N / 4,
+// i.e. the WP=4 fragments of a warp are the 4 branches of the same 16
+// channels, and one lane holds all 4 gates of its channel for 8 tokens. The
+// epilogue then does exactly what the combine kernel did (same ops, same
+// branch order): x = sum_b sigmoid(G_b) * Rhat_b / 4, fp32 to Y[P,d] and bf16
+// to Yb. Only the column->block assignment changes, not the K accumulation,
+// so G and x are bit-identical to the unfused pair. Requires WP == 4,
+// PW * 64 == BP and N % BP == 0 (host-checked); G never touches DRAM.
+template <int BM, int BP, int MW, int PW, int WM, int WP, int KST, int NT,
+          int Epi = 0>
 __global__ void __launch_bounds__(NT)
     k_gemm_wmma(const uint16_t* __restrict__ X, const uint16_t* __restrict__ W,
-                float* __restrict__ Y, int P, int K, int N, int gm) {
+                float* __restrict__ Y, int P, int K, int N, int gm,
+                const uint16_t* __restrict__ Rh = nullptr,
+                uint16_t* __restrict__ Yb = nullptr) {
+  static_assert(Epi == 0 || (WP == 4 && PW * WP * 16 == BP), "hc epi layout");
   constexpr int LSA = KST + 8;        // LDS row stride (elems)
   constexpr int BREG = 8 * LSA + 8;   // W 8-row region stride (elems)
   constexpr int NW = NT / 32;         // warps per block
@@ -123,7 +152,10 @@ __global__ void __launch_bounds__(NT)
     const int idx = tid + j * NT;
     const int q = idx % Q8, b = (idx / Q8) % RPW;
     const int row = (idx / (Q8 * RPW)) * RPW + (b & 1) * (RPW / 2) + (b / 2);
-    gb[j] = W + (size_t)min(n0 + row, N - 1) * K + q * 8;
+    int wrow = min(n0 + row, N - 1);
+    if constexpr (Epi == 1)
+      wrow = ((wrow >> 4) & 3) * (N >> 2) + (wrow >> 6) * 16 + (wrow & 15);
+    gb[j] = W + (size_t)wrow * K + q * 8;
     sboff[j] = ((row >> 3) * BREG + (row & 7) * LSA + q * 8) * 2;
   }
 
@@ -176,6 +208,31 @@ __global__ void __launch_bounds__(NT)
 #undef GWMMA_COMPUTE
 
   const int rh = (lane >> 4) * 8, cl = lane & 15;
+  if constexpr (Epi == 1) {
+    const int d = N >> 2;
+    const int c = (n0 >> 2) + (wp0 >> 2) + cl;
+#pragma unroll
+    for (int i = 0; i < WM; ++i) {
+      const int p0 = m0 + wm0 + i * 16 + rh;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const int p = p0 + e;
+        if (p < P) {
+          const uint16_t* Rt = Rh + (size_t)p * 4 * d + c;
+          float a = 0.f;
+#pragma unroll
+          for (int b = 0; b < 4; ++b) {
+            float gate = 1.f / (1.f + expf(-acc[i][b][e]));
+            a += gate * gw_bf2f(Rt[b * d]);
+          }
+          const float value = a / 4;
+          Y[(size_t)p * d + c] = value;
+          Yb[(size_t)p * d + c] = gw_f2bf(value);
+        }
+      }
+    }
+    return;
+  }
 #pragma unroll
   for (int i = 0; i < WM; ++i)
 #pragma unroll
