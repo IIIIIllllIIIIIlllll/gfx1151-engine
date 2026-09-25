@@ -113,6 +113,28 @@ __global__ void k_dequant_q8g64_bf16(const uint8_t* __restrict__ w,
   for (int j = 0; j < 64; j++) o[j] = f2bf(codes[j] * s + mn);
 }
 
+// --- q8g32 planar full dequant to bf16 (one thread per 32-col group)
+__global__ void k_dequant_q8g32_bf16(const int8_t* __restrict__ q,
+                                     const __half* __restrict__ s,
+                                     uint16_t* __restrict__ out, uint64_t rows,
+                                     uint64_t cols) {
+  uint64_t gid = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+  if (gid >= rows * (cols / 32)) return;
+  float sc = __half2float(s[gid]);  // scales are [rows][cols/32] = flat gid
+  const uint4* c = (const uint4*)(q + gid * 32);
+  uint4 a = c[0], b = c[1];
+  uint32_t w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+  uint16_t r[32];
+#pragma unroll
+  for (int i = 0; i < 8; i++)
+#pragma unroll
+    for (int k = 0; k < 4; k++)
+      r[i * 4 + k] = f2bf((float)(int8_t)(uint8_t)(w[i] >> (8 * k)) * sc);
+  uint4* o = (uint4*)(out + gid * 32);
+#pragma unroll
+  for (int i = 0; i < 4; i++) o[i] = ((const uint4*)r)[i];
+}
+
 // --- fp32 [P,n] (row stride xs) -> compact bf16 [P,n]
 __global__ void k_f32_to_bf16(const float* __restrict__ x, uint16_t* __restrict__ out,
                               uint64_t xs, int P, int n) {

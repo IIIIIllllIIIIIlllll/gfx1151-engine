@@ -224,6 +224,14 @@ struct GpuModel {
   GpuMoeRouting moe_routing;
   MoeTile* d_moetiles = nullptr;
   int* d_moentiles = nullptr;
+  // GGUF routed experts (gg_on()): P == 1 scratch used by the decode graph;
+  // batches reuse the prefill workspaces (see moe_gguf).
+  __half* d_gg_x16 = nullptr;   // [d] F16 x
+  __half* d_gg_hid = nullptr;   // [topk][moe_mid] F16 up*silu(gate)
+  float* d_gg_pairs = nullptr;  // [topk][d] unweighted expert outputs
+  float* d_gg_pw = nullptr;     // [topk]
+  int *d_gg_tok = nullptr, *d_gg_pid = nullptr, *d_gg_nt = nullptr;
+  MoeTile* d_gg_tiles = nullptr;  // [topk]
   // GDN chunked prefill (Phase 3b)
   float* d_convb;    // [maxctx, 10240] post-conv qkv (conv is not in-place)
   float* d_gdn_ws;   // [48, 2, 64, 128] per-head chunk scratch
@@ -450,6 +458,21 @@ struct GpuModel {
     DALLOC(&d_hid, 16 * 640 * 4);
     DALLOC(&d_ey, g_cfg.d * 4);
     DALLOC(&d_moeacc, g_cfg.d * 4);
+    if (gg_on()) {
+      const int k = g_cfg.topk;
+      if (k != 10 || !moe_deterministic || moe_host_route || moe_ordered || moe_untiled)
+        throw std::runtime_error(
+            "GDEC_GGUF needs top-10 and the default MoE routing (no GDEC_MOE_ATOMIC / "
+            "HOST_ROUTE / ORDERED / UNTILED)");
+      DALLOC(&d_gg_x16, (size_t)g_cfg.d * 2);
+      DALLOC(&d_gg_hid, (size_t)k * g_cfg.moe_mid * 2);
+      DALLOC(&d_gg_pairs, (size_t)k * g_cfg.d * 4);
+      DALLOC(&d_gg_pw, k * 4);
+      DALLOC(&d_gg_tok, k * 4);
+      DALLOC(&d_gg_pid, k * 4);
+      DALLOC(&d_gg_nt, 4);
+      DALLOC(&d_gg_tiles, k * sizeof(MoeTile));
+    }
     DALLOC(&d_sg, 4);
     DALLOC(&d_e, 2560 * 4);
     CK(hipHostMalloc((void**)&ple_e, 2560 * 4, hipHostMallocDefault));
@@ -1218,6 +1241,45 @@ struct GpuModel {
         d_moeacc, topids, d_topw, (uint64_t)g_cfg.d, dn.cols, dn.scale_stride,
         (uint64_t)g_cfg.moe_mid, k, 16 /*id_stride*/, 0 /*acc_stride*/, k);
   }
+  // GGUF routed experts of trunk layer l (gg_on()): x f32 [P][d] with top-k
+  // rows (16 wide) -> acc f32 [P][d], every element overwritten (no memset).
+  // P == 1 (decode graph): sort-free per-pair tiles on private scratch.
+  // P > 1: stable GPU bucketing + 64-slot tiles on the prefill workspaces
+  // (F16 x in d_xbf16b, which is never cached; hid F16 in d_hidb; unweighted
+  // pairs in d_guvb, dead again once the weighted reduce has run).
+  void moe_gguf(int l, const float* x, const int* topids, const float* topw, float* acc,
+                int P) {
+    const GgExperts& g = g_ggx.at(l);
+    const int k = g_cfg.topk, E = g_cfg.experts, d = g_cfg.d, mid = g_cfg.moe_mid;
+    int *tokidx, *pairids, *ntiles;
+    float *pw, *pairs;
+    MoeTile* tiles;
+    __half *x16, *hid;
+    int max_tiles;
+    if (P == 1) {
+      k_moe_gg_route1<<<1, 64, 0, g_str>>>(topids, topw, 1, k, 16, d_gg_tok, d_gg_pw,
+                                           d_gg_pid, d_gg_tiles, d_gg_nt);
+      tokidx = d_gg_tok, pairids = d_gg_pid, ntiles = d_gg_nt, pw = d_gg_pw;
+      tiles = d_gg_tiles, x16 = d_gg_x16, hid = d_gg_hid, pairs = d_gg_pairs;
+      max_tiles = k;
+    } else {
+      if (P > maxbatch_cap) throw std::runtime_error("moe_gguf: P exceeds the batch buffers");
+      moe_routing.run(topids, topw, d_tokidx, d_pweight, d_eoff, d_pairids, P, k, E);
+      k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E);
+      tokidx = d_tokidx, pairids = d_pairids, ntiles = d_moentiles, pw = d_pweight;
+      tiles = d_moetiles, x16 = (__half*)d_xbf16b, hid = (__half*)d_hidb, pairs = d_guvb;
+      max_tiles = (P * k + 63) / 64 + E;
+    }
+    const size_t n4 = (size_t)P * d / 4;
+    k_f32_to_f16_v4<<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(x, x16, n4);
+    if (!moe_gg_up(g.tgu, g.gate, g.up, x16, tokidx, tiles, ntiles, max_tiles, hid, mid, d,
+                   g_str) ||
+        !moe_gg_down(g.tdn, g.down, hid, tiles, ntiles, max_tiles, pairs, d, mid, g_str))
+      throw std::runtime_error("moe_gguf: unsupported expert type");
+    k_moe_reduce_pw<10><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(pairs, pairids, pw, acc,
+                                                                     P, d);
+  }
+
   void moe(int l, const float* x, float* y) {
     char buf[128];
     snprintf(buf, sizeof buf, "layers.%d.mlp.gate.weight", l);
@@ -1234,23 +1296,28 @@ struct GpuModel {
       fprintf(stderr, "\n");
     }
 
-    snprintf(buf, sizeof buf, "layers.%d.mlp.experts.gate_up_proj.weight", l);
-    WView gu = wview(ckpt.at(buf));
-    snprintf(buf, sizeof buf, "layers.%d.mlp.experts.down_proj.weight", l);
-    WView dn = wview(ckpt.at(buf));
-    if (!moe_down_direct(k, dn)) CK(hipMemsetAsync(d_moeacc, 0, g_cfg.d * 4, g_str));
-    const int* topids = d_topids;  // 直读:ids 即专家号,免 D2H 同步
-    // fused experts: one grouped launch each for gate_up / silu / down+accum
-    {
-      // v3 kernel: 2 rows per warp -> k * moe_mid warp-pairs
-      uint64_t pairs = (uint64_t)k * g_cfg.moe_mid;
-      k_q4cp_gemv_gg<<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
-          gu.data + 64, gu.data + 64 + gu.rows * gu.cols / 2, (const float*)gu.data, x,
-          d_guv, topids, (uint64_t)2 * g_cfg.moe_mid, gu.cols, gu.scale_stride, k,
-          0 /*x_stride*/, 16 /*id_stride*/, k);
+    if (gg_on()) {
+      moe_gguf(l, x, d_topids, d_topw, d_moeacc, 1);
+    } else {
+      snprintf(buf, sizeof buf, "layers.%d.mlp.experts.gate_up_proj.weight", l);
+      WView gu = wview(ckpt.at(buf));
+      snprintf(buf, sizeof buf, "layers.%d.mlp.experts.down_proj.weight", l);
+      WView dn = wview(ckpt.at(buf));
+      if (!moe_down_direct(k, dn)) CK(hipMemsetAsync(d_moeacc, 0, g_cfg.d * 4, g_str));
+      const int* topids = d_topids;  // 直读:ids 即专家号,免 D2H 同步
+      // fused experts: one grouped launch each for gate_up / silu / down+accum
+      {
+        // v3 kernel: 2 rows per warp -> k * moe_mid warp-pairs
+        uint64_t pairs = (uint64_t)k * g_cfg.moe_mid;
+        k_q4cp_gemv_gg<<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
+            gu.data + 64, gu.data + 64 + gu.rows * gu.cols / 2, (const float*)gu.data, x,
+            d_guv, topids, (uint64_t)2 * g_cfg.moe_mid, gu.cols, gu.scale_stride, k,
+            0 /*x_stride*/, 16 /*id_stride*/, k);
+      }
+      k_silu_mul_g<<<(k * g_cfg.moe_mid + 255) / 256, 256, 0, g_str>>>(d_guv, d_hid,
+                                                                       g_cfg.moe_mid, k);
+      moe_down1(k, dn, topids);
     }
-    k_silu_mul_g<<<(k * g_cfg.moe_mid + 255) / 256, 256, 0, g_str>>>(d_guv, d_hid, g_cfg.moe_mid, k);
-    moe_down1(k, dn, topids);
     // shared expert
     snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
     gemv(wview(ckpt.at(buf)), x, d_guv);
@@ -1436,11 +1503,7 @@ struct GpuModel {
   }
   // enqueue helpers — shared by direct execution and graph capture
   void enq_embed() {
-    WView et = wview(ckpt.at("embed_tokens.weight"));
-    const uint8_t* codes = et.data + 64;
-    const uint8_t* scales = et.data + 64 + et.rows * et.cols / 2;
-    k_q4cp_row<<<1, 128, 0, g_str>>>(codes, scales, (const float*)et.data, d_token,
-                                     et.cols, et.scale_stride, d_emb);
+    embed_rows(wview(ckpt.at("embed_tokens.weight")), d_token, 1, d_emb, 0);
     k_repeat4<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_emb, d_R, g_cfg.d);
     h_rms("gpu", -1, "emb", d_emb, g_cfg.d);
   }
@@ -1516,6 +1579,13 @@ struct GpuModel {
       uint64_t tot = N * K / 64;
       k_dequant_q8g64_bf16<<<(unsigned)((tot + 255) / 256), 256, 0, g_str>>>(
           w.data, d_wbf16, N, K);
+      wp = d_wbf16;
+    } else if (w.dtype == 8) {
+      if (N * K * 2 > ((size_t)64 << 20))
+        throw std::runtime_error("gemm: weight too big for d_wbf16");
+      uint64_t tot = N * K / 32;
+      k_dequant_q8g32_bf16<<<(unsigned)((tot + 255) / 256), 256, 0, g_str>>>(
+          (const int8_t*)w.data, (const __half*)(w.data + N * K), d_wbf16, N, K);
       wp = d_wbf16;
     } else {
       throw std::runtime_error("gemm: unsupported dtype");
@@ -2672,6 +2742,11 @@ struct GpuModel {
     gemm(wview(ckpt.at(buf)), d_xb, d_routerb, P);
     int k = g_cfg.topk;
     k_router_topk<<<P, 512, 0, g_str>>>(d_routerb, d_topidsb, d_topwb, g_cfg.experts, k);
+    if (gg_on()) {
+      moe_gguf(l, d_xb, d_topidsb, d_topwb, acc, P);
+      moe_b_shared(l, P, acc, direct_output);
+      return;
+    }
     snprintf(buf, sizeof buf, "layers.%d.mlp.experts.gate_up_proj.weight", l);
     WView gu = wview(ckpt.at(buf));
     snprintf(buf, sizeof buf, "layers.%d.mlp.experts.down_proj.weight", l);
@@ -3112,6 +3187,12 @@ struct GpuModel {
         }
       }
     }
+    moe_b_shared(l, P, acc, direct_output);
+  }
+
+  // Shared expert of trunk layer l added into acc (routed sum), then acc -> d_yb.
+  void moe_b_shared(int l, int P, float* acc, bool direct_output) {
+    char buf[128];
     // shared expert (gate/up scratch in d_guvb head, silu out in d_hidb head)
     snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
     gemm(wview(ckpt.at(buf)), d_xb, d_guvb, P);
@@ -3448,16 +3529,10 @@ struct GpuModel {
     CK(hipMemcpyAsync(d_tokarr, tokens.data(), P * 4, hipMemcpyHostToDevice, g_str));
     // embed all tokens: gather rows then repeat to 4 branches (in-place safe)
     WView et = wview(ckpt.at("embed_tokens.weight"));
-    const uint8_t* codes = et.data + 64;
-    const uint8_t* scales = et.data + 64 + et.rows * et.cols / 2;
     if (gr_bf16)
-      k_q4cp_row_b_hc_bf16<<<P, 128, 0, g_str>>>(
-          codes, scales, (const float*)et.data, d_tokarr, et.cols,
-          et.scale_stride, (uint16_t*)d_Rb);
+      embed_rows(et, d_tokarr, P, d_Rb, 0, true);
     else {
-      k_q4cp_row_b<<<P, 128, 0, g_str>>>(codes, scales, (const float*)et.data,
-                                         d_tokarr, et.cols, et.scale_stride, d_Rb,
-                                         10240);
+      embed_rows(et, d_tokarr, P, d_Rb, 10240);
       k_repeat4_b<<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(d_Rb, d_Rb, g_cfg.d);
     }
     if (dbg && !gr_bf16)
@@ -3607,11 +3682,7 @@ struct GpuModel {
   // fc_embedding(norm_e(embed(tok))), stream = repeat4(h + e). Norm mode is
   // GDEC_MTP_NORM=full (one 10240 RMSNorm, default) or =branch (4x2560).
   void mtp_input_1(const float* tap) {
-    WView et = wview(ckpt.at("embed_tokens.weight"));
-    k_q4cp_row<<<1, 128, 0, g_str>>>(et.data + 64,
-                                     et.data + 64 + et.rows * et.cols / 2,
-                                     (const float*)et.data, d_mtok, et.cols,
-                                     et.scale_stride, d_emb);
+    embed_rows(wview(ckpt.at("embed_tokens.weight")), d_mtok, 1, d_emb, 0);
     k_rmsnorm_zc_grouped<<<1, 1024, 0, g_str>>>(d_emb, d_mnorm_e, d_me, 2560,
                                                 g_cfg.norm_eps, 1);
     gemv(wview(ckpt.at("mtp.fc_embedding.weight")), d_me, d_meo);
@@ -3796,11 +3867,7 @@ struct GpuModel {
   // Row j takes (tap[j] = trunk h_{base+j}, toks[j] = t_{base+j+1}) at MTP
   // position base+j. No mixer/lm_head: only the layer state (KV) is built.
   void mtp_input_b(const float* taps, int P) {
-    WView et = wview(ckpt.at("embed_tokens.weight"));
-    k_q4cp_row_b<<<P, 128, 0, g_str>>>(et.data + 64,
-                                       et.data + 64 + et.rows * et.cols / 2,
-                                       (const float*)et.data, d_tokarr, et.cols,
-                                       et.scale_stride, d_eb, 2560);
+    embed_rows(wview(ckpt.at("embed_tokens.weight")), d_tokarr, P, d_eb, 2560);
     k_rmsnorm_zc_grouped<<<P, 1024, 0, g_str>>>(d_eb, d_mnorm_e, d_eb, 2560,
                                                 g_cfg.norm_eps, 1);
     gemm(wview(ckpt.at("mtp.fc_embedding.weight")), d_eb, d_qnb, P);

@@ -313,6 +313,129 @@ __global__ void k_q8g64_gemv(const uint8_t* __restrict__ w, const float* __restr
   if (lane == 0) y[row] = acc;
 }
 
+// --- q8g32 planar (GGUF Q8_0 repack, hgn.h dtype 8) --------------------------
+// q: [rows][cols] int8 codes, s: [rows][cols/32] fp16 scales; w = q * s.
+// y[P,N] = x[P,K] . W[N,K]^T, 2 rows per warp, lanes stride over 32-col
+// groups (32 contiguous code bytes = 2 x uint4 per lane), weight read once
+// for all P input rows. P=1 doubles as the plain decode GEMV.
+__device__ inline float q8_b(uint32_t v, int k) {
+  return (float)(int8_t)(uint8_t)(v >> (8 * k));
+}
+template <int P, bool XBF16 = false>
+__global__ void k_q8g32_gemv_mr(const int8_t* __restrict__ q,
+                                const __half* __restrict__ s,
+                                const void* __restrict__ x,
+                                float* __restrict__ y, uint64_t rows,
+                                uint64_t cols, uint64_t xstride) {
+  const uint64_t gpr = cols / 32;
+  uint64_t row0 =
+      (blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize) * 2;
+  if (row0 >= rows) return;
+  int lane = threadIdx.x % warpSize;
+  bool has1 = row0 + 1 < rows;
+  const int8_t* q0 = q + row0 * cols;
+  const int8_t* q1 = q + (has1 ? row0 + 1 : row0) * cols;
+  const __half* s0p = s + row0 * gpr;
+  const __half* s1p = s + (has1 ? row0 + 1 : row0) * gpr;
+  float acc0[P], acc1[P];
+#pragma unroll
+  for (int p = 0; p < P; p++) {
+    acc0[p] = 0.f;
+    acc1[p] = 0.f;
+  }
+  for (uint64_t g = lane; g < gpr; g += warpSize) {
+    const uint4* c0 = (const uint4*)(q0 + g * 32);
+    const uint4* c1 = (const uint4*)(q1 + g * 32);
+    uint4 a0 = c0[0], a1 = c0[1], b0 = c1[0], b1 = c1[1];
+    uint32_t w0[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+    uint32_t w1[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+    float sc0 = __half2float(s0p[g]);
+    float sc1 = has1 ? __half2float(s1p[g]) : 0.f;
+#pragma unroll
+    for (int p = 0; p < P; p++) {
+      float xv[32];
+      if (XBF16) {
+        const uint16_t* xg = (const uint16_t*)x + (size_t)p * xstride + g * 32;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          uint4 t = *(const uint4*)(xg + i * 8);
+          const uint16_t* th = (const uint16_t*)&t;
+#pragma unroll
+          for (int j = 0; j < 8; j++)
+            xv[i * 8 + j] = __bfloat162float(*(__hip_bfloat16*)(&th[j]));
+        }
+      } else {
+        const float* xg = (const float*)x + (size_t)p * xstride + g * 32;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+          float4 t = *(const float4*)(xg + i * 4);
+          xv[i * 4] = t.x;
+          xv[i * 4 + 1] = t.y;
+          xv[i * 4 + 2] = t.z;
+          xv[i * 4 + 3] = t.w;
+        }
+      }
+      float d0 = 0.f, d1 = 0.f;
+#pragma unroll
+      for (int i = 0; i < 8; i++)
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+          d0 += q8_b(w0[i], k) * xv[i * 4 + k];
+          d1 += q8_b(w1[i], k) * xv[i * 4 + k];
+        }
+      acc0[p] += d0 * sc0;
+      acc1[p] += d1 * sc1;
+    }
+  }
+#pragma unroll
+  for (int p = 0; p < P; p++) {
+    for (int off = warpSize / 2; off > 0; off >>= 1) {
+      acc0[p] += __shfl_down_sync(~0ull, acc0[p], off);
+      acc1[p] += __shfl_down_sync(~0ull, acc1[p], off);
+    }
+    if (lane == 0) {
+      y[(size_t)p * rows + row0] = acc0[p];
+      if (has1) y[(size_t)p * rows + row0 + 1] = acc1[p];
+    }
+  }
+}
+
+// --- q8g32 embedding gather: block b dequants row tok[b] into
+// out + b*outstride (fp32), or with HC4 into four bf16 branch copies at
+// out + b*4*cols (same layout as k_q4cp_row_b_hc_bf16). cols/32 threads.
+template <bool HC4>
+__global__ void k_q8g32_row_b(const int8_t* __restrict__ q, const __half* __restrict__ s,
+                              const int* __restrict__ d_tokens, uint64_t cols,
+                              void* __restrict__ out, uint64_t outstride) {
+  uint64_t row = (uint64_t)d_tokens[blockIdx.x];
+  uint64_t g = threadIdx.x;
+  if (g * 32 >= cols) return;
+  const uint4* c = (const uint4*)(q + row * cols + g * 32);
+  uint4 a = c[0], b = c[1];
+  uint32_t w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+  float sc = __half2float(s[row * (cols / 32) + g]);
+#pragma unroll
+  for (int i = 0; i < 8; i++)
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+      uint64_t col = g * 32 + i * 4 + k;
+      float v = q8_b(w[i], k) * sc;
+      if (HC4) {
+        uint32_t u;
+        memcpy(&u, &v, 4);
+        u += 0x7FFF + ((u >> 16) & 1);
+        uint16_t h = (uint16_t)(u >> 16);
+        uint16_t* o = (uint16_t*)out + (size_t)blockIdx.x * 4 * cols;
+        o[col] = h;
+        o[cols + col] = h;
+        o[2 * cols + col] = h;
+        o[3 * cols + col] = h;
+      } else {
+        ((float*)out)[(size_t)blockIdx.x * outstride + col] = v;
+      }
+    }
+}
+
 // --- BF16 GEMV: one warp per row, float4 (8 bf16) loads
 __global__ void k_bf16_gemv(const uint16_t* __restrict__ w, const float* __restrict__ x,
                             float* __restrict__ y, uint64_t rows, uint64_t cols) {

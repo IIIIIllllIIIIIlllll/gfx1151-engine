@@ -255,11 +255,13 @@ int main(int argc, char** argv) {
     for (const auto& o : overlays) ckpt.add_overlay(o.c_str());
     fprintf(stderr, "loaded %zu tensors (base+%zu overlay)\n", ckpt.tensor_count(),
             overlays.size());
+    gguf_dense_apply(ckpt);
     g_cfg.vocab = (int)ckpt.at("lm_head.weight").dims[0];
     memstats_capture_hip_baseline();
     devarena_init(ckpt, maxctx);
     load_arena(ckpt);
     GpuModel m(ckpt, maxctx);
+    gguf_dense_release(ckpt);
     m.ple_on = ple_on;
     m.build_graphs();
     if (!vision_tower.empty()) m.load_vision(vision_tower.c_str());
@@ -277,6 +279,13 @@ int main(int argc, char** argv) {
     // prompts) that produced the cached KV
     kvsnap::g_model_files = overlays;
     kvsnap::g_model_files.insert(kvsnap::g_model_files.begin(), base);
+    if (g_gguf)  // GDEC_GGUF experts: every shard is part of the identity
+      for (const auto& mp : g_gguf->mappings()) kvsnap::g_model_files.push_back(mp.path);
+    if (g_gguf_dense) {  // same files as the G2 hybrid, different weights
+      kvsnap::g_model_files.push_back("@gguf-dense");
+      if (g_gguf_mtp)
+        for (const auto& mp : g_gguf_mtp->mappings()) kvsnap::g_model_files.push_back(mp.path);
+    }
     kvsnap::g_vision_file = vision_tower;
     return serve::run(m, port);
   }
@@ -297,6 +306,7 @@ int main(int argc, char** argv) {
   for (const auto& o : overlays) ckpt.add_overlay(o.c_str());
   fprintf(stderr, "loaded %zu tensors (base+%zu overlay)\n", ckpt.tensor_count(),
           overlays.size());
+  gguf_dense_apply(ckpt);
   g_cfg.vocab = (int)ckpt.at("lm_head.weight").dims[0];
   if (ppl) {
     for (size_t i = 0; i < tokens.size(); i++) {
@@ -312,6 +322,7 @@ int main(int argc, char** argv) {
   load_arena(ckpt);
 
   GpuModel m(ckpt, maxctx);
+  gguf_dense_release(ckpt);
   m.ple_on = ple_on;
   m.build_graphs();
   if (mtp_test > 0 || spec_gen > 0) {

@@ -13,6 +13,11 @@
 //   dtype 10 FP8 E4M3 (n-gram table): [numel uint8 codes][4B fp32 global
 //            scale at the very end];  w = e4m3(code) * scale
 //            (verified 2026-09-08 vs BF16 original rows via range requests)
+// Synthetic dtypes (built in memory from GGUF by gguf_map.h, never on disk):
+//   dtype 1  F32 passthrough (norms, conv, A_log, dt_bias)
+//   dtype 8  q8g32 planar: [rows*cols int8 codes][rows*cols/32 fp16 scales];
+//            w[r,c] = code * scale[r*cols/32 + c/32]  (lossless GGUF Q8_0
+//            repack; every row's codes start 16B-aligned for cols%16==0)
 #pragma once
 
 #include <cmath>
@@ -20,6 +25,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <list>
 #include <stdexcept>
 #include <string>
 #ifndef _WIN32
@@ -92,10 +98,44 @@ inline float fp8e4m3_to_f32(uint8_t v) {
 
 class Checkpoint {
 public:
+  Checkpoint() = default;  // empty; filled via add_synthetic (pure GGUF)
   explicit Checkpoint(const char* path) { map_file(path); }
+  Checkpoint(const Checkpoint&) = delete;
+  Checkpoint& operator=(const Checkpoint&) = delete;
 
   // overlay tensors override base tensors with the same name
   void add_overlay(const char* path) { map_file(path, true); }
+
+  // In-memory tensor (GGUF-derived) owning its bytes; overrides by name like
+  // an overlay. t.data / t.data_size are set from buf.
+  void add_synthetic(Tensor t, std::vector<uint8_t>&& buf) {
+    owned_.push_back(std::move(buf));
+    t.data = owned_.back().data();
+    t.data_size = owned_.back().size();
+    index_[t.name] = t;
+    n_synth_++;
+  }
+  // Borrowed in-memory tensor (e.g. a raw GGUF mmap view); caller keeps it alive.
+  void add_view(const Tensor& t) { index_[t.name] = t; n_synth_++; }
+  // add_synthetic + add_view calls so far (overrides included)
+  size_t synthetic_count() const { return n_synth_; }
+  // Drop the host copy of synthetic tensors after they were uploaded (the
+  // Tensor records stay: dims/dtype/name remain valid, data becomes null).
+  size_t release_owned(bool (*keep)(const Tensor&)) {
+    size_t freed = 0;
+    for (auto& kv : index_) {
+      Tensor& t = kv.second;
+      if (!t.data || keep(t)) continue;
+      for (auto it = owned_.begin(); it != owned_.end(); ++it)
+        if (it->data() == t.data) {
+          freed += it->size();
+          owned_.erase(it);
+          t.data = nullptr;
+          break;
+        }
+    }
+    return freed;
+  }
 
   const Tensor* find(const std::string& name) const {
     auto it = index_.find(name);
@@ -114,6 +154,17 @@ public:
       case 0: {
         const uint16_t* p = (const uint16_t*)t.data;
         for (uint64_t i = 0; i < n; i++) out[i] = bf16_to_f32(p[i]);
+        break;
+      }
+      case 1:
+        memcpy(out, t.data, n * 4);
+        break;
+      case 8: {
+        if (n + n / 32 * 2 != t.data_size)
+          throw std::runtime_error("q8g32 size mismatch on " + t.name);
+        const int8_t* q = (const int8_t*)t.data;
+        const uint16_t* s = (const uint16_t*)(t.data + n);
+        for (uint64_t i = 0; i < n; i++) out[i] = q[i] * fp16_to_f32(s[i / 32]);
         break;
       }
       case 5: {
@@ -208,6 +259,8 @@ public:
 private:
   std::vector<Mapping> maps_;
   std::unordered_map<std::string, Tensor> index_;
+  std::list<std::vector<uint8_t>> owned_;  // synthetic tensor storage (stable addresses)
+  size_t n_synth_ = 0;
 
   void map_file(const char* path, bool is_overlay = false) {
 #ifdef _WIN32

@@ -133,6 +133,8 @@
 #endif
 
 #include "../hgn.h"
+#include "../gguf.h"
+#include "../gguf_map.h"
 
 #include "parts/00_platform.inc"
 #include "parts/05_config.inc"
@@ -144,6 +146,7 @@
 #include "parts/23_kernels_moe_w4.inc"
 #include "parts/24_kernels_moe_lt.inc"
 #include "parts/25_kernels_gdn.inc"
+#include "parts/26_kernels_moe_gguf.inc"
 #include "parts/30_host_util.inc"
 #include "parts/31_vision.inc"
 #include "parts/40_model.inc"

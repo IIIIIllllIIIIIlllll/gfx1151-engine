@@ -253,6 +253,157 @@ static void devarena_init(const Checkpoint& ck, int maxctx) {
 #endif
 }
 
+// --- GGUF routed experts (hgn -> GGUF transition, GDEC_GGUF=<first shard>) --
+// Trunk routed experts come straight from a llama.cpp GGUF (e.g. Unsloth
+// UD-Q4_K_XL: gate/up Q4_K|Q5_K, down Q5_1|Q8_0) and run on the WMMA kernels
+// of 26_kernels_moe_gguf.inc; everything else still comes from hgn. The
+// tensors stay in their mmap'd shards; like the hgn experts they are
+// hipHostRegister'd (mapped) so kernels read the host pointers directly.
+// Adjacent tensors can share a page, and a page may be registered only once,
+// so page-rounded ranges are merged first. The hgn trunk experts are then
+// never registered or touched (their page cache ages out). MTP experts
+// (mtp.layers.0.mlp.experts.*) are not in the main GGUF and stay on hgn.
+struct GgExperts {
+  const uint8_t *gate = nullptr, *up = nullptr, *down = nullptr;
+  int tgu = 0, tdn = 0;  // gguf::Type of gate/up and of down
+};
+static gguf::File* g_gguf = nullptr;
+static std::vector<GgExperts> g_ggx;  // per trunk layer; empty = hgn experts
+static bool gg_on() { return !g_ggx.empty(); }
+static bool is_trunk_experts(const std::string& n) {
+  return n.compare(0, 7, "layers.") == 0 && n.find(".mlp.experts.") != std::string::npos;
+}
+
+static void gguf_experts_open() {
+  const char* path = getenv("GDEC_GGUF");
+  if (!path || !*path || gg_on()) return;
+#ifdef _WIN32
+  throw std::runtime_error("GDEC_GGUF: not supported on Windows yet");
+#else
+  auto t0 = std::chrono::steady_clock::now();
+  if (!g_gguf) g_gguf = new gguf::File(path);  // may be open already (gguf_dense_apply)
+  struct Range { uintptr_t a, b; };
+  std::vector<Range> rs;
+  size_t bytes = 0;
+  int n_q5k = 0, n_q80 = 0;
+  for (int l = 0; l < g_cfg.layers; l++) {
+    char n[96];
+    const gguf::Tensor* t[3];
+    const char* nm[3] = {"gate", "up", "down"};
+    for (int i = 0; i < 3; i++) {
+      snprintf(n, sizeof n, "blk.%d.ffn_%s_exps.weight", l, nm[i]);
+      t[i] = &g_gguf->at(n);
+    }
+    const uint64_t D = g_cfg.d, M = g_cfg.moe_mid, E = g_cfg.experts;
+    if (t[0]->ne[0] != D || t[0]->ne[1] != M || t[0]->ne[2] != E || t[1]->type != t[0]->type ||
+        t[1]->ne[0] != D || t[1]->ne[1] != M || t[1]->ne[2] != E || t[2]->ne[0] != M ||
+        t[2]->ne[1] != D || t[2]->ne[2] != E)
+      throw std::runtime_error("GDEC_GGUF: unexpected expert shapes/types at layer " +
+                               std::to_string(l));
+    if (t[0]->type != gguf::Q4_K && t[0]->type != gguf::Q5_K)
+      throw std::runtime_error(std::string("GDEC_GGUF: gate/up type ") +
+                               gguf::type_name(t[0]->type) + " unsupported");
+    if (t[2]->type != gguf::Q5_1 && t[2]->type != gguf::Q8_0)
+      throw std::runtime_error(std::string("GDEC_GGUF: down type ") +
+                               gguf::type_name(t[2]->type) + " unsupported");
+    n_q5k += t[0]->type == gguf::Q5_K;
+    n_q80 += t[2]->type == gguf::Q8_0;
+    g_ggx.push_back({t[0]->data, t[1]->data, t[2]->data, (int)t[0]->type, (int)t[2]->type});
+    for (auto* x : t) {
+      const uintptr_t a = (uintptr_t)x->data & ~(uintptr_t)4095;
+      const uintptr_t b = ((uintptr_t)x->data + x->nbytes + 4095) & ~(uintptr_t)4095;
+      rs.push_back({a, b});
+      bytes += x->nbytes;
+    }
+  }
+  std::sort(rs.begin(), rs.end(), [](const Range& x, const Range& y) { return x.a < y.a; });
+  std::vector<Range> merged;
+  for (const Range& r : rs) {
+    // only overlapping ranges merge (a shared page => same mapping); merely
+    // touching ranges may belong to different shard mappings
+    if (!merged.empty() && r.a < merged.back().b)
+      merged.back().b = std::max(merged.back().b, r.b);
+    else
+      merged.push_back(r);
+  }
+  for (const Range& r : merged) {
+    hipError_t re = hipHostRegister((void*)r.a, r.b - r.a, hipHostRegisterMapped);
+    if (re != hipSuccess)
+      throw std::runtime_error(std::string("GDEC_GGUF: hipHostRegister: ") +
+                               hipGetErrorString(re));
+  }
+  double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  fprintf(stderr,
+          "gguf experts: %zu layers from %s (%.1f GiB, %zu ranges, %.1f s; "
+          "Q5_K gate/up %d layers, Q8_0 down %d layers)\n",
+          g_ggx.size(), path, bytes / 1073741824.0, merged.size(), s, n_q5k, n_q80);
+#endif
+}
+
+// --- GGUF non-expert weights (G3.1, GDEC_GGUF + GDEC_GGUF_DENSE=1) ----------
+// Dense/norm/router/HC/PLE-projection tensors are rebuilt from the GGUF under
+// their hgn names (src/gguf_map.h: Q8_0 -> dtype 8 q8g32, F32 vectors ->
+// dtype 1) and override the hgn records, so everything downstream (arena,
+// gemv/gemm dispatch, small fp32 uploads) is unchanged. GDEC_GGUF_MTP=<mtp
+// sidecar gguf> also replaces the MTP head's non-expert tensors. Still from
+// hgn: the PLE n-gram table and the MTP routed experts. The synthetic host
+// copies of large tensors are dropped after upload (gguf_dense_release).
+static gguf::File* g_gguf_mtp = nullptr;
+static bool g_gguf_dense = false;
+static void gguf_dense_apply(Checkpoint& ck) {
+  const char* on = getenv("GDEC_GGUF_DENSE");
+  if (!on || !*on || !strcmp(on, "0")) return;
+  const char* path = getenv("GDEC_GGUF");
+  if (!path || !*path) throw std::runtime_error("GDEC_GGUF_DENSE needs GDEC_GGUF=<first shard>");
+#ifdef _WIN32
+  (void)ck;
+  throw std::runtime_error("GDEC_GGUF_DENSE: not supported on Windows yet");
+#else
+  auto t0 = std::chrono::steady_clock::now();
+  if (!g_gguf) g_gguf = new gguf::File(path);
+  const char* mp = getenv("GDEC_GGUF_MTP");
+  if (mp && *mp && !g_gguf_mtp) g_gguf_mtp = new gguf::File(mp);
+  // Debug bisect: GDEC_GGUF_DENSE_FILTER=sub1,sub2,...  only hgn names
+  // containing one of the substrings come from GGUF ("!" prefix = invert).
+  if (const char* f = getenv("GDEC_GGUF_DENSE_FILTER"); f && *f) {
+    bool inv = *f == '!';
+    std::vector<std::string> subs;
+    for (std::string s(f + inv); !s.empty();) {
+      size_t c = s.find(',');
+      if (c) subs.push_back(s.substr(0, c));
+      s = c == std::string::npos ? "" : s.substr(c + 1);
+    }
+    gguf_map::g_keep = [subs, inv](const std::string& nm) {
+      for (auto& s : subs)
+        if (nm.find(s) != std::string::npos) return !inv;
+      return inv;
+    };
+    fprintf(stderr, "gguf dense: filter %s\n", f);
+  }
+  size_t n = gguf_map::build(ck, *g_gguf, g_gguf_mtp);
+  size_t bytes = 0;
+  int n8 = 0;
+  for (auto& kv : ck.tensors())
+    if (kv.second.dtype == 8 || kv.second.dtype == 1) {
+      bytes += kv.second.data_size;
+      n8 += kv.second.dtype == 8;
+    }
+  g_gguf_dense = true;
+  double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  fprintf(stderr,
+          "gguf dense: %zu tensors from GGUF%s (%d q8g32, %.2f GiB synthetic, %.1f s)\n", n,
+          g_gguf_mtp ? " + MTP sidecar" : "", n8, bytes / 1073741824.0, s);
+#endif
+}
+// After GpuModel construction: free host copies of large synthetic tensors
+// (the device arena has them). Small ones stay: ensure_hcnorm/ensure_norm256
+// upload norms lazily from the host record.
+static void gguf_dense_release(Checkpoint& ck) {
+  if (!g_gguf_dense) return;
+  size_t f = ck.release_owned([](const Tensor& t) { return t.data_size < ((size_t)1 << 20); });
+  fprintf(stderr, "gguf dense: released %.2f GiB of host copies\n", f / 1073741824.0);
+}
+
 // --- weight arena: copy trunk tensors (except the 47.7 GiB PLE table and the
 // tiny u64 config arrays) into one big device allocation at startup ----------
 static std::unordered_map<std::string, const uint8_t*> g_devtensor;
@@ -271,10 +422,12 @@ static void load_arena(const Checkpoint& ck) {
   auto is_experts = [](const std::string& n) {
     return n.find(".mlp.experts.") != std::string::npos;
   };
+  gguf_experts_open();
   size_t total = 0, xbytes = 0;
   for (auto& kv : ck.tensors()) {
     const Tensor& t = kv.second;
     if (t.dtype == 10 || t.dtype == 4) continue;  // PLE table / u64 config
+    if (gg_on() && is_trunk_experts(t.name)) continue;  // served from GGUF
 #ifndef _WIN32
     if (is_experts(t.name)) {
       hipError_t re =
@@ -305,6 +458,7 @@ static void load_arena(const Checkpoint& ck) {
   for (auto& kv : ck.tensors()) {
     const Tensor& t = kv.second;
     if (t.dtype == 10 || t.dtype == 4) continue;
+    if (gg_on() && is_trunk_experts(t.name)) continue;
 #ifndef _WIN32
     if (is_experts(t.name)) continue;  // 已在上面登记 host 指针
 #endif
@@ -527,9 +681,40 @@ static void gemv(const WView& w, const float* x, float* y, uint64_t row_off = 0,
   } else if (w.dtype == 0) {
     k_bf16_gemv<<<(unsigned)blocks, threads, 0, g_str>>>(
         (const uint16_t*)w.data + row_off * w.cols, x, y, rows, w.cols);
+  } else if (w.dtype == 8) {
+    const int8_t* q = (const int8_t*)w.data + row_off * w.cols;
+    const __half* s = (const __half*)(w.data + w.rows * w.cols) + row_off * (w.cols / 32);
+    uint64_t wpb = threads / 32;
+    k_q8g32_gemv_mr<1><<<(unsigned)((rows + wpb * 2 - 1) / (wpb * 2)), threads, 0, g_str>>>(
+        q, s, x, y, rows, w.cols, w.cols);
   } else {
     throw std::runtime_error("gemv: unsupported dtype");
   }
+}
+
+// Embedding gather for P tokens (d_tok[0..P)): fp32 rows at out + p*outstride,
+// or (hc4) four bf16 branch copies per token at out + p*4*cols. dtype 5 q4cp
+// (hgn) or 8 q8g32 (GGUF Q8_0).
+static void embed_rows(const WView& et, const int* d_tok, int P, void* out,
+                       uint64_t outstride, bool hc4 = false) {
+  if (et.dtype == 8) {
+    const int8_t* q = (const int8_t*)et.data;
+    const __half* s = (const __half*)(et.data + et.rows * et.cols);
+    if (hc4)
+      k_q8g32_row_b<true><<<P, 128, 0, g_str>>>(q, s, d_tok, et.cols, out, 0);
+    else
+      k_q8g32_row_b<false><<<P, 128, 0, g_str>>>(q, s, d_tok, et.cols, out, outstride);
+    return;
+  }
+  if (et.dtype != 5) throw std::runtime_error("embed: unsupported dtype");
+  const uint8_t* codes = et.data + 64;
+  const uint8_t* scales = et.data + 64 + et.rows * et.cols / 2;
+  if (hc4)
+    k_q4cp_row_b_hc_bf16<<<P, 128, 0, g_str>>>(codes, scales, (const float*)et.data, d_tok,
+                                               et.cols, et.scale_stride, (uint16_t*)out);
+  else
+    k_q4cp_row_b<<<P, 128, 0, g_str>>>(codes, scales, (const float*)et.data, d_tok, et.cols,
+                                       et.scale_stride, (float*)out, outstride);
 }
 
 // Multi-row GEMV dispatch (P in 1..8) for q4cp (dtype 5, fp32/bf16 x), bf16
@@ -576,6 +761,47 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
   case PP:                                                                 \
     k_q8g64_gemv_mr<PP><<<(unsigned)blocks, threads, 0, g_str>>>(          \
         w.data, (const float*)x, y, w.rows, w.cols, xstride);              \
+    break;
+      GDEC_GEMV_MR_CASE(1)
+      GDEC_GEMV_MR_CASE(2)
+      GDEC_GEMV_MR_CASE(3)
+      GDEC_GEMV_MR_CASE(4)
+      GDEC_GEMV_MR_CASE(5)
+      GDEC_GEMV_MR_CASE(6)
+      GDEC_GEMV_MR_CASE(7)
+      GDEC_GEMV_MR_CASE(8)
+#undef GDEC_GEMV_MR_CASE
+      default:
+        return false;
+    }
+    return true;
+  }
+  if (w.dtype == 8 && w.cols % 32 == 0) {
+    const int8_t* q = (const int8_t*)w.data;
+    const __half* s = (const __half*)(w.data + w.rows * w.cols);
+    if (xbf16) switch (P) {
+#define GDEC_GEMV_MR_CASE(PP)                                              \
+  case PP:                                                                 \
+    k_q8g32_gemv_mr<PP, true><<<(unsigned)blocks, threads, 0, g_str>>>(    \
+        q, s, x, y, w.rows, w.cols, xstride);                              \
+    break;
+      GDEC_GEMV_MR_CASE(1)
+      GDEC_GEMV_MR_CASE(2)
+      GDEC_GEMV_MR_CASE(3)
+      GDEC_GEMV_MR_CASE(4)
+      GDEC_GEMV_MR_CASE(5)
+      GDEC_GEMV_MR_CASE(6)
+      GDEC_GEMV_MR_CASE(7)
+      GDEC_GEMV_MR_CASE(8)
+#undef GDEC_GEMV_MR_CASE
+      default:
+        return false;
+    }
+    else switch (P) {
+#define GDEC_GEMV_MR_CASE(PP)                                              \
+  case PP:                                                                 \
+    k_q8g32_gemv_mr<PP, false><<<(unsigned)blocks, threads, 0, g_str>>>(   \
+        q, s, x, y, w.rows, w.cols, xstride);                              \
     break;
       GDEC_GEMV_MR_CASE(1)
       GDEC_GEMV_MR_CASE(2)
