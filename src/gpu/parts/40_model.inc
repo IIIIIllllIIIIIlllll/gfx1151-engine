@@ -232,6 +232,7 @@ struct GpuModel {
   float* d_gg_pw = nullptr;     // [topk]
   int *d_gg_tok = nullptr, *d_gg_pid = nullptr, *d_gg_nt = nullptr;
   MoeTile* d_gg_tiles = nullptr;  // [topk]
+  int* d_gg_uq = nullptr;         // expert-dedup metadata (moegg::kUqInts), 2 <= P <= 8
   // GDN chunked prefill (Phase 3b)
   float* d_convb;    // [maxctx, 10240] post-conv qkv (conv is not in-place)
   float* d_gdn_ws;   // [48, 2, 64, 128] per-head chunk scratch
@@ -472,6 +473,7 @@ struct GpuModel {
       DALLOC(&d_gg_pid, k * 4);
       DALLOC(&d_gg_nt, 4);
       DALLOC(&d_gg_tiles, k * sizeof(MoeTile));
+      DALLOC(&d_gg_uq, moegg::kUqInts * 4);
     }
     DALLOC(&d_sg, 4);
     DALLOC(&d_e, 2560 * 4);
@@ -1251,6 +1253,26 @@ struct GpuModel {
                 int P) {
     const GgExperts& g = g_ggx.at(l);
     const int k = g_cfg.topk, E = g_cfg.experts, d = g_cfg.d, mid = g_cfg.moe_mid;
+    // Small P (decode, spec verify): raw-block GEMVs, FP32 hid, weighted sum in
+    // expert-rank order written straight to acc (26_kernels_moe_gguf.inc).
+    // GDEC_GG_GEMV=<max P> (default 8, 0 = always WMMA).
+    static const int gemv_max = [] {
+      const char* s = getenv("GDEC_GG_GEMV");
+      return s && *s ? atoi(s) : 8;
+    }();
+    // 2 <= P <= 8: experts shared between the P tokens (spec verify) are read
+    // once (bit-identical to the plain path); unweighted pairs go to d_guvb.
+    // GDEC_GG_UQ=0 disables.
+    static const bool uq_on = [] {
+      const char* s = getenv("GDEC_GG_UQ");
+      return !(s && *s == '0');
+    }();
+    const bool uq = uq_on && P >= 2;
+    if (P <= gemv_max && P <= maxbatch_cap &&
+        moe_gg_gemv(g.tgu, g.tdn, g.gate, g.up, g.down, x, topids, topw,
+                    P == 1 ? d_hid : d_hidb, acc, P, d, mid, 16, g_str,
+                    uq ? d_gg_uq : nullptr, uq ? d_guvb : nullptr))
+      return;
     int *tokidx, *pairids, *ntiles;
     float *pw, *pairs;
     MoeTile* tiles;

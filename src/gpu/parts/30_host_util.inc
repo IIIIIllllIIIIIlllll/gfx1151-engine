@@ -678,15 +678,23 @@ static void gemv(const WView& w, const float* x, float* y, uint64_t row_off = 0,
     uint64_t stride = w.cols + w.cols / 64 * 4;
     k_q8g64_gemv<<<(unsigned)blocks, threads, 0, g_str>>>(w.data + row_off * stride, x, y, rows,
                                                 w.cols);
+  } else if (g_gguf_dense && w.dtype == 0 && rows < 64 && w.cols % 8 == 0 && w.cols >= 2048) {
+    // GGUF only: keeps the hgn path bit-exact vs earlier builds (g3_verify 3)
+    k_bf16_gemv_row<<<(unsigned)rows, 256, 0, g_str>>>(
+        (const uint16_t*)w.data + row_off * w.cols, x, y, w.cols);
   } else if (w.dtype == 0) {
     k_bf16_gemv<<<(unsigned)blocks, threads, 0, g_str>>>(
         (const uint16_t*)w.data + row_off * w.cols, x, y, rows, w.cols);
   } else if (w.dtype == 8) {
     const int8_t* q = (const int8_t*)w.data + row_off * w.cols;
     const __half* s = (const __half*)(w.data + w.rows * w.cols) + row_off * (w.cols / 32);
-    uint64_t wpb = threads / 32;
-    k_q8g32_gemv_mr<1><<<(unsigned)((rows + wpb * 2 - 1) / (wpb * 2)), threads, 0, g_str>>>(
-        q, s, x, y, rows, w.cols, w.cols);
+    // tools/q8g32_gemv_bench.cu: full-wave rows in 256-thread blocks beat the
+    // 2-rows-per-wave kernel on every decode shape (2560x6144 141 -> 210 GB/s,
+    // big ones +4-7%); 8 lanes per row for the 320/640-col matrices.
+    if (w.cols < 1024)
+      q8g32_gemv_small<8, 256>(q, s, x, y, rows, w.cols, g_str);
+    else
+      q8g32_gemv_small<32, 256>(q, s, x, y, rows, w.cols, g_str);
   } else {
     throw std::runtime_error("gemv: unsupported dtype");
   }
@@ -733,6 +741,33 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
   int threads = 512;
   uint64_t wpb = threads / 32;
   uint64_t blocks = (w.rows + wpb * 2 - 1) / (wpb * 2);
+  if (g_gguf_dense && w.dtype == 0 && w.rows < 64 && w.cols % 8 == 0 && w.cols >= 2048 &&
+      xstride % 8 == 0) {
+    // few-row bf16 (HC inject 4x10240 with bf16 x in spec verify, in_proj_a/b
+    // 48x2560): one block per row. GGUF only (hgn path unchanged).
+#define GDEC_BROW(PP)                                                          \
+  case PP:                                                                     \
+    if (xbf16)                                                                 \
+      k_bf16_gemv_row_mp<PP, true><<<(unsigned)w.rows, 256, 0, g_str>>>(      \
+          (const uint16_t*)w.data, x, y, w.rows, w.cols, xstride);             \
+    else                                                                       \
+      k_bf16_gemv_row_mp<PP, false><<<(unsigned)w.rows, 256, 0, g_str>>>(     \
+          (const uint16_t*)w.data, x, y, w.rows, w.cols, xstride);             \
+    return true;
+    switch (P) {
+      GDEC_BROW(1)
+      GDEC_BROW(2)
+      GDEC_BROW(3)
+      GDEC_BROW(4)
+      GDEC_BROW(5)
+      GDEC_BROW(6)
+      GDEC_BROW(7)
+      GDEC_BROW(8)
+      default:
+        break;
+    }
+#undef GDEC_BROW
+  }
   if (w.dtype == 0 && !xbf16 && w.cols % 8 == 0) {
     switch (P) {
 #define GDEC_GEMV_MR_CASE(PP)                                              \
@@ -777,44 +812,68 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
     return true;
   }
   if (w.dtype == 8 && w.cols % 32 == 0) {
+    // LPR lanes per row (tools/q8g32_gemv_bench.cu, P=4): short rows (HC up
+    // 320, shexp down 640 cols) want 8 lanes, long rows (out_proj 6144,
+    // HC down 10240) a full wave, the 2560-col majority 16.
     const int8_t* q = (const int8_t*)w.data;
     const __half* s = (const __half*)(w.data + w.rows * w.cols);
-    if (xbf16) switch (P) {
-#define GDEC_GEMV_MR_CASE(PP)                                              \
-  case PP:                                                                 \
-    k_q8g32_gemv_mr<PP, true><<<(unsigned)blocks, threads, 0, g_str>>>(    \
-        q, s, x, y, w.rows, w.cols, xstride);                              \
+    const int lpr = w.cols < 1024 ? 8 : w.cols >= 4096 ? 32 : 16;
+    // bf16 x, few long rows (HC down 320x10240, out_proj 2560x6144 in spec
+    // verify): one 128-thread block per row (bench P=4: 39->23 / 113->93 us).
+    if (xbf16 && w.cols >= 4096 && w.rows <= 4096) {
+      switch (P) {
+#define GDEC_Q8B(PP)                                                           \
+  case PP:                                                                     \
+    k_q8g32_gemv_brow<PP, true, 128><<<(unsigned)w.rows, 128, 0, g_str>>>(    \
+        q, s, x, y, w.rows, w.cols, xstride);                                  \
+    return true;
+        GDEC_Q8B(1)
+        GDEC_Q8B(2)
+        GDEC_Q8B(3)
+        GDEC_Q8B(4)
+        GDEC_Q8B(5)
+        GDEC_Q8B(6)
+        GDEC_Q8B(7)
+        GDEC_Q8B(8)
+#undef GDEC_Q8B
+        default:
+          return false;
+      }
+    }
+#define GDEC_Q8M(PP, XB, L) \
+  q8g32_gemv_multi<PP, XB, L, 256>(q, s, x, y, w.rows, w.cols, xstride, g_str)
+#define GDEC_Q8M_P(PP, XB)                  \
+  case PP:                                  \
+    if (lpr == 8) GDEC_Q8M(PP, XB, 8);      \
+    else if (lpr == 16) GDEC_Q8M(PP, XB, 16); \
+    else GDEC_Q8M(PP, XB, 32);              \
     break;
-      GDEC_GEMV_MR_CASE(1)
-      GDEC_GEMV_MR_CASE(2)
-      GDEC_GEMV_MR_CASE(3)
-      GDEC_GEMV_MR_CASE(4)
-      GDEC_GEMV_MR_CASE(5)
-      GDEC_GEMV_MR_CASE(6)
-      GDEC_GEMV_MR_CASE(7)
-      GDEC_GEMV_MR_CASE(8)
-#undef GDEC_GEMV_MR_CASE
+    if (xbf16) switch (P) {
+      GDEC_Q8M_P(1, true)
+      GDEC_Q8M_P(2, true)
+      GDEC_Q8M_P(3, true)
+      GDEC_Q8M_P(4, true)
+      GDEC_Q8M_P(5, true)
+      GDEC_Q8M_P(6, true)
+      GDEC_Q8M_P(7, true)
+      GDEC_Q8M_P(8, true)
       default:
         return false;
     }
     else switch (P) {
-#define GDEC_GEMV_MR_CASE(PP)                                              \
-  case PP:                                                                 \
-    k_q8g32_gemv_mr<PP, false><<<(unsigned)blocks, threads, 0, g_str>>>(   \
-        q, s, x, y, w.rows, w.cols, xstride);                              \
-    break;
-      GDEC_GEMV_MR_CASE(1)
-      GDEC_GEMV_MR_CASE(2)
-      GDEC_GEMV_MR_CASE(3)
-      GDEC_GEMV_MR_CASE(4)
-      GDEC_GEMV_MR_CASE(5)
-      GDEC_GEMV_MR_CASE(6)
-      GDEC_GEMV_MR_CASE(7)
-      GDEC_GEMV_MR_CASE(8)
-#undef GDEC_GEMV_MR_CASE
+      GDEC_Q8M_P(1, false)
+      GDEC_Q8M_P(2, false)
+      GDEC_Q8M_P(3, false)
+      GDEC_Q8M_P(4, false)
+      GDEC_Q8M_P(5, false)
+      GDEC_Q8M_P(6, false)
+      GDEC_Q8M_P(7, false)
+      GDEC_Q8M_P(8, false)
       default:
         return false;
     }
+#undef GDEC_Q8M_P
+#undef GDEC_Q8M
     return true;
   }
   if (w.dtype != 5) return false;

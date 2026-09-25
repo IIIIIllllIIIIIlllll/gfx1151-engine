@@ -38,16 +38,32 @@ export GDEC_GGUF_MTP=$D/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf          # G3.1�
 | top1 一致 | 86.61% | 87.20% | **93.25%** | |
 | pp 8K @ chunk 2048 | 786 | 1215 | 1160 | |
 | pp 32K @ chunk 16384 | 1242 | 1397 | 1392 | |
-| decode @ 32K（tok/s） | 30.1 | 25.4 | 21.0 | |
-| MTP 投机 commit/round（8K，γ=3） | 3.78 | | 3.71 | |
+| decode @ 32K（tok/s） | 30.1 | 25.4 | 21.0 → 24.8（decode 提速后） | |
+| MTP 投机 commit/round（8K，γ=3） | 3.78 | | 3.71 → 3.82 | |
 
 - 质量提升主要来自非专家张量（hgn 的 dense 是 4-bit q4cp，GGUF 是 Q8_0）。
 - 同一 1024 token 上逐 token decode 与 batched prefill 的 PPL：G3 6.814 / 6.760（0.8%），
   hgn 自身 6.905 / 6.862（0.6%），属于两条计算路径的正常差异。
-- 不设 GGUF 变量时与 HEAD 的 hgn 结果逐位相同。
-- **已知短板：decode。** 两个原因：P=1 时 WMMA 专家 kernel 16 行只用 1 行；
-  Q8_0 dense（含 248320×2560 的 lm_head）每 token 读取字节约为 q4cp 的 2 倍。
-  下一步：专用 GGUF decode GEMV。
+- 不设 GGUF 变量时与改动前提交的 hgn 结果逐位相同（REF 要用同一提交编出的二进制，见 g3_verify.sh 注释）。
+- **decode / 投机提速（2026-09-25 下午）。** 原先两个短板：P=1 时 WMMA 专家 kernel 16 行只用 1 行；
+  Q8_0 dense 每 token 读取字节约为 q4cp 的 2 倍。已做：
+  1. 小 P（≤8，`GDEC_GG_GEMV`）的路由专家走原始块 FP32 GEMV `moe_gg_gemv`（26_kernels_moe_gguf.inc），
+     P=1 每层 158 µs（WMMA 约 225）。
+  2. 2≤P≤8 时做专家去重（`GDEC_GG_UQ=0` 关闭）：投机验证的几个 token 共享的专家只读一次，
+     与不去重的路径逐位相同（`tools/moe_gguf_gemv_test.cu --share 0.5`：MoE 1.07–1.14×；
+     实测投机端到端只有约 +1%，在噪声内，没有共享时开销 <1%）。
+  3. q8g32 dense GEMV：P=1 `k_q8g32_gemv_lpr`；P>1 `k_q8g32_gemv_mlpr`（每组权重解码一次，复用于 P 行），
+     bf16 x 且 cols≥4096 用每行一个 block 的 `k_q8g32_gemv_brow`（HC down 39→23 µs，out_proj 131→93 µs）。
+     基准 `tools/q8g32_gemv_bench.cu`。
+  4. rows<64 的 bf16 矩阵（HC inject）：P=1 `k_bf16_gemv_row`，P>1 `k_bf16_gemv_row_mp`，替代 rocBLAS（66→4 µs）。
+
+  | 512 token prompt，同机 | hgn | G3 原始 | G3 现在 |
+  |---|---|---|---|
+  | decode（tok/s） | 32.3 | 23.0 | 26.2 |
+  | 投机 8K γ=3（tok/s） | 51.5 | 38.0 | 45.7–46.8 |
+
+  剩余差距主要是 Q8_0 dense 的字节数（约为 q4cp 的 2 倍），带宽已接近上限；
+  只有重新量化（牺牲 KLD）才能消除，暂不做。
 
 ## 验证脚本
 
@@ -55,3 +71,5 @@ export GDEC_GGUF_MTP=$D/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf          # G3.1�
 - `tools/g3_verify.sh` — G3.1：KLD、decode/prefill PPL、hgn 路径逐位不变、MTP、速度
 - `tools/g3_smoke.sh [ENV=...]` — 512 token PPL 冒烟（可带过滤器等 env）
 - `tools/moe_gguf_test.cu` — MoE kernel vs CPU 参考
+- `tools/moe_gguf_gemv_test.cu` — 小 P 专家 GEMV（含去重路径逐位对照）vs CPU 参考
+- `tools/q8g32_gemv_bench.cu` — q8g32 dense GEMV 各变体（P=1 与 P=4）

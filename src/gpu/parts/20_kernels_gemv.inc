@@ -463,6 +463,270 @@ __global__ void k_bf16_gemv(const uint16_t* __restrict__ w, const float* __restr
   if (lane == 0) y[row] = acc;
 }
 
+// --- q8g32 P=1 GEMV, LPR lanes per row (32/LPR rows per wave), TPB-thread
+// blocks. For the decode shapes where k_q8g32_gemv_mr<1> (2 rows per wave,
+// 512-thread blocks) runs below bandwidth: few rows (2560 x 6144: only 80
+// blocks on 40 CUs) or short rows (640 cols = 20 groups < 32 lanes).
+template <int LPR>
+__global__ void k_q8g32_gemv_lpr(const int8_t* __restrict__ q, const __half* __restrict__ s,
+                                 const float* __restrict__ x, float* __restrict__ y,
+                                 uint64_t rows, uint64_t cols) {
+  constexpr int RPW = 32 / LPR;
+  const uint64_t gpr = cols / 32;
+  const int lane = threadIdx.x % warpSize, ll = lane % LPR;
+  const uint64_t row =
+      (blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize) * RPW + lane / LPR;
+  const bool live = row < rows;
+  const int8_t* qr = q + (live ? row : 0) * cols;
+  const __half* sr = s + (live ? row : 0) * gpr;
+  float acc = 0.f;
+#pragma unroll 2
+  for (uint64_t g = ll; g < gpr; g += LPR) {
+    const uint4* c = (const uint4*)(qr + g * 32);
+    const uint4 a0 = c[0], a1 = c[1];
+    const uint32_t w[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+    const float* xg = x + g * 32;
+    float d = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const float4 t = *(const float4*)(xg + i * 4);
+      d += q8_b(w[i], 0) * t.x + q8_b(w[i], 1) * t.y + q8_b(w[i], 2) * t.z + q8_b(w[i], 3) * t.w;
+    }
+    acc += __half2float(sr[g]) * d;
+  }
+#pragma unroll
+  for (int off = LPR / 2; off > 0; off >>= 1) acc += __shfl_down_sync(~0ull, acc, off, LPR);
+  if (ll == 0 && live) y[row] = acc;
+}
+template <int LPR, int TPB>
+static void q8g32_gemv_small(const int8_t* q, const __half* s, const float* x, float* y,
+                             uint64_t rows, uint64_t cols, hipStream_t st) {
+  constexpr uint64_t rpb = (TPB / 32) * (32 / LPR);
+  k_q8g32_gemv_lpr<LPR><<<(unsigned)((rows + rpb - 1) / rpb), TPB, 0, st>>>(q, s, x, y, rows, cols);
+}
+
+// --- q8g32 multi-row (P input rows, spec verify / small batches) with LPR
+// lanes per weight row: same layout as k_q8g32_gemv_lpr, codes decoded to
+// float once per 32-col group and reused for all P x rows (weight read once).
+// x: P rows of stride xstride, fp32 or bf16 (XBF16). y[p*rows + r].
+template <int P, bool XBF16, int LPR>
+__global__ void k_q8g32_gemv_mlpr(const int8_t* __restrict__ q, const __half* __restrict__ s,
+                                  const void* __restrict__ x, float* __restrict__ y,
+                                  uint64_t rows, uint64_t cols, uint64_t xstride) {
+  constexpr int RPW = 32 / LPR;
+  const uint64_t gpr = cols / 32;
+  const int lane = threadIdx.x % warpSize, ll = lane % LPR;
+  const uint64_t row =
+      (blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize) * RPW + lane / LPR;
+  const bool live = row < rows;
+  const int8_t* qr = q + (live ? row : 0) * cols;
+  const __half* sr = s + (live ? row : 0) * gpr;
+  float acc[P];
+#pragma unroll
+  for (int p = 0; p < P; p++) acc[p] = 0.f;
+  for (uint64_t g = ll; g < gpr; g += LPR) {
+    const uint4* c = (const uint4*)(qr + g * 32);
+    const uint4 a0 = c[0], a1 = c[1];
+    const uint32_t w[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+    const float sc = __half2float(sr[g]);
+    float wf[32];
+#pragma unroll
+    for (int i = 0; i < 8; i++)
+#pragma unroll
+      for (int k = 0; k < 4; k++) wf[i * 4 + k] = q8_b(w[i], k);
+#pragma unroll
+    for (int p = 0; p < P; p++) {
+      float d = 0.f;
+      if (XBF16) {
+        const uint16_t* xg = (const uint16_t*)x + (size_t)p * xstride + g * 32;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          const uint4 t = *(const uint4*)(xg + i * 8);
+          const uint32_t tv[4] = {t.x, t.y, t.z, t.w};
+#pragma unroll
+          for (int j = 0; j < 4; j++) {
+            d += wf[i * 8 + 2 * j] * __uint_as_float(tv[j] << 16);
+            d += wf[i * 8 + 2 * j + 1] * __uint_as_float(tv[j] & 0xFFFF0000u);
+          }
+        }
+      } else {
+        const float* xg = (const float*)x + (size_t)p * xstride + g * 32;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+          const float4 t = *(const float4*)(xg + i * 4);
+          d += wf[i * 4] * t.x + wf[i * 4 + 1] * t.y + wf[i * 4 + 2] * t.z + wf[i * 4 + 3] * t.w;
+        }
+      }
+      acc[p] += sc * d;
+    }
+  }
+#pragma unroll
+  for (int p = 0; p < P; p++) {
+#pragma unroll
+    for (int off = LPR / 2; off > 0; off >>= 1) acc[p] += __shfl_down_sync(~0ull, acc[p], off, LPR);
+    if (ll == 0 && live) y[(size_t)p * rows + row] = acc[p];
+  }
+}
+// Few long rows (HC down 320 x 10240): one TPB-thread block per row, block
+// reduce, so 320 rows still fill the GPU (the wave-per-row kernel gets only
+// 320 waves on 40 CUs and stays latency-bound).
+template <int P, bool XBF16, int TPB>
+__launch_bounds__(TPB) __global__
+void k_q8g32_gemv_brow(const int8_t* __restrict__ q, const __half* __restrict__ s,
+                       const void* __restrict__ x, float* __restrict__ y, uint64_t rows,
+                       uint64_t cols, uint64_t xstride) {
+  const uint64_t gpr = cols / 32, row = blockIdx.x;
+  const int8_t* qr = q + row * cols;
+  const __half* sr = s + row * gpr;
+  float acc[P];
+#pragma unroll
+  for (int p = 0; p < P; p++) acc[p] = 0.f;
+  for (uint64_t g = threadIdx.x; g < gpr; g += TPB) {
+    const uint4* c = (const uint4*)(qr + g * 32);
+    const uint4 a0 = c[0], a1 = c[1];
+    const uint32_t w[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+    const float sc = __half2float(sr[g]);
+    float wf[32];
+#pragma unroll
+    for (int i = 0; i < 8; i++)
+#pragma unroll
+      for (int k = 0; k < 4; k++) wf[i * 4 + k] = q8_b(w[i], k);
+#pragma unroll
+    for (int p = 0; p < P; p++) {
+      float d = 0.f;
+      if (XBF16) {
+        const uint16_t* xg = (const uint16_t*)x + (size_t)p * xstride + g * 32;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          const uint4 t = *(const uint4*)(xg + i * 8);
+          const uint32_t tv[4] = {t.x, t.y, t.z, t.w};
+#pragma unroll
+          for (int j = 0; j < 4; j++) {
+            d += wf[i * 8 + 2 * j] * __uint_as_float(tv[j] << 16);
+            d += wf[i * 8 + 2 * j + 1] * __uint_as_float(tv[j] & 0xFFFF0000u);
+          }
+        }
+      } else {
+        const float* xg = (const float*)x + (size_t)p * xstride + g * 32;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+          const float4 t = *(const float4*)(xg + i * 4);
+          d += wf[i * 4] * t.x + wf[i * 4 + 1] * t.y + wf[i * 4 + 2] * t.z + wf[i * 4 + 3] * t.w;
+        }
+      }
+      acc[p] += sc * d;
+    }
+  }
+  __shared__ float red[P][TPB / 32];
+  const int lane = threadIdx.x % warpSize, wid = threadIdx.x / warpSize;
+#pragma unroll
+  for (int p = 0; p < P; p++) {
+    for (int off = warpSize / 2; off > 0; off >>= 1) acc[p] += __shfl_down_sync(~0ull, acc[p], off);
+    if (lane == 0) red[p][wid] = acc[p];
+  }
+  __syncthreads();
+  if (threadIdx.x < P) {
+    float t = 0.f;
+    for (int i = 0; i < TPB / 32; i++) t += red[threadIdx.x][i];
+    y[(size_t)threadIdx.x * rows + row] = t;
+  }
+}
+template <int P, bool XBF16, int LPR, int TPB>
+static void q8g32_gemv_multi(const int8_t* q, const __half* s, const void* x, float* y,
+                             uint64_t rows, uint64_t cols, uint64_t xstride, hipStream_t st) {
+  constexpr uint64_t rpb = (TPB / 32) * (32 / LPR);
+  k_q8g32_gemv_mlpr<P, XBF16, LPR><<<(unsigned)((rows + rpb - 1) / rpb), TPB, 0, st>>>(
+      q, s, x, y, rows, cols, xstride);
+}
+
+// --- BF16 GEMV for few-row matrices (rows < 64: HC inject 4x10240, shared-
+// expert gate 1x2560, GDN in_proj_a/b 48x2560 from GGUF): one 256-thread
+// block per row + block reduce. The warp-per-row kernel above leaves those
+// launches latency-bound (4 waves each walking 40 sequential steps, ~10 us).
+__launch_bounds__(256) __global__
+void k_bf16_gemv_row(const uint16_t* __restrict__ w, const float* __restrict__ x,
+                     float* __restrict__ y, uint64_t cols) {
+  const uint16_t* rw = w + (uint64_t)blockIdx.x * cols;
+  float acc = 0.f;
+  for (uint64_t c = threadIdx.x * 8; c < cols; c += 256 * 8) {
+    uint4 pk = *(const uint4*)(rw + c);
+    float4 xa = *(const float4*)(x + c);
+    float4 xb = *(const float4*)(x + c + 4);
+    const uint32_t pw[4] = {pk.x, pk.y, pk.z, pk.w};
+    const float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      acc += __uint_as_float(pw[j] << 16) * xv[2 * j];
+      acc += __uint_as_float(pw[j] & 0xFFFF0000u) * xv[2 * j + 1];
+    }
+  }
+  for (int off = warpSize / 2; off > 0; off >>= 1) acc += __shfl_down_sync(~0ull, acc, off);
+  __shared__ float red[256 / 32];
+  const int lane = threadIdx.x % warpSize, wid = threadIdx.x / warpSize;
+  if (lane == 0) red[wid] = acc;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float t = 0.f;
+    for (int i = 0; i < (int)(blockDim.x / warpSize); i++) t += red[i];
+    y[blockIdx.x] = t;
+  }
+}
+// Multi-row (P input rows, stride xstride, fp32 or bf16) version: the spec
+// verify HC inject (4 x 10240, bf16 x) otherwise falls to the rocBLAS LT
+// path (~66 us per call on a 128-workgroup tile). y[p*rows + blockIdx.x].
+template <int P, bool XBF16>
+__launch_bounds__(256) __global__
+void k_bf16_gemv_row_mp(const uint16_t* __restrict__ w, const void* __restrict__ x,
+                        float* __restrict__ y, uint64_t rows, uint64_t cols, uint64_t xstride) {
+  const uint16_t* rw = w + (uint64_t)blockIdx.x * cols;
+  float acc[P];
+#pragma unroll
+  for (int p = 0; p < P; p++) acc[p] = 0.f;
+  for (uint64_t c = threadIdx.x * 8; c < cols; c += 256 * 8) {
+    const uint4 pk = *(const uint4*)(rw + c);
+    const uint32_t pw[4] = {pk.x, pk.y, pk.z, pk.w};
+    float wv[8];
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      wv[2 * j] = __uint_as_float(pw[j] << 16);
+      wv[2 * j + 1] = __uint_as_float(pw[j] & 0xFFFF0000u);
+    }
+#pragma unroll
+    for (int p = 0; p < P; p++) {
+      float xv[8];
+      if (XBF16) {
+        const uint4 t = *(const uint4*)((const uint16_t*)x + (uint64_t)p * xstride + c);
+        const uint32_t tv[4] = {t.x, t.y, t.z, t.w};
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          xv[2 * j] = __uint_as_float(tv[j] << 16);
+          xv[2 * j + 1] = __uint_as_float(tv[j] & 0xFFFF0000u);
+        }
+      } else {
+        const float* xp = (const float*)x + (uint64_t)p * xstride + c;
+        const float4 xa = *(const float4*)xp, xb = *(const float4*)(xp + 4);
+        xv[0] = xa.x; xv[1] = xa.y; xv[2] = xa.z; xv[3] = xa.w;
+        xv[4] = xb.x; xv[5] = xb.y; xv[6] = xb.z; xv[7] = xb.w;
+      }
+#pragma unroll
+      for (int j = 0; j < 8; j++) acc[p] += wv[j] * xv[j];
+    }
+  }
+  __shared__ float red[P][256 / 32];
+  const int lane = threadIdx.x % warpSize, wid = threadIdx.x / warpSize;
+#pragma unroll
+  for (int p = 0; p < P; p++) {
+    for (int off = warpSize / 2; off > 0; off >>= 1) acc[p] += __shfl_down_sync(~0ull, acc[p], off);
+    if (lane == 0) red[p][wid] = acc[p];
+  }
+  __syncthreads();
+  if (threadIdx.x < P) {
+    float t = 0.f;
+    for (int i = 0; i < (int)(blockDim.x / warpSize); i++) t += red[threadIdx.x][i];
+    y[(uint64_t)threadIdx.x * rows + blockIdx.x] = t;
+  }
+}
+
 // --- Q4C-P single-row dequant (embedding gather): out[cols]
 __global__ void k_q4cp_row(const uint8_t* __restrict__ codes,
                            const uint8_t* __restrict__ scales,

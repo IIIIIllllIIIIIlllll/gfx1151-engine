@@ -442,3 +442,452 @@ static bool moe_gg_down(int type, const uint8_t* dn, const __half* hid, const Mo
     return false;
   return true;
 }
+
+// --- GGUF routed experts, small-P GEMV path (decode / spec verify) ----------
+//
+// The WMMA kernels above compute 16 rows per slot tile; at P = 1 they waste
+// 15/16 of the matrix work and run ~40% below the hgn q4cp decode GEMVs.
+// These kernels read the raw llama.cpp blocks with scalar FP32 math (FP32
+// activations, no F16 rounding), one "unit" per lane step:
+//   Q4_K / Q5_K: 64 elements = sub-block pair j of a 256 super-block
+//                (low nibbles -> sub-block 2j, high nibbles -> 2j+1),
+//   Q5_1 / Q8_0: one 32-element block.
+// gate/up: one wave per (token, slot, row m); lanes 0-15 walk the gate row,
+//   lanes 16-31 the up row; hid[tok*kpt+s][m] = up * silu(gate) (FP32).
+// down: LPR lanes per output row, all KPT expert partials kept in registers
+//   and summed in expert-rank order with the routing weights -> out[tok][r]
+//   overwritten (deterministic, no atomics, no memset), like
+//   k_q4cp_gemv_gd_topk_h16.
+
+namespace moegg {
+
+__device__ __forceinline__ uint32_t byte_of(const uint32_t* w, int i) {
+  return (w[i >> 2] >> (8 * (i & 3))) & 0xFFu;
+}
+// ggml get_scale_min_k4 on the 12 packed scale bytes (as 3 words)
+__device__ __forceinline__ void scale_min_k4(int j, const uint32_t* q, float& s, float& m) {
+  if (j < 4) {
+    s = (float)(byte_of(q, j) & 63);
+    m = (float)(byte_of(q, j + 4) & 63);
+  } else {
+    s = (float)((byte_of(q, j + 4) & 0xF) | ((byte_of(q, j - 4) >> 6) << 4));
+    m = (float)((byte_of(q, j + 4) >> 4) | ((byte_of(q, j) >> 6) << 4));
+  }
+}
+
+template <int T>
+__host__ __device__ constexpr int unit_elems() {
+  return (T == kQ4K || T == kQ5K) ? 64 : 32;
+}
+
+// One weight "unit" of a raw GGUF row, loaded once (load) and dotted with
+// any number of activation vectors (dot) — the expert-dedup kernels reuse one
+// load for every token routed to the same expert. unit_dot = load + dot.
+template <int T> struct UnitW;
+template <> struct UnitW<kQ4K> {
+  float d, dmin, s0, m0, s1, m1;
+  uint32_t qw[8];
+  int off;  // element offset of the unit in the row
+  __device__ __forceinline__ void load(const uint8_t* __restrict__ row, int u) {
+    const int sb = u >> 2, j = u & 3;
+    const uint8_t* blk = row + (size_t)sb * 144;
+    const uint32_t dd = *(const uint32_t*)blk;
+    d = __half2float(__ushort_as_half((unsigned short)(dd & 0xFFFF)));
+    dmin = __half2float(__ushort_as_half((unsigned short)(dd >> 16)));
+    uint32_t sc[3];
+    sc[0] = *(const uint32_t*)(blk + 4);
+    sc[1] = *(const uint32_t*)(blk + 8);
+    sc[2] = *(const uint32_t*)(blk + 12);
+    scale_min_k4(2 * j, sc, s0, m0);
+    scale_min_k4(2 * j + 1, sc, s1, m1);
+    const uint4* qp = (const uint4*)(blk + 16 + 32 * j);
+    const uint4 qa = qp[0], qb = qp[1];
+    qw[0] = qa.x; qw[1] = qa.y; qw[2] = qa.z; qw[3] = qa.w;
+    qw[4] = qb.x; qw[5] = qb.y; qw[6] = qb.z; qw[7] = qb.w;
+    off = sb * 256 + 64 * j;
+  }
+  __device__ __forceinline__ float dot(const float* __restrict__ x) const {
+    const float* x0 = x + off;
+    float dl = 0.f, dh = 0.f, sl = 0.f, sh = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const float4 xl = *(const float4*)(x0 + 4 * i);
+      const float4 xh = *(const float4*)(x0 + 32 + 4 * i);
+      const float xlv[4] = {xl.x, xl.y, xl.z, xl.w}, xhv[4] = {xh.x, xh.y, xh.z, xh.w};
+#pragma unroll
+      for (int b = 0; b < 4; b++) {
+        const uint32_t q = (qw[i] >> (8 * b)) & 0xFFu;
+        dl += (float)(q & 0xF) * xlv[b];
+        dh += (float)(q >> 4) * xhv[b];
+        sl += xlv[b];
+        sh += xhv[b];
+      }
+    }
+    return d * (s0 * dl + s1 * dh) - dmin * (m0 * sl + m1 * sh);
+  }
+};
+template <> struct UnitW<kQ5K> {
+  float d, dmin, s0, m0, s1, m1;
+  uint32_t qw[8], hw[8];
+  int off, j;
+  __device__ __forceinline__ void load(const uint8_t* __restrict__ row, int u) {
+    const int sb = u >> 2;
+    j = u & 3;
+    const uint8_t* blk = row + (size_t)sb * 176;
+    const uint32_t dd = *(const uint32_t*)blk;
+    d = __half2float(__ushort_as_half((unsigned short)(dd & 0xFFFF)));
+    dmin = __half2float(__ushort_as_half((unsigned short)(dd >> 16)));
+    uint32_t sc[3];
+    sc[0] = *(const uint32_t*)(blk + 4);
+    sc[1] = *(const uint32_t*)(blk + 8);
+    sc[2] = *(const uint32_t*)(blk + 12);
+    scale_min_k4(2 * j, sc, s0, m0);
+    scale_min_k4(2 * j + 1, sc, s1, m1);
+    const uint4* qp = (const uint4*)(blk + 48 + 32 * j);
+    const uint4 qa = qp[0], qb = qp[1];
+    qw[0] = qa.x; qw[1] = qa.y; qw[2] = qa.z; qw[3] = qa.w;
+    qw[4] = qb.x; qw[5] = qb.y; qw[6] = qb.z; qw[7] = qb.w;
+    const uint4* hp = (const uint4*)(blk + 16);
+    const uint4 ha = hp[0], hb = hp[1];
+    hw[0] = ha.x; hw[1] = ha.y; hw[2] = ha.z; hw[3] = ha.w;
+    hw[4] = hb.x; hw[5] = hb.y; hw[6] = hb.z; hw[7] = hb.w;
+    off = sb * 256 + 64 * j;
+  }
+  __device__ __forceinline__ float dot(const float* __restrict__ x) const {
+    const float* x0 = x + off;
+    float dl = 0.f, dh = 0.f, sl = 0.f, sh = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const float4 xl = *(const float4*)(x0 + 4 * i);
+      const float4 xh = *(const float4*)(x0 + 32 + 4 * i);
+      const float xlv[4] = {xl.x, xl.y, xl.z, xl.w}, xhv[4] = {xh.x, xh.y, xh.z, xh.w};
+#pragma unroll
+      for (int b = 0; b < 4; b++) {
+        const uint32_t q = (qw[i] >> (8 * b)) & 0xFFu;
+        const uint32_t h = (hw[i] >> (8 * b)) & 0xFFu;
+        const uint32_t lo = (q & 0xF) | (((h >> (2 * j)) & 1u) << 4);
+        const uint32_t hi = (q >> 4) | (((h >> (2 * j + 1)) & 1u) << 4);
+        dl += (float)lo * xlv[b];
+        dh += (float)hi * xhv[b];
+        sl += xlv[b];
+        sh += xhv[b];
+      }
+    }
+    return d * (s0 * dl + s1 * dh) - dmin * (m0 * sl + m1 * sh);
+  }
+};
+template <> struct UnitW<kQ51> {
+  float d, mn;
+  uint32_t qh, qw[4];
+  int off;
+  __device__ __forceinline__ void load(const uint8_t* __restrict__ row, int u) {
+    const uint8_t* blk = row + (size_t)u * 24;
+    const uint32_t dm = *(const uint32_t*)blk;
+    d = __half2float(__ushort_as_half((unsigned short)(dm & 0xFFFF)));
+    mn = __half2float(__ushort_as_half((unsigned short)(dm >> 16)));
+    qh = *(const uint32_t*)(blk + 4);
+    const uint2 qa = *(const uint2*)(blk + 8), qb = *(const uint2*)(blk + 16);
+    qw[0] = qa.x; qw[1] = qa.y; qw[2] = qb.x; qw[3] = qb.y;
+    off = u * 32;
+  }
+  __device__ __forceinline__ float dot(const float* __restrict__ x) const {
+    const float* x0 = x + off;
+    float dq = 0.f, sx = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      const float4 xl = *(const float4*)(x0 + 4 * i);
+      const float4 xh = *(const float4*)(x0 + 16 + 4 * i);
+      const float xlv[4] = {xl.x, xl.y, xl.z, xl.w}, xhv[4] = {xh.x, xh.y, xh.z, xh.w};
+#pragma unroll
+      for (int b = 0; b < 4; b++) {
+        const int e = 4 * i + b;
+        const uint32_t q = (qw[i] >> (8 * b)) & 0xFFu;
+        const uint32_t lo = (q & 0xF) | (((qh >> e) & 1u) << 4);
+        const uint32_t hi = (q >> 4) | (((qh >> (e + 16)) & 1u) << 4);
+        dq += (float)lo * xlv[b] + (float)hi * xhv[b];
+        sx += xlv[b] + xhv[b];
+      }
+    }
+    return d * dq + mn * sx;
+  }
+};
+template <> struct UnitW<kQ80> {  // 34-byte blocks are only 2-byte aligned
+  float d;
+  uint32_t w[8];
+  int off;
+  __device__ __forceinline__ void load(const uint8_t* __restrict__ row, int u) {
+    const uint16_t* blk = (const uint16_t*)(row + (size_t)u * 34);
+    d = __half2float(__ushort_as_half(blk[0]));
+#pragma unroll
+    for (int i = 0; i < 8; i++) w[i] = (uint32_t)blk[1 + 2 * i] | ((uint32_t)blk[2 + 2 * i] << 16);
+    off = u * 32;
+  }
+  __device__ __forceinline__ float dot(const float* __restrict__ x) const {
+    const float* x0 = x + off;
+    float dq = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const float4 xv = *(const float4*)(x0 + 4 * i);
+      dq += (float)(int8_t)(w[i] & 0xFF) * xv.x + (float)(int8_t)((w[i] >> 8) & 0xFF) * xv.y +
+            (float)(int8_t)((w[i] >> 16) & 0xFF) * xv.z + (float)(int8_t)(w[i] >> 24) * xv.w;
+    }
+    return d * dq;
+  }
+};
+
+// dot(row unit u, x[unit u elements]) for one weight row in raw GGUF layout
+template <int T>
+__device__ __forceinline__ float unit_dot(const uint8_t* __restrict__ row, int u,
+                                          const float* __restrict__ x) {
+  UnitW<T> w;
+  w.load(row, u);
+  return w.dot(x);
+}
+
+}  // namespace moegg
+
+// x F32 [P][k]; ids/topw rows id_stride wide; hid F32 [P*kpt][m].
+template <int T>
+__launch_bounds__(256) __global__
+void k_moe_gg_gemv_gu(const uint8_t* __restrict__ wg, const uint8_t* __restrict__ wu,
+                      const float* __restrict__ x, const int* __restrict__ ids,
+                      float* __restrict__ hid, int m, int k, int kpt, int id_stride, int P) {
+  const int gw = (int)((blockIdx.x * blockDim.x + threadIdx.x) / warpSize);
+  if (gw >= P * kpt * m) return;
+  const int lane = threadIdx.x % warpSize, half = lane >> 4, l16 = lane & 15;
+  const int r = gw % m, slot = gw / m, tok = slot / kpt, s = slot - tok * kpt;
+  const int e = ids[tok * id_stride + s];
+  const size_t rb = moegg::row_bytes<T>((size_t)k);
+  const uint8_t* w = (half ? wu : wg) + ((size_t)e * m + r) * rb;
+  const float* xt = x + (size_t)tok * k;
+  const int nu = k / moegg::unit_elems<T>();
+  float acc = 0.f;
+  for (int u = l16; u < nu; u += 16) acc += moegg::unit_dot<T>(w, u, xt);
+#pragma unroll
+  for (int off = 8; off > 0; off >>= 1) acc += __shfl_down_sync(~0ull, acc, off, 16);
+  const float up = __shfl_sync(~0ull, acc, 16);
+  if (lane == 0) hid[(size_t)slot * m + r] = up * acc * moegg::sigmoidf_(acc);
+}
+
+template <int T, int LPR, int KPT>
+__launch_bounds__(256) __global__
+void k_moe_gg_gemv_dn(const uint8_t* __restrict__ wd, const float* __restrict__ hid,
+                      const int* __restrict__ ids, const float* __restrict__ ws,
+                      float* __restrict__ out, int m, int k, int id_stride, int P) {
+  constexpr int RPW = 32 / LPR;  // rows per wave (wave32)
+  const int gw = (int)((blockIdx.x * blockDim.x + threadIdx.x) / warpSize);
+  const int rpt = (m + RPW - 1) / RPW;  // row groups per token
+  if (gw >= P * rpt) return;
+  const int lane = threadIdx.x % warpSize, sub = lane / LPR, ll = lane % LPR;
+  const int tok = gw / rpt, r = (gw % rpt) * RPW + sub;
+  const bool live = r < m;
+  const size_t rb = moegg::row_bytes<T>((size_t)k);
+  const int nu = k / moegg::unit_elems<T>();
+  float acc[KPT];
+#pragma unroll
+  for (int s = 0; s < KPT; s++) {
+    acc[s] = 0.f;
+    const int e = ids[tok * id_stride + s];
+    const uint8_t* w = wd + ((size_t)e * m + (live ? r : 0)) * rb;
+    const float* xs = hid + ((size_t)tok * KPT + s) * k;
+    for (int u = ll; u < nu; u += LPR) acc[s] += moegg::unit_dot<T>(w, u, xs);
+  }
+#pragma unroll
+  for (int s = 0; s < KPT; s++)
+#pragma unroll
+    for (int off = LPR / 2; off > 0; off >>= 1)
+      acc[s] += __shfl_down_sync(~0ull, acc[s], off, LPR);
+  if (ll == 0 && live) {
+    float y = 0.f;
+#pragma unroll
+    for (int s = 0; s < KPT; s++) y += ws[tok * id_stride + s] * acc[s];
+    out[(size_t)tok * m + r] = y;
+  }
+}
+
+// --- Expert dedup for 2 <= P <= 8 (spec verify): tokens of one step share
+// many experts; read each unique expert once for all its (token, slot) pairs.
+// meta (ints): [0] unique count U; [1+u] expert; [1+NM+u] member count;
+// [1+2NM+8u+j] member j = tok*kpt+s (ascending). NM = 8*kpt max.
+namespace moegg {
+constexpr int kUqMaxP = 8, kUqNM = kUqMaxP * 10;
+constexpr int kUqInts = 1 + 2 * kUqNM + kUqMaxP * kUqNM;
+}  // namespace moegg
+__launch_bounds__(128) __global__
+void k_moe_gg_uniq(const int* __restrict__ ids, int* __restrict__ meta, int P, int kpt,
+                   int id_stride) {
+  constexpr int NM = moegg::kUqNM;
+  __shared__ int e[NM], lead[NM];
+  const int n = P * kpt;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) e[i] = ids[(i / kpt) * id_stride + i % kpt];
+  __syncthreads();
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    int l = 1;
+    for (int j = 0; j < i; j++)
+      if (e[j] == e[i]) { l = 0; break; }
+    lead[i] = l;
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    if (!lead[i]) continue;
+    int u = 0;
+    for (int j = 0; j < i; j++) u += lead[j];
+    meta[1 + u] = e[i];
+    int c = 0;
+    for (int j = i; j < n; j++)
+      if (e[j] == e[i]) meta[1 + 2 * NM + moegg::kUqMaxP * u + c++] = j;
+    meta[1 + NM + u] = c;
+  }
+  if (threadIdx.x == 0) {
+    int U = 0;
+    for (int i = 0; i < n; i++) U += lead[i];
+    meta[0] = U;
+  }
+}
+
+// gate/up: one wave per (unique expert u, row r); hid[member][r] as in
+// k_moe_gg_gemv_gu (same per-lane unit order -> same values).
+template <int T>
+__launch_bounds__(256) __global__
+void k_moe_gg_gemv_gu_uq(const uint8_t* __restrict__ wg, const uint8_t* __restrict__ wu,
+                         const float* __restrict__ x, const int* __restrict__ meta,
+                         float* __restrict__ hid, int m, int k, int kpt) {
+  constexpr int NM = moegg::kUqNM, MP = moegg::kUqMaxP;
+  const int gw = (int)((blockIdx.x * blockDim.x + threadIdx.x) / warpSize);
+  const int u = gw / m, r = gw - u * m;
+  if (u >= meta[0]) return;
+  const int e = meta[1 + u], cnt = meta[1 + NM + u];
+  const int* mem = meta + 1 + 2 * NM + MP * u;
+  const int lane = threadIdx.x % warpSize, half = lane >> 4, l16 = lane & 15;
+  const size_t rb = moegg::row_bytes<T>((size_t)k);
+  const uint8_t* w = (half ? wu : wg) + ((size_t)e * m + r) * rb;
+  int sl[MP];
+  const float* xp[MP];
+  float acc[MP];
+#pragma unroll
+  for (int j = 0; j < MP; j++) {
+    sl[j] = mem[j < cnt ? j : 0];
+    xp[j] = x + (size_t)(sl[j] / kpt) * k;
+    acc[j] = 0.f;
+  }
+  const int nu = k / moegg::unit_elems<T>();
+  for (int uu = l16; uu < nu; uu += 16) {
+    moegg::UnitW<T> wv;
+    wv.load(w, uu);
+#pragma unroll
+    for (int j = 0; j < MP; j++)
+      if (j < cnt) acc[j] += wv.dot(xp[j]);
+  }
+#pragma unroll
+  for (int j = 0; j < MP; j++) {
+    if (j >= cnt) break;  // cnt is wave-uniform
+    float a = acc[j];
+#pragma unroll
+    for (int off = 8; off > 0; off >>= 1) a += __shfl_down_sync(~0ull, a, off, 16);
+    const float up = __shfl_sync(~0ull, a, 16);
+    if (lane == 0) hid[(size_t)sl[j] * m + r] = up * a * moegg::sigmoidf_(a);
+  }
+}
+
+// down: one wave per (unique expert, RPW rows); unweighted pairs[member][r].
+template <int T, int LPR>
+__launch_bounds__(256) __global__
+void k_moe_gg_gemv_dn_uq(const uint8_t* __restrict__ wd, const float* __restrict__ hid,
+                         const int* __restrict__ meta, float* __restrict__ pairs, int m,
+                         int k) {
+  constexpr int NM = moegg::kUqNM, MP = moegg::kUqMaxP, RPW = 32 / LPR;
+  const int gw = (int)((blockIdx.x * blockDim.x + threadIdx.x) / warpSize);
+  const int rpt = (m + RPW - 1) / RPW;
+  const int u = gw / rpt;
+  if (u >= meta[0]) return;
+  const int lane = threadIdx.x % warpSize, sub = lane / LPR, ll = lane % LPR;
+  const int r = (gw - u * rpt) * RPW + sub;
+  const bool live = r < m;
+  const int e = meta[1 + u], cnt = meta[1 + NM + u];
+  const int* mem = meta + 1 + 2 * NM + MP * u;
+  const size_t rb = moegg::row_bytes<T>((size_t)k);
+  const uint8_t* w = wd + ((size_t)e * m + (live ? r : 0)) * rb;
+  int sl[MP];
+  float acc[MP];
+#pragma unroll
+  for (int j = 0; j < MP; j++) {
+    sl[j] = mem[j < cnt ? j : 0];
+    acc[j] = 0.f;
+  }
+  const int nu = k / moegg::unit_elems<T>();
+  for (int uu = ll; uu < nu; uu += LPR) {
+    moegg::UnitW<T> wv;
+    wv.load(w, uu);
+#pragma unroll
+    for (int j = 0; j < MP; j++)
+      if (j < cnt) acc[j] += wv.dot(hid + (size_t)sl[j] * k);
+  }
+#pragma unroll
+  for (int j = 0; j < MP; j++) {
+    if (j >= cnt) break;
+    float a = acc[j];
+#pragma unroll
+    for (int off = LPR / 2; off > 0; off >>= 1) a += __shfl_down_sync(~0ull, a, off, LPR);
+    if (ll == 0 && live) pairs[(size_t)sl[j] * m + r] = a;
+  }
+}
+// out[tok][r] = sum_s ws[tok][s] * pairs[tok*KPT+s][r], expert-rank order
+// (same order as k_moe_gg_gemv_dn -> same values).
+template <int KPT>
+__global__ void k_moe_gg_pairs_sum(const float* __restrict__ pairs, const float* __restrict__ ws,
+                                   float* __restrict__ out, int m, int id_stride) {
+  const int tok = blockIdx.y, r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= m) return;
+  float y = 0.f;
+#pragma unroll
+  for (int s = 0; s < KPT; s++) y += ws[tok * id_stride + s] * pairs[((size_t)tok * KPT + s) * m + r];
+  out[(size_t)tok * m + r] = y;
+}
+
+#ifndef MOE_GG_DN_LPR
+#define MOE_GG_DN_LPR 8
+#endif
+// Small-P GEMV path: x F32 [P][d] -> out F32 [P][d] (overwritten), hid =
+// F32 scratch [P*10][mid]. topk must be 10. false = unsupported types.
+static bool moe_gg_gemv(int tgu, int tdn, const uint8_t* gate, const uint8_t* up,
+                        const uint8_t* down, const float* x, const int* ids, const float* ws,
+                        float* hid, float* out, int P, int d, int mid, int id_stride,
+                        hipStream_t st, int* uq_meta = nullptr, float* uq_pairs = nullptr) {
+  constexpr int KPT = 10;
+  if (d % 256 || mid % 32) return false;
+  if (uq_meta && uq_pairs && P >= 2 && P <= moegg::kUqMaxP) {
+    // expert dedup (meta/pairs scratch: kUqInts ints, P*KPT*d floats)
+    if ((tgu != moegg::kQ4K && tgu != moegg::kQ5K) || (tdn != moegg::kQ51 && tdn != moegg::kQ80))
+      return false;
+    k_moe_gg_uniq<<<1, 128, 0, st>>>(ids, uq_meta, P, KPT, id_stride);
+    const unsigned gb = (unsigned)(((size_t)P * KPT * mid + 7) / 8);
+    if (tgu == moegg::kQ4K)
+      k_moe_gg_gemv_gu_uq<moegg::kQ4K><<<gb, 256, 0, st>>>(gate, up, x, uq_meta, hid, mid, d, KPT);
+    else
+      k_moe_gg_gemv_gu_uq<moegg::kQ5K><<<gb, 256, 0, st>>>(gate, up, x, uq_meta, hid, mid, d, KPT);
+    constexpr int LPR = MOE_GG_DN_LPR, RPW = 32 / LPR;
+    const unsigned db = (unsigned)(((size_t)P * KPT * ((d + RPW - 1) / RPW) + 7) / 8);
+    if (tdn == moegg::kQ51)
+      k_moe_gg_gemv_dn_uq<moegg::kQ51, LPR><<<db, 256, 0, st>>>(down, hid, uq_meta, uq_pairs, d, mid);
+    else
+      k_moe_gg_gemv_dn_uq<moegg::kQ80, LPR><<<db, 256, 0, st>>>(down, hid, uq_meta, uq_pairs, d, mid);
+    k_moe_gg_pairs_sum<KPT><<<dim3((d + 255) / 256, P), 256, 0, st>>>(uq_pairs, ws, out, d, id_stride);
+    return true;
+  }
+  const unsigned gu_blocks = (unsigned)(((size_t)P * KPT * mid + 7) / 8);
+  if (tgu == moegg::kQ4K)
+    k_moe_gg_gemv_gu<moegg::kQ4K><<<gu_blocks, 256, 0, st>>>(gate, up, x, ids, hid, mid, d, KPT, id_stride, P);
+  else if (tgu == moegg::kQ5K)
+    k_moe_gg_gemv_gu<moegg::kQ5K><<<gu_blocks, 256, 0, st>>>(gate, up, x, ids, hid, mid, d, KPT, id_stride, P);
+  else
+    return false;
+  constexpr int LPR = MOE_GG_DN_LPR, RPW = 32 / LPR;
+  const unsigned dn_blocks = (unsigned)(((size_t)P * ((d + RPW - 1) / RPW) + 7) / 8);
+  if (tdn == moegg::kQ51)
+    k_moe_gg_gemv_dn<moegg::kQ51, LPR, KPT><<<dn_blocks, 256, 0, st>>>(down, hid, ids, ws, out, d, mid, id_stride, P);
+  else if (tdn == moegg::kQ80)
+    k_moe_gg_gemv_dn<moegg::kQ80, LPR, KPT><<<dn_blocks, 256, 0, st>>>(down, hid, ids, ws, out, d, mid, id_stride, P);
+  else
+    return false;
+  return true;
+}

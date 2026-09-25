@@ -5,6 +5,8 @@
 #   bash tools/g3_verify.sh
 #     GGDIR=<GGUF 目录>    默认 ~/App/llama.cpp/models/Qwen3.8-Flash-Next-UD-Q4_K_XL
 #     BIN=build/gdec-gguf  REF=build/gdec（hgn 生产二进制）
+#       REF 必须是改动前那个提交编出来的二进制：09-24 的旧 build/gdec 逐 token decode
+#       本身不确定（同一输入 3 次 3 个 NLL），第 3 项会误报。例如 REF=build/gdec-head
 #     QUICK=1              KLD 只跑 16 chunk，跳过速度
 # 检查项：
 #   1. KLD（BF16 基准 data/kld/bf16_c512.kld，64×512）< G2 的 0.1494（dense 从 q4cp 换成 Q8_0 应更好）
