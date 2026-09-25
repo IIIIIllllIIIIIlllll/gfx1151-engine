@@ -32,8 +32,10 @@ chk="$(bash "$LAUNCHER" --check 2>&1)" || { echo "$chk"; echo "$LAUNCHER --check
 mapfile -t PENV < <(sed -n 's/^ENV //p' <<<"$chk")
 CMDLINE="$(sed -n 's/^CMD //p' <<<"$chk")"
 eval "C=($CMDLINE)"
-MODEL=${C[1]}; OVERLAY=${C[2]}
-[[ "$OVERLAY" == --* ]] && OVERLAY=""
+# 权重参数与生产一致：主模型 + 全部 overlay（hgn 的 8-bit MTP 草稿 mtp.hgn 也是 overlay，
+# 缺了它 SPEC 会退回 overlay 内置的 4-bit 草稿头）
+WARGS=()
+for a in "${C[@]:1}"; do [[ $a == --* ]] && break; WARGS+=("$a"); done
 
 for e in $(compgen -e | grep '^GDEC_'); do unset "$e"; done
 for e in "${PENV[@]}" GDEC_PROF=1 GDEC_PHASE=1 "$@"; do export "$e"; done
@@ -43,7 +45,7 @@ mkdir -p logs
 LOG="logs/$LABEL.log"
 GENARG=(--gen "${GEN:-1}")
 [[ -n "${SPEC:-}" ]] && GENARG=(--spec-gen "$SPEC" --gamma "${GAMMA:-3}")
-RUN=("$BIN" "$MODEL" ${OVERLAY:+"$OVERLAY"} --tokens-file "$TOK" "${GENARG[@]}" --maxctx "$MAXCTX")
+RUN=("$BIN" "${WARGS[@]}" --tokens-file "$TOK" "${GENARG[@]}" --maxctx "$MAXCTX")
 if [[ "${KTRACE:-0}" == 1 ]]; then
   KD="logs/$LABEL.ktrace"; rm -rf "$KD"
   RUN=(rocprofv3 --kernel-trace --stats -d "$KD" -o run -- "${RUN[@]}")

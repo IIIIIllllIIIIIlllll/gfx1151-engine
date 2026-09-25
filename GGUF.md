@@ -141,6 +141,32 @@ export GDEC_GGUF_MTP=$D/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf          # G3.1/
 
   纯 GGUF 与"hgn 基座 + GGUF 全覆盖 + `GDEC_GGUF_PLE=1`"的 PPL 逐位相同，说明没有任何张量还在读 hgn。
 
+## 同机完整对比（`tools/bench_full.sh`）
+
+两个启动器各自的生产配置（`start_hgn.sh` / `start_gguf.sh --check` 的环境变量与权重参数，prefill chunk 16384），
+2026-09-25 重启后全新编译。离线项用 `tools/pp_prod.sh` / `tools/kld_engine.sh`，API 项由启动器真正起服务
+（256K 上下文、4 路并发，只关 KVSNAP），数字取自 API / 引擎日志的逐请求统计。
+
+| 项目 | hgn | GGUF |
+|---|---|---|
+| prefill 8K（tok/s） | 1056 | 1370 |
+| prefill 32K（整体 / 末 chunk） | 1250 / 1242 | 1435 / 1441 |
+| prefill 64K（整体 / 末 chunk） | 1242 / 1209 | 1409 / 1370 |
+| decode @32K，不投机（tok/s） | 30.5 | 25.0 |
+| MTP 投机 8K prompt + 256，γ=3（tok/s，commit/round） | 51.9（3.84） | 46.6（3.82） |
+| KLD vs BF16 / top1 / PPL | 0.163 / 86.61% / 3.468 | 0.0511 / 92.64% / 3.348 |
+| API 就绪后内存 device / RSS（GiB） | 32.6 / 69.4 | 34.8 / 81.1 |
+| API 中文散文 512 tok（tok/s，草稿接受率） | 30.1（0.40） | 26.2（0.37） |
+| API 代码 512 tok（tok/s，草稿接受率） | 31.1（0.41） | 32.3（0.55） |
+| API 8K prompt 首 token（s，prefill tok/s） | 7.6（1016） | 6.2（1237） |
+| API 32K prompt 首 token（s，prefill tok/s） | 27.2（1209） | 24.3（1353） |
+| API 4 路并发 ×256 tok 总吞吐（tok/s） | 29.8 | 28.5 |
+
+GGUF prefill 快 13–30%、KLD 只有 hgn 的 1/3；decode 慢约 18%（Q8_0 dense 字节多）。
+对话类文本草稿接受率只有 0.4 左右，投机收益远小于离线 8K 文档 prompt（commit/round 3.8）。
+pp_prod.sh 现在把启动器命令行里的全部权重参数传给引擎，hgn 的投机用的是生产的 8-bit `mtp.hgn`
+（以前只传主模型 + overlay，用的是 overlay 内置的 4-bit 草稿头，51.5 / 3.78）。
+
 ## 验证脚本
 
 - `tools/g2_verify.sh` — G2（专家）
@@ -149,6 +175,8 @@ export GDEC_GGUF_MTP=$D/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf          # G3.1/
 - `tools/g3_pure_verify.sh` — G3.3 纯 GGUF：start_gguf.sh 配置、KLD、与混合启动逐位相同、decode/prefill、
   hgn 路径逐位不变、MTP、速度
 - `tools/launcher_verify.sh` — 两个启动器：--check 命令行/环境、缺文件报错、格式互斥、端到端起停
+- `tools/bench_full.sh` — hgn vs GGUF 完整性能：prefill 8K/32K/64K、decode、投机、KLD、API 端到端，
+  汇总表写到 logs/bench_full.md（`FORMATS=gguf` 只测一种，`SKIP="kld api"` 跳过几项）
 - `tools/g3_smoke.sh [ENV=...]` — 512 token PPL 冒烟（可带过滤器等 env）
 - `tools/moe_gguf_test.cu` — MoE kernel vs CPU 参考
 - `tools/moe_gguf_gemv_test.cu` — 小 P 专家 GEMV（含去重路径逐位对照）vs CPU 参考
