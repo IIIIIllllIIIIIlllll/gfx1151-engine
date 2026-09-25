@@ -35,6 +35,14 @@ Verification matrix (all PASS):
 | hipBLASLt MoE path (GDEC_MOE_LT=1) | passed along with the smoke test |
 | 32K prefill measurement (32768 random ids, `--tokens-file`, maxctx=40960) | chunk=8192: **~920 tok/s** (4 chunks in sequence: 913.9/936.9/922.3/907.7, no degradation); chunk=16384: **~979 tok/s** (987.6/970.4, arena 91.95 GiB with no truncation). **Doubling the chunk buys only ~6% PP** — GEMM efficiency at 8192 is already near saturation, so being locked at 8192 by the 95 GiB cap at 256K costs very little |
 
+> **Update 2026-09-25 (faster hgn prefill; takes effect on Windows after a rebuild)**: hgn routed-expert
+> prefill now runs a LUT-decode WMMA kernel (`27_kernels_moe_lut.inc`, default on, `GDEC_MOE_Q4W=0`
+> disables it). Measured on Linux: pp8K @ chunk 2048 816 → 1215 tok/s, pp32K @ chunk 16384 1237 → 1422;
+> KLD and decode are unchanged (see the "hgn 路由专家也走 WMMA" section in [GGUF.md](GGUF.md)). With it on,
+> `GDEC_MOE_LT=1` has no effect and its dequant/gather buffers (~0.4 GiB at chunk 8192, ~0.8 GiB at 16384)
+> are not allocated; the arena estimate shrinks accordingly. So Windows stays on hgn (~11 GiB less memory
+> than GGUF). Not yet measured on Windows.
+
 Key implementation points (differences relative to the Linux version):
 
 - **Single-arena memory architecture**: `g_devarena` + `dalloc_arena` (bump

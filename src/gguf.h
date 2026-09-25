@@ -385,6 +385,26 @@ inline void dequant_row(uint32_t t, const uint8_t* src, float* y, uint64_t k) {
     }
     return;
   }
+  if (t == IQ4_XS) {  // 136 B / 256: d, scales_h, scales_l[4], qs[128]
+    static const int8_t kv[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
+                                  1, 13, 25, 38, 53, 69, 89, 113};
+    for (uint64_t b = 0; b < k / 256; b++, src += 136) {
+      uint16_t dh, sh; memcpy(&dh, src, 2); memcpy(&sh, src + 2, 2);
+      const float d = h2f(dh);
+      const uint8_t* sl = src + 4;
+      const uint8_t* qs = src + 8;
+      for (int ib = 0; ib < 8; ib++, qs += 16) {
+        const int ls = ((sl[ib / 2] >> (4 * (ib % 2))) & 0xF) | (((sh >> (2 * ib)) & 3) << 4);
+        const float dl = d * (float)(ls - 32);
+        float* yy = y + b * 256 + ib * 32;
+        for (int j = 0; j < 16; j++) {
+          yy[j] = dl * kv[qs[j] & 0xF];
+          yy[j + 16] = dl * kv[qs[j] >> 4];
+        }
+      }
+    }
+    return;
+  }
   if (t == Q4_K || t == Q5_K) {
     const uint64_t bs = t == Q4_K ? 144 : 176;
     for (uint64_t b = 0; b < k / 256; b++, src += bs) {

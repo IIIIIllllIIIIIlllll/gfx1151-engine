@@ -69,6 +69,14 @@ static int eff_parallel() {
   return e ? std::max(1, std::min(8, atoi(e))) : 1;
 }
 
+// hgn q4cp 路由专家 prefill 走 LUT 解码 WMMA kernel（27_kernels_moe_lut.inc）。
+// 默认开；GDEC_MOE_Q4W=0 恢复旧路径（GDEC_MOE_LT / tiled k_moe_w4）。开启时
+// GDEC_MOE_LT 不生效，其 dequant/gather 缓冲也不分配。
+static bool moe_q4w_env() {
+  const char* s = getenv("GDEC_MOE_Q4W");
+  return !(s && *s == '0');
+}
+
 // 镜像 GpuModel 构造函数的分配公式（含相同 env 分支），用于 arena 精确 sizing。
 // 每项 256B 对齐后求和；估少了一律有 dalloc_arena 的 hipMalloc 回退兜底。
 static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
@@ -87,7 +95,7 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
                    getenv("GDEC_QSA_WMMA_BTV");
   const bool fused = getenv("GDEC_PREFILL_UNFUSED") == nullptr;
   const bool moe_det = getenv("GDEC_MOE_ATOMIC") == nullptr;  // 与 40_model.inc 同步
-  const bool moe_lt_ok = getenv("GDEC_MOE_LT") && g_cfg.topk == 10 && moe_det &&
+  const bool moe_lt_ok = getenv("GDEC_MOE_LT") && !moe_q4w_env() && g_cfg.topk == 10 && moe_det &&
                          !getenv("GDEC_MOE_HOST_ROUTE") &&
                          !getenv("GDEC_MOE_ORDERED");
   const bool lt_cmp = getenv("GDEC_MOE_LT_CMP") != nullptr;

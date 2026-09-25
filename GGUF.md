@@ -167,6 +167,42 @@ GGUF prefill 快 13–30%、KLD 只有 hgn 的 1/3；decode 慢约 18%（Q8_0 de
 pp_prod.sh 现在把启动器命令行里的全部权重参数传给引擎，hgn 的投机用的是生产的 8-bit `mtp.hgn`
 （以前只传主模型 + overlay，用的是 overlay 内置的 4-bit 草稿头，51.5 / 3.78）。
 
+## hgn 路由专家也走 WMMA：LUT 解码 kernel（2026-09-25，`tools/lut_verify.sh` PASS）
+
+以前 hgn 没吃到 G1 MoE kernel 的收益：它只认 GGUF 块格式，hgn（q4cp）prefill 仍是
+dequant + hipBLASLt（`GDEC_MOE_LT`）/ 标量 `k_moe_w4`。q4cp 与 IQ4_NL 结构几乎一样
+（32 元素一组、4-bit 查表索引、fp16 scale），所以写了一个 LUT 解码族 kernel
+`src/gpu/parts/27_kernels_moe_lut.inc`：`k_moe_lut<kQ4CP | kIQ4NL | kIQ4XS, pair>`，
+流水线/tiling/epilogue 与 `k_moe_gg` 相同，解码 = LDS half2 对表（一个字节查出两个元素）× scale。
+
+- **默认开启**（hgn prefill，P > moe_naive_max）；`GDEC_MOE_Q4W=0` 恢复旧路径且与旧提交逐位相同。
+  开启时 `GDEC_MOE_LT` 不再生效，它的 dequant/gather 缓冲（`d_moexg` 等，chunk 16384 约 0.8 GiB、
+  Windows chunk 8192 约 0.4 GiB）也不分配，`devarena_estimate` 同步。
+- decode（P ≤ 16 的 grouped GEMV）完全不变：逐 token decode mean_nll 与旧二进制逐位相同。
+- IQ4_NL / IQ4_XS 模板已在 `tools/moe_lut_test.cu --synth iq4nl|iq4xs` 对 CPU 参考通过；
+  引擎的 GGUF 路径还没接（手头没有 IQ4 专家的 GGUF 文件），以后给 Windows 用 UD-IQ4_XS 时再接。
+
+kernel（`tools/moe_lut_test.cu --hgn`，真实 q4cp 权重）：P=2048 10.6 ms/层（旧 `k_moe_w4` 28.3，
+GGUF Q4_K 11.8）；P=16384 0.168 ms/token（旧 LT 路径 0.291，GGUF 0.173）。
+
+引擎（`start_hgn.sh` 生产配置，同一二进制 off / on）：
+
+| 项目 | off（旧路径） | on（LUT WMMA） | GGUF 参考 |
+|---|---|---|---|
+| KLD vs BF16 / top1 | 0.1631 / 86.61% | 0.1628 / 86.81% | 0.0511 / 92.64% |
+| prefill 8K @ chunk 2048（tok/s） | 816 | 1215（+49%） | 1206 |
+| prefill 8K 单 chunk | 1096 | 1361（+24%） | 1370 |
+| prefill 32K @ chunk 16384 | 1237 | 1422（+15%） | 1435 |
+| decode @32K（tok/s） | 30.5 | 31.2 | 25.0 |
+| MTP 投机 8K γ=3（tok/s，commit/round） | 51.6（3.84） | 49.3（3.67） | 46.6（3.82） |
+
+投机每轮耗时不变，commit/round 的差别来自 prefill 数值略变后生成的文本不同（单次 256 token，
+脚本门槛 ≥ 0.95×off）。1024 token prefill vs decode PPL 6.875 / 6.905（< 1%）。
+
+结论：hgn 的 prefill 速度追平 GGUF，decode 保持 hgn 的优势，显存比 GGUF 少约 11 GiB——
+Windows（96 GiB 上限）继续用 hgn 即可拿到这份 prefill 提速，重新编译即可。质量（KLD）仍是 hgn 的
+0.163，下一步是用 imatrix 重新量化出高质量 hgn（dense 8-bit）。
+
 ## 验证脚本
 
 - `tools/g2_verify.sh` — G2（专家）
@@ -178,6 +214,9 @@ pp_prod.sh 现在把启动器命令行里的全部权重参数传给引擎，hgn
 - `tools/bench_full.sh` — hgn vs GGUF 完整性能：prefill 8K/32K/64K、decode、投机、KLD、API 端到端，
   汇总表写到 logs/bench_full.md（`FORMATS=gguf` 只测一种，`SKIP="kld api"` 跳过几项）
 - `tools/g3_smoke.sh [ENV=...]` — 512 token PPL 冒烟（可带过滤器等 env）
+- `tools/lut_verify.sh` — hgn LUT MoE kernel：开关关闭与旧二进制逐位相同、decode 不变、KLD、
+  prefill/decode PPL、MTP、速度（`BIN=` 新二进制，`REF=` 旧提交二进制）
+- `tools/moe_lut_test.cu` — LUT kernel（q4cp 真实权重 `--hgn` / 合成 IQ4_NL、IQ4_XS `--synth`）vs CPU 参考
 - `tools/moe_gguf_test.cu` — MoE kernel vs CPU 参考
 - `tools/moe_gguf_gemv_test.cu` — 小 P 专家 GEMV（含去重路径逐位对照）vs CPU 参考
 - `tools/q8g32_gemv_bench.cu` — q8g32 dense GEMV 各变体（P=1 与 P=4）

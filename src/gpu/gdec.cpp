@@ -51,6 +51,10 @@
 // (GDEC_GEMM_NO_K64=1 reverts); fp32 indexer projection runs a timed-pick
 // rocBLAS solution index (GDEC_IPROJ_SGEMM=1 reverts); MTP indexer scores use
 // the trunk's tiled kernel (GDEC_MTP_INDEX_SGEMM=1 reverts). PREFILL.md §11.9.
+// 2026-09-25: hgn q4cp routed-expert prefill (P > 16) runs the LUT-decode F16
+// WMMA kernels (parts/27_kernels_moe_lut.inc) by default; GDEC_MOE_Q4W=0
+// restores the old path (bit-identical). While on, GDEC_MOE_LT is ignored and
+// its buffers are not allocated. Decode is unchanged. GGUF.md.
 // --kld-base/--kld-save: llama-perplexity-compatible KL divergence against a
 // llama.cpp logits file (parts/48_kld.inc, KLD.md).
 // M-RoPE (vision, stage 1b/1c): requests may carry image grid_thw triples
@@ -148,6 +152,7 @@
 #include "parts/24_kernels_moe_lt.inc"
 #include "parts/25_kernels_gdn.inc"
 #include "parts/26_kernels_moe_gguf.inc"
+#include "parts/27_kernels_moe_lut.inc"
 #include "parts/30_host_util.inc"
 #include "parts/31_vision.inc"
 #include "parts/40_model.inc"

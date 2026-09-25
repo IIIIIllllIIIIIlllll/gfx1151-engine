@@ -1319,6 +1319,43 @@ struct GpuModel {
                                                                      P, d);
   }
 
+  // hgn q4cp routed experts through the LUT-decode WMMA kernels (GDEC_MOE_Q4W):
+  // same prefill workspaces / dataflow as moe_gguf's P > 1 branch; acc f32
+  // [P][d] fully overwritten. Returns false (nothing launched) if unsupported.
+  bool moe_q4w_run(const WView& gu, const WView& dn, const float* x, const int* topids,
+                   const float* topw, float* acc, int P) {
+    const int k = g_cfg.topk, E = g_cfg.experts, d = g_cfg.d, mid = g_cfg.moe_mid;
+    if (!moe_q4w || k != 10 || !moe_deterministic || moe_host_route || moe_ordered ||
+        moe_untiled || P > maxbatch_cap || gu.dtype != 5 || dn.dtype != 5 ||
+        gu.cols != (uint64_t)d || gu.rows != (uint64_t)E * 2 * mid || dn.cols != (uint64_t)mid ||
+        dn.rows != (uint64_t)E * d)
+      return false;
+    const moelut::LutW pgu = lut_q4cp_view(gu.data, gu.rows, gu.cols, gu.scale_stride, 2 * mid, mid);
+    const moelut::LutW pdn = lut_q4cp_view(dn.data, dn.rows, dn.cols, dn.scale_stride, d, 0);
+    if (mid % 64 || d % 128 || !moelut::lut_ok(moelut::kQ4CP, pgu, true, d) ||
+        !moelut::lut_ok(moelut::kQ4CP, pdn, false, mid))
+      return false;
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      fprintf(stderr, "moe prefill: q4cp LUT WMMA (GDEC_MOE_Q4W=0 disables)\n");
+    }
+    moe_routing.run(topids, topw, d_tokidx, d_pweight, d_eoff, d_pairids, P, k, E);
+    k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E);
+    const int max_tiles = (P * k + 63) / 64 + E;
+    __half* x16 = (__half*)d_xbf16b;
+    __half* hid = (__half*)d_hidb;
+    const size_t n4 = (size_t)P * d / 4;
+    k_f32_to_f16_v4<<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(x, x16, n4);
+    moe_lut_up(moelut::kQ4CP, pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, hid, mid, d,
+               g_str);
+    moe_lut_down(moelut::kQ4CP, pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid,
+                 g_str);
+    k_moe_reduce_pw<10><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(d_guvb, d_pairids, d_pweight,
+                                                                     acc, P, d);
+    return true;
+  }
+
   void moe(int l, const float* x, float* y) {
     char buf[128];
     snprintf(buf, sizeof buf, "layers.%d.mlp.gate.weight", l);
@@ -1491,7 +1528,12 @@ struct GpuModel {
   // bf16 pair rows from the deterministic down kernel; the router weight is
   // applied in fp32 by k_moe_reduce_pw_bf16 instead of pre-multiplied in fp32.
   bool moe_pairs_bf16 = getenv("GDEC_MOE_PAIRS_BF16") != nullptr;
-  bool moe_lt = getenv("GDEC_MOE_LT") != nullptr;  // prefill MoE: dequant + per-expert hipBLASLt
+  // hgn q4cp prefill MoE (P > moe_naive_max) via the LUT-decode F16 WMMA kernels
+  // (27_kernels_moe_lut.inc, same dataflow as moe_gguf). Default on,
+  // GDEC_MOE_Q4W=0 restores GDEC_MOE_LT / tiled k_moe_w4. When on, GDEC_MOE_LT is
+  // ignored (no LT buffers); decode (P <= moe_naive_max) is untouched.
+  bool moe_q4w = moe_q4w_env();
+  bool moe_lt = getenv("GDEC_MOE_LT") != nullptr && !moe_q4w;  // prefill MoE: dequant + per-expert hipBLASLt
   // Validated PP dataflow changes. Unset each switch to restore its baseline.
   // Keep the P<=8 direct GEMV path's input precision and scratch lifetime.
   bool pp_moe_out = getenv("GDEC_PP_MOE_OUT") != nullptr;
@@ -2794,6 +2836,11 @@ struct GpuModel {
     WView gu = wview(ckpt.at(buf));
     snprintf(buf, sizeof buf, "layers.%d.mlp.experts.down_proj.weight", l);
     WView dn = wview(ckpt.at(buf));
+    if (!moe_naive && P > moe_naive_max &&
+        moe_q4w_run(gu, dn, d_xb, d_topidsb, d_topwb, acc, P)) {
+      moe_b_shared(l, P, acc, direct_output);
+      return;
+    }
     // fused kernels require exact tiling (guards would spill accumulators)
     bool fused_ok = g_cfg.moe_mid % MOE_CT == 0 && g_cfg.d % MOE_CT == 0 &&
                     g_cfg.d % FD_CT_DN == 0 &&
@@ -4123,13 +4170,17 @@ struct GpuModel {
       mtp_moe_b_shared(P);
       return;
     }
-    CK(hipMemsetAsync(d_moeaccb, 0, (size_t)P * g_cfg.d * 4, g_str));
     snprintf(buf, sizeof buf, "%s.experts.gate_up_proj.weight", pfx);
     const Tensor& gu_t = ckpt.at(buf);
     WView gu = wview(gu_t);
     snprintf(buf, sizeof buf, "%s.experts.down_proj.weight", pfx);
     const Tensor& dn_t = ckpt.at(buf);
     WView dn = wview(dn_t);
+    if (P > moe_naive_max && moe_q4w_run(gu, dn, d_xb, d_topidsb, d_topwb, d_moeaccb, P)) {
+      mtp_moe_b_shared(P);
+      return;
+    }
+    CK(hipMemsetAsync(d_moeaccb, 0, (size_t)P * g_cfg.d * 4, g_str));
     moe_routing.run(d_topidsb, d_topwb, d_tokidx, d_pweight, d_eoff, d_pairids,
                     P, k, E);
     int tasks = (npairs + 63) / 64 + E;

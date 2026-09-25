@@ -30,6 +30,13 @@ OpenAI 接口）。Git Bash 下 `start_win.sh` 与 Linux `start.sh` 并列。
 | hipBLASLt MoE 路径（GDEC_MOE_LT=1） | 随冒烟通过 |
 | 32K prefill 实测（32768 随机 id，`--tokens-file`，maxctx=40960） | chunk=8192：**~920 tok/s**（4 chunk 逐次 913.9/936.9/922.3/907.7，无衰减）；chunk=16384：**~979 tok/s**（987.6/970.4，arena 91.95 GiB 无截断）。**chunk 翻倍仅换 ~6% PP**——8192 的 GEMM 效率已接近饱和，256K 下被 95 GiB 上限锁在 8192 的代价很小 |
 
+> **2026-09-25 更新（hgn prefill 提速，Windows 重新编译即生效）**：hgn 路由专家的 prefill 改走
+> LUT 解码 WMMA kernel（`27_kernels_moe_lut.inc`，默认开，`GDEC_MOE_Q4W=0` 关闭）。Linux 实测
+> pp8K @ chunk 2048 816 → 1215 tok/s、pp32K @ chunk 16384 1237 → 1422，KLD 不变、decode 不变
+> （详见 [GGUF.md](GGUF.md) "hgn 路由专家也走 WMMA"）。开启后 `GDEC_MOE_LT=1` 不再生效，
+> 它的 dequant/gather 缓冲（chunk 8192 约 0.4 GiB，16384 约 0.8 GiB）不再分配，arena 估算同步变小。
+> 因此 Windows 继续用 hgn（显存比 GGUF 少约 11 GiB），不需要换 GGUF。Windows 上尚未实测。
+
 关键实现（相对 Linux 版的差异点）：
 
 - **单 arena 内存架构**：`g_devarena` + `dalloc_arena`（bump 分配，溢出回退
