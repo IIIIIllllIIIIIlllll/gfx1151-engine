@@ -8,6 +8,8 @@
 #     UNSET="GDEC_A GDEC_B"   从生产 env 中去掉这些变量（开关类变量只看存在性）
 #     GEN=N                   生成 token 数（默认 1；日志末尾 ids: 行可做 A/B 比对）
 #     SPEC=N [GAMMA=3]        改用 MTP 投机生成 --spec-gen N（看 MTP 接受率）
+#     OVERLAY=<file>|none     替换/去掉生产 overlay（第 2 个权重参数）
+#     MODEL=<file>            替换主模型（第 1 个权重参数）
 # 长度简写从 data/ppbench/tok<N>.txt 或 ~/ppbench/tok<N>.txt 找。
 # 输出：logs/<标签>.log；打印 phase / prefill / prof 行与总耗时。
 set -uo pipefail
@@ -36,6 +38,12 @@ eval "C=($CMDLINE)"
 # 缺了它 SPEC 会退回 overlay 内置的 4-bit 草稿头）
 WARGS=()
 for a in "${C[@]:1}"; do [[ $a == --* ]] && break; WARGS+=("$a"); done
+# OVERLAY=<file> 替换第 2 个权重参数（生产 overlay），OVERLAY=none 去掉它；MTP overlay 不动
+if [[ -n "${OVERLAY:-}" && ${#WARGS[@]} -ge 2 ]]; then
+  if [[ $OVERLAY == none ]]; then WARGS=("${WARGS[0]}" "${WARGS[@]:2}")
+  else WARGS[1]=$OVERLAY; fi
+fi
+[[ -n "${MODEL:-}" ]] && WARGS[0]=$MODEL
 
 for e in $(compgen -e | grep '^GDEC_'); do unset "$e"; done
 for e in "${PENV[@]}" GDEC_PROF=1 GDEC_PHASE=1 "$@"; do export "$e"; done
