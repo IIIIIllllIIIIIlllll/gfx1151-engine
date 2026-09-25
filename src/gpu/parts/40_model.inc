@@ -125,7 +125,9 @@ struct GpuModel {
   bool prefill_fused = getenv("GDEC_PREFILL_UNFUSED") == nullptr;
   bool gr_bf16 = getenv("GDEC_GR_BF16") != nullptr && prefill_fused;
   bool gr_scatter_norm = getenv("GDEC_GR_SCATTER_NORM") != nullptr || gr_bf16;
-  bool moe_deterministic = !qsa_dense && getenv("GDEC_MOE_ATOMIC") == nullptr;
+  // Independent of GDEC_QSA_DENSE: dense used to force atomic MoE (and so lose
+  // MoE_LT), which made it 2x slower in MoE and not a clean attention-only A/B.
+  bool moe_deterministic = getenv("GDEC_MOE_ATOMIC") == nullptr;
   float* d_router;                        // 512
   int* d_topids;                          // 16
   float* d_topw;                          // 16
@@ -1112,17 +1114,14 @@ struct GpuModel {
   // tokens (< 2051) take the same path (ntok = token+1, identity source map);
   // the old 3-pass k_qsa_step dense kernel cost ~0.7ms->5.4ms/layer growing
   // linearly with pos (rocprofv3: 55.8% of all decode kernel time), while the
-  // flash split stays flat. GDEC_QSA_DENSE keeps k_qsa_step as a debug fallback.
+  // flash split stays flat. GDEC_QSA_DENSE takes the same split kernel with no
+  // selection list (all visible positions). k_qsa_step used to be its fallback,
+  // but its pass 3 recomputes every q.k per output dim: 1170 ms/token at 8K.
   template <typename KVT>
   void qsa_attn(const KVT* kc, const KVT* vc, const int* ptab = nullptr) {
-    if (qsa_dense) {
-      k_qsa_step<KVT><<<24, 256, 0, g_str>>>(d_qs, kc, vc, d_attn, d_pos, 256, 2, 24,
-                                             nullptr, false, ptab);
-      return;
-    }
     k_qsa_flash<true, false, KVT, true><<<dim3(QSA_DEC_NSPLIT, 2), 128, 0, g_str>>>(
-        d_qs, kc, vc, d_attn, 1, 256, 2, 24, d_iselected, 0, d_pos, d_pacc, d_pml, 0,
-        ptab);
+        d_qs, kc, vc, d_attn, 1, 256, 2, 24, qsa_dense ? nullptr : d_iselected, 0,
+        d_pos, d_pacc, d_pml, 0, ptab);
     k_qsa_flash_combine<<<dim3(12, 2), 64, 0, g_str>>>(d_pml, d_pacc, d_attn, 12,
                                                        256, d_pos);
   }
@@ -3666,14 +3665,9 @@ struct GpuModel {
 
   template <typename KVT>
   void mtp_qsa_attn(const KVT* kc, const KVT* vc) {
-    if (qsa_dense) {
-      k_qsa_step<KVT><<<24, 256, 0, g_str>>>(d_qs, kc, vc, d_attn, d_mpos, 256, 2,
-                                             24, nullptr, false, kvpt());
-      return;
-    }
     k_qsa_flash<true, false, KVT, true><<<dim3(QSA_DEC_NSPLIT, 2), 128, 0, g_str>>>(
-        d_qs, kc, vc, d_attn, 1, 256, 2, 24, d_iselected, 0, d_mpos, d_pacc,
-        d_pml, 0, kvpt());
+        d_qs, kc, vc, d_attn, 1, 256, 2, 24, qsa_dense ? nullptr : d_iselected, 0,
+        d_mpos, d_pacc, d_pml, 0, kvpt());
     k_qsa_flash_combine<<<dim3(12, 2), 64, 0, g_str>>>(d_pml, d_pacc, d_attn, 12,
                                                        256, d_mpos);
   }

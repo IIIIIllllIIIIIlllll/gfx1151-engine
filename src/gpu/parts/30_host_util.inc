@@ -86,7 +86,7 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   const bool btv = getenv("GDEC_QSA_WMMA") && !kv_fp32 &&
                    getenv("GDEC_QSA_WMMA_BTV");
   const bool fused = getenv("GDEC_PREFILL_UNFUSED") == nullptr;
-  const bool moe_det = !qsa_dense && getenv("GDEC_MOE_ATOMIC") == nullptr;
+  const bool moe_det = getenv("GDEC_MOE_ATOMIC") == nullptr;  // 与 40_model.inc 同步
   const bool moe_lt_ok = getenv("GDEC_MOE_LT") && g_cfg.topk == 10 && moe_det &&
                          !getenv("GDEC_MOE_HOST_ROUTE") &&
                          !getenv("GDEC_MOE_ORDERED");

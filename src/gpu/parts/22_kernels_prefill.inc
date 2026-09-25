@@ -622,7 +622,9 @@ __global__ void k_qsa_flash(const float* __restrict__ q, const KVT* __restrict__
   // Sparse: q/out rows are batch-local (token - kbase); token stays absolute
   // for ntok/source bookkeeping. Dense: rows local, keys/mask absolute (kbase).
   const int qrow = token - kbase;
-  const int ntok = Sparse ? (token < 2051 ? token + 1 : 2048 + (token + 1) % 4)
+  // selected == nullptr (GDEC_QSA_DENSE decode): every visible position.
+  const int ntok = Sparse ? ((token < 2051 || !selected) ? token + 1
+                                                         : 2048 + (token + 1) % 4)
                           : min(kbase + P, kbase + ts + QSA_TR);
   constexpr int QR = SharedV ? 12 : QSA_TR;
   __shared__ float qs[QR][QSA_LP];
