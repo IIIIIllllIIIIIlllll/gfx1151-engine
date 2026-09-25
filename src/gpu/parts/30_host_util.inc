@@ -294,6 +294,12 @@ static bool is_gguf_experts(const std::string& n) {
 static void gguf_experts_open() {
   const char* path = getenv("GDEC_GGUF");
   if (!path || !*path || gg_on()) return;
+  // GDEC_GGUF_EXPERTS=0: keep the hgn routed experts (trunk + MTP) and take
+  // only the dense tensors from the GGUF (GDEC_GGUF_DENSE=1). Quality probe.
+  if (const char* e = getenv("GDEC_GGUF_EXPERTS"); e && !strcmp(e, "0")) {
+    fprintf(stderr, "gguf experts: off (GDEC_GGUF_EXPERTS=0), hgn experts\n");
+    return;
+  }
 #ifdef _WIN32
   throw std::runtime_error("GDEC_GGUF: not supported on Windows yet");
 #else
@@ -383,7 +389,19 @@ static void gguf_experts_open() {
 // base (pure GGUF start) or GDEC_GGUF_PLE=1. The synthetic host copies of
 // large tensors are dropped after upload (gguf_dense_release).
 static bool g_gguf_dense = false;
+// 8-bit dense weights (GGUF dense, or an hgn overlay with q8g32 dense tensors,
+// tools/hgn_hq.py): few-row bf16 matrices (HC inject 4x10240, in_proj_a/b
+// 48x2560) take the one-block-per-row gemv kernels. Old 4-bit hgn files have
+// no dtype 8 and keep the original kernels (bit-exact vs earlier builds).
+static bool g_dense_rowfast = false;
 static void gguf_dense_apply(Checkpoint& ck) {
+  if (!g_dense_rowfast)
+    for (auto& kv : ck.tensors())
+      if (kv.second.dtype == 8 && kv.first.find(".mlp.experts.") == std::string::npos) {
+        g_dense_rowfast = true;
+        fprintf(stderr, "dense: 8-bit (q8g32) weights present, few-row bf16 gemv on\n");
+        break;
+      }
   const char* on = getenv("GDEC_GGUF_DENSE");
   if (!on || !*on || !strcmp(on, "0")) return;
   const char* path = getenv("GDEC_GGUF");
@@ -427,6 +445,7 @@ static void gguf_dense_apply(Checkpoint& ck) {
       n8 += kv.second.dtype == 8;
     }
   g_gguf_dense = true;
+  g_dense_rowfast = true;
   double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   fprintf(stderr,
           "gguf dense: %zu tensors from GGUF%s (%d q8g32, %.2f GiB synthetic, %.1f s)%s\n", n,
@@ -717,8 +736,8 @@ static void gemv(const WView& w, const float* x, float* y, uint64_t row_off = 0,
     uint64_t stride = w.cols + w.cols / 64 * 4;
     k_q8g64_gemv<<<(unsigned)blocks, threads, 0, g_str>>>(w.data + row_off * stride, x, y, rows,
                                                 w.cols);
-  } else if (g_gguf_dense && w.dtype == 0 && rows < 64 && w.cols % 8 == 0 && w.cols >= 2048) {
-    // GGUF only: keeps the hgn path bit-exact vs earlier builds (g3_verify 3)
+  } else if (g_dense_rowfast && w.dtype == 0 && rows < 64 && w.cols % 8 == 0 && w.cols >= 2048) {
+    // 8-bit dense only: keeps the 4-bit hgn path bit-exact (g3_verify 3)
     k_bf16_gemv_row<<<(unsigned)rows, 256, 0, g_str>>>(
         (const uint16_t*)w.data + row_off * w.cols, x, y, w.cols);
   } else if (w.dtype == 0) {
@@ -780,10 +799,10 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
   int threads = 512;
   uint64_t wpb = threads / 32;
   uint64_t blocks = (w.rows + wpb * 2 - 1) / (wpb * 2);
-  if (g_gguf_dense && w.dtype == 0 && w.rows < 64 && w.cols % 8 == 0 && w.cols >= 2048 &&
+  if (g_dense_rowfast && w.dtype == 0 && w.rows < 64 && w.cols % 8 == 0 && w.cols >= 2048 &&
       xstride % 8 == 0) {
     // few-row bf16 (HC inject 4x10240 with bf16 x in spec verify, in_proj_a/b
-    // 48x2560): one block per row. GGUF only (hgn path unchanged).
+    // 48x2560): one block per row. 8-bit dense only (4-bit hgn unchanged).
 #define GDEC_BROW(PP)                                                          \
   case PP:                                                                     \
     if (xbf16)                                                                 \
