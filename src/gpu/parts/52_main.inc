@@ -1,4 +1,46 @@
 // ---------------- main -------------------------------------------------------
+// Pure GGUF start (G3.3): `gdec <first shard>.gguf ...` needs no .hgn. Implies
+// GDEC_GGUF=<base> + GDEC_GGUF_DENSE=1; the MTP sidecar defaults to the single
+// mtp-*.gguf next to the shards (GDEC_GGUF_MTP= empty = none).
+static bool is_gguf_path(const std::string& p) {
+  return p.size() > 5 && p.compare(p.size() - 5, 5, ".gguf") == 0;
+}
+static void gguf_base_setup(const std::string& base) {
+#ifdef _WIN32
+  _putenv_s("GDEC_GGUF", base.c_str());
+  _putenv_s("GDEC_GGUF_DENSE", "1");
+#else
+  setenv("GDEC_GGUF", base.c_str(), 1);
+  setenv("GDEC_GGUF_DENSE", "1", 1);
+  if (!getenv("GDEC_GGUF_MTP")) {
+    const size_t sl = base.find_last_of('/');
+    const std::string dir = sl == std::string::npos ? "." : base.substr(0, sl);
+    std::string hit;
+    int n = 0;
+    if (DIR* d = opendir(dir.c_str())) {
+      while (dirent* e = readdir(d)) {
+        const std::string nm = e->d_name;
+        if (nm.compare(0, 4, "mtp-") == 0 && is_gguf_path(nm)) hit = dir + "/" + nm, n++;
+      }
+      closedir(d);
+    }
+    if (n == 1) setenv("GDEC_GGUF_MTP", hit.c_str(), 1);
+    else fprintf(stderr, "gguf: %s MTP sidecar (mtp-*.gguf) in %s; set GDEC_GGUF_MTP\n",
+                 n ? "several" : "no", dir.c_str());
+  }
+#endif
+  fprintf(stderr, "gguf: pure GGUF start from %s (MTP %s)\n", base.c_str(),
+          getenv("GDEC_GGUF_MTP") && *getenv("GDEC_GGUF_MTP") ? getenv("GDEC_GGUF_MTP") : "none");
+}
+// Base checkpoint: the .hgn file, or empty when the base is a GGUF (tensors
+// come from gguf_dense_apply).
+static std::unique_ptr<Checkpoint> open_base(const std::string& base) {
+  if (is_gguf_path(base)) return std::make_unique<Checkpoint>();
+  auto ck = std::make_unique<Checkpoint>(base.c_str());
+  ple_uring_open(base.c_str());
+  return ck;
+}
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
   if (!wsa_init()) {
@@ -44,6 +86,7 @@ int main(int argc, char** argv) {
   // Vision (stage 4): sidecar tower weights; offline ViT parity mode.
   std::string vision_tower, vision_test, vision_patches;
   while (argi < argc && argv[argi][0] != '-') overlays.push_back(argv[argi++]);
+  if (is_gguf_path(base)) gguf_base_setup(base);
   for (; argi < argc; argi++) {
     std::string a = argv[argi];
     auto next = [&]() { return argv[++argi]; };
@@ -250,8 +293,8 @@ int main(int argc, char** argv) {
   }
   if (serve_mode) {
     if (!maxctx_set) maxctx = 65536;  // service default; CLI one-shot stays 4096
-    Checkpoint ckpt(base.c_str());
-    ple_uring_open(base.c_str());
+    auto ckbase = open_base(base);
+    Checkpoint& ckpt = *ckbase;
     for (const auto& o : overlays) ckpt.add_overlay(o.c_str());
     fprintf(stderr, "loaded %zu tensors (base+%zu overlay)\n", ckpt.tensor_count(),
             overlays.size());
@@ -306,8 +349,8 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  Checkpoint ckpt(base.c_str());
-  ple_uring_open(base.c_str());
+  auto ckbase = open_base(base);
+  Checkpoint& ckpt = *ckbase;
   for (const auto& o : overlays) ckpt.add_overlay(o.c_str());
   fprintf(stderr, "loaded %zu tensors (base+%zu overlay)\n", ckpt.tensor_count(),
           overlays.size());

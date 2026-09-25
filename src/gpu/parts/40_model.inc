@@ -250,6 +250,7 @@ struct GpuModel {
   int64_t ple_mult[3], ple_vsz[16], ple_voff[16];
   const Tensor* ple_table = nullptr;
   float ple_tscale = 1.f;
+  bool ple_iq4 = false;  // table is the GGUF IQ4_NL view (dtype 11, g_ple_rb 90)
   int ple_ringpos = 0;           // host mirror for direct mode
   int* d_token = nullptr;        // device scalars for graph-replayable kernels
   int* d_pos = nullptr;
@@ -660,6 +661,21 @@ struct GpuModel {
       const Tensor& vo = ckpt.at("layers.1.ple.ple_embedding.ngram_heads_offsets");
       memcpy(ple_voff, vo.data, 128);
       ple_table = &ckpt.at("layers.1.ple.ngram_embedding.weight");
+      ple_iq4 = ple_table->dtype == 11;
+      if (ple_iq4) {
+        // GGUF IQ4_NL table: 90 B rows, no global scale. The batch-read fd is
+        // re-pointed at the shard that holds it (mmapped from offset 0).
+        g_ple_rb = 90;
+#ifndef _WIN32
+        if (g_gguf)
+          for (const auto& mp : g_gguf->mappings())
+            if (ple_table->data >= mp.base && ple_table->data < mp.base + mp.len) {
+              ple_uring_open(mp.path.c_str());
+              g_ple_foff = (uint64_t)(ple_table->data - mp.base);
+              g_ple_off_ok = g_ple_fd >= 0;
+            }
+#endif
+      } else {
       memcpy(&ple_tscale, ple_table->data + ple_table->numel(), 4);
       // io_uring path: file offset of the PLE table in the base .hgn. The fd
       // is the base file, so only the base mapping (maps from file offset 0)
@@ -674,6 +690,7 @@ struct GpuModel {
           g_ple_foff = (uint64_t)(ple_table->data - mp0.base);
           g_ple_off_ok = true;
         }
+      }
       }
     }
 
@@ -1357,6 +1374,14 @@ struct GpuModel {
 
   // PLE host phase: hash + read 16 rows into pinned staging (disk latency — overlapped).
   float* ple_e = nullptr;  // pinned
+  // one raw table row (g_ple_rb bytes) -> 160 f32
+  void ple_deq(const uint8_t* p, float* dst) const {
+    if (ple_iq4) {
+      gguf::dequant_row(gguf::IQ4_NL, p, dst, 160);
+      return;
+    }
+    for (int i = 0; i < 160; i++) dst[i] = hgn::fp8e4m3_to_f32(p[i]) * ple_tscale;
+  }
   // reads the 16 PLE rows for chist position t into dst (pure read of chist;
   // safe to call concurrently for distinct t/dst).
   void ple_rows(int t, float* dst) {
@@ -1370,7 +1395,7 @@ struct GpuModel {
       int64_t mix = cat(0) * ple_mult[0] ^ (cat(1) * ple_mult[1]);
       if (h >= 8) mix ^= cat(2) * ple_mult[2];
       uint64_t row = (uint64_t)(ple_voff[h] + (int64_t)(mix % ple_vsz[h]));
-      const uint8_t* p = ple_table->data + row * 160;
+      const uint8_t* p = ple_table->data + row * g_ple_rb;
       addrs[h] = p;
       madvise((void*)(uintptr_t)((uintptr_t)p & ~4095ull), 4096, MADV_WILLNEED);
     }
@@ -1380,20 +1405,16 @@ struct GpuModel {
       uint8_t stg[16 * 160];
       for (int h = 0; h < 16; h++) a64[h] = (uint64_t)(uintptr_t)addrs[h];
       g_ple_win.run(a64, stg, (uint64_t)(uintptr_t)ple_table->data, 16);
-      for (int i = 0; i < 16 * 160; i++)
-        dst[i] = hgn::fp8e4m3_to_f32(stg[i]) * ple_tscale;
+      for (int h = 0; h < 16; h++) ple_deq(stg + h * g_ple_rb, dst + h * 160);
       return;
     }
 #endif
     // pass 2: read (pages already in flight)
-    for (int h = 0; h < 16; h++) {
-      const uint8_t* p = addrs[h];
-      for (int i = 0; i < 160; i++)
-        dst[h * 160 + i] = hgn::fp8e4m3_to_f32(p[i]) * ple_tscale;
-    }
+    for (int h = 0; h < 16; h++) ple_deq(addrs[h], dst + h * 160);
   }
-  // raw fp8 variant: staging keeps the 160 code bytes per head; dequant+scale
-  // happens on GPU (k_ple_fp8_dequant). ~4x less host work per token.
+  // raw variant: staging keeps the g_ple_rb row bytes per head (fp8 codes or
+  // IQ4_NL blocks); dequant happens on GPU (k_ple_fp8_dequant /
+  // k_ple_iq4nl_dequant). ~4x less host work per token.
   void ple_rows_fp8(int t, uint8_t* dst) {
     auto cat = [&](int back) -> int64_t {
       int j = t - back;
@@ -1404,7 +1425,7 @@ struct GpuModel {
       int64_t mix = cat(0) * ple_mult[0] ^ (cat(1) * ple_mult[1]);
       if (h >= 8) mix ^= cat(2) * ple_mult[2];
       uint64_t row = (uint64_t)(ple_voff[h] + (int64_t)(mix % ple_vsz[h]));
-      const uint8_t* p = ple_table->data + row * 160;
+      const uint8_t* p = ple_table->data + row * g_ple_rb;
       addrs[h] = p;
       madvise((void*)(uintptr_t)((uintptr_t)p & ~4095ull), 4096, MADV_WILLNEED);
     }
@@ -1416,7 +1437,7 @@ struct GpuModel {
       return;
     }
 #endif
-    for (int h = 0; h < 16; h++) memcpy(dst + h * 160, addrs[h], 160);
+    for (int h = 0; h < 16; h++) memcpy(dst + h * g_ple_rb, addrs[h], g_ple_rb);
   }
   void ple_host(int token, float* dst) {
     chist.push_back(token);
@@ -3474,7 +3495,7 @@ struct GpuModel {
                   int64_t mix = cat(0) * ple_mult[0] ^ (cat(1) * ple_mult[1]);
                   if (h >= 8) mix ^= cat(2) * ple_mult[2];
                   uint64_t row = (uint64_t)(ple_voff[h] + (int64_t)(mix % ple_vsz[h]));
-                  ple_addrs[(size_t)t * 16 + h] = (uint64_t)(uintptr_t)(ple_table->data + row * 160);
+                  ple_addrs[(size_t)t * 16 + h] = (uint64_t)(uintptr_t)(ple_table->data + row * g_ple_rb);
                 }
               }
               ple_barrier.fetch_add(1, std::memory_order_acq_rel);
@@ -3511,7 +3532,7 @@ struct GpuModel {
                 int64_t mix = cat(0) * ple_mult[0] ^ (cat(1) * ple_mult[1]);
                 if (h >= 8) mix ^= cat(2) * ple_mult[2];
                 uint64_t row = (uint64_t)(ple_voff[h] + (int64_t)(mix % ple_vsz[h]));
-                ple_addrs[(size_t)t * 16 + h] = (uint64_t)(uintptr_t)(ple_table->data + row * 160);
+                ple_addrs[(size_t)t * 16 + h] = (uint64_t)(uintptr_t)(ple_table->data + row * g_ple_rb);
               }
             }
             uint64_t* kb = ple_keys.data() + (size_t)t0 * 16;
@@ -3529,10 +3550,10 @@ struct GpuModel {
             while (ple_barrier.load(std::memory_order_acquire) < nt)
               std::this_thread::yield();
             for (int t = t0; t < t1; t++) {
-              uint8_t* dst = ple_fp8 + (size_t)t * 2560;
+              uint8_t* dst = ple_fp8 + (size_t)t * 16 * g_ple_rb;
               const uint64_t* ap = ple_addrs.data() + (size_t)t * 16;
               for (int h = 0; h < 16; h++)
-                std::memcpy(dst + h * 160, (const void*)(uintptr_t)ap[h], 160);
+                std::memcpy(dst + h * g_ple_rb, (const void*)(uintptr_t)ap[h], g_ple_rb);
             }
             if (ple_workers.fetch_sub(1) == 1)
               ple_done = std::chrono::steady_clock::now();
@@ -3542,7 +3563,7 @@ struct GpuModel {
         for (int w = 0; w < nt; w++)
           ple_pool.emplace_back([&, w] {
             for (int t = w; t < P; t += nt)
-              ple_rows_fp8(ple_base0 + t, ple_fp8 + (size_t)t * 2560);
+              ple_rows_fp8(ple_base0 + t, ple_fp8 + (size_t)t * 16 * g_ple_rb);
             if (ple_workers.fetch_sub(1) == 1)
               ple_done = std::chrono::steady_clock::now();
           });
@@ -3591,10 +3612,16 @@ struct GpuModel {
         p_ple_wait +=
             std::chrono::duration<double, std::milli>(wait_done - wait_start).count();
       }
-      // dequant fp8 -> f32 d_eb on GPU (zero-copy read of pinned staging)
-      size_t n16 = (size_t)P * 2560 / 16;
-      k_ple_fp8_dequant<<<(unsigned)((n16 + 255) / 256), 256, 0, g_str>>>(
-          ple_eb_dev, d_eb, ple_tscale, n16);
+      // dequant staging -> f32 d_eb on GPU (zero-copy read of pinned staging)
+      if (ple_iq4) {
+        size_t nb = (size_t)P * 2560 / 32;
+        k_ple_iq4nl_dequant<<<(unsigned)((nb + 255) / 256), 256, 0, g_str>>>(
+            ple_eb_dev, d_eb, nb);
+      } else {
+        size_t n16 = (size_t)P * 2560 / 16;
+        k_ple_fp8_dequant<<<(unsigned)((n16 + 255) / 256), 256, 0, g_str>>>(
+            ple_eb_dev, d_eb, ple_tscale, n16);
+      }
       float* hc_storage = d_Rb;
       if (gr_bf16) {
         uint64_t n = (uint64_t)P * 10240;

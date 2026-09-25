@@ -77,7 +77,7 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   // 权重：Windows 下专家也进 arena（无 hipHostRegister 直读；PLE 表/配置留盘）
   for (auto& kv : ck.tensors()) {
     const Tensor& t = kv.second;
-    if (t.dtype == 10 || t.dtype == 4) continue;
+    if (t.dtype == 10 || t.dtype == 11 || t.dtype == 4) continue;
     add(t.data_size);
   }
   const bool qsa_dense = getenv("GDEC_QSA_DENSE") != nullptr;
@@ -370,9 +370,10 @@ static void gguf_experts_open() {
 // their hgn names (src/gguf_map.h: Q8_0 -> dtype 8 q8g32, F32 vectors ->
 // dtype 1) and override the hgn records, so everything downstream (arena,
 // gemv/gemm dispatch, small fp32 uploads) is unchanged. GDEC_GGUF_MTP=<mtp
-// sidecar gguf> also replaces the MTP head's non-expert tensors. Still from
-// hgn: the PLE n-gram table and the MTP routed experts. The synthetic host
-// copies of large tensors are dropped after upload (gguf_dense_release).
+// sidecar gguf> also replaces the MTP head's non-expert tensors. The PLE
+// n-gram table becomes a view of the GGUF IQ4_NL table when there is no hgn
+// base (pure GGUF start) or GDEC_GGUF_PLE=1. The synthetic host copies of
+// large tensors are dropped after upload (gguf_dense_release).
 static bool g_gguf_dense = false;
 static void gguf_dense_apply(Checkpoint& ck) {
   const char* on = getenv("GDEC_GGUF_DENSE");
@@ -405,6 +406,11 @@ static void gguf_dense_apply(Checkpoint& ck) {
     fprintf(stderr, "gguf dense: filter %s\n", f);
   }
   size_t n = gguf_map::build(ck, *g_gguf, g_gguf_mtp);
+  // PLE n-gram table: a hgn base keeps its fp8 table by default (KLD 0.0453
+  // vs 0.0511 with the GGUF's IQ4_NL one); pure GGUF / GDEC_GGUF_PLE=1 use IQ4_NL.
+  const char* pe = getenv("GDEC_GGUF_PLE");
+  const bool ple = (pe && !strcmp(pe, "1")) || !ck.find("layers.1.ple.ngram_embedding.weight");
+  if (ple) gguf_map::add_ple_table(ck, *g_gguf);
   size_t bytes = 0;
   int n8 = 0;
   for (auto& kv : ck.tensors())
@@ -415,8 +421,9 @@ static void gguf_dense_apply(Checkpoint& ck) {
   g_gguf_dense = true;
   double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   fprintf(stderr,
-          "gguf dense: %zu tensors from GGUF%s (%d q8g32, %.2f GiB synthetic, %.1f s)\n", n,
-          g_gguf_mtp ? " + MTP sidecar" : "", n8, bytes / 1073741824.0, s);
+          "gguf dense: %zu tensors from GGUF%s (%d q8g32, %.2f GiB synthetic, %.1f s)%s\n", n,
+          g_gguf_mtp ? " + MTP sidecar" : "", n8, bytes / 1073741824.0, s,
+          ple ? "; PLE table IQ4_NL" : "");
 #endif
 }
 // After GpuModel construction: free host copies of large synthetic tensors
@@ -450,7 +457,7 @@ static void load_arena(const Checkpoint& ck) {
   size_t total = 0, xbytes = 0;
   for (auto& kv : ck.tensors()) {
     const Tensor& t = kv.second;
-    if (t.dtype == 10 || t.dtype == 4) continue;  // PLE table / u64 config
+    if (t.dtype == 10 || t.dtype == 11 || t.dtype == 4) continue;  // PLE table / u64 config
     if (is_gguf_experts(t.name)) continue;  // served from GGUF
 #ifndef _WIN32
     if (is_experts(t.name)) {
@@ -481,7 +488,7 @@ static void load_arena(const Checkpoint& ck) {
   size_t off = 0;
   for (auto& kv : ck.tensors()) {
     const Tensor& t = kv.second;
-    if (t.dtype == 10 || t.dtype == 4) continue;
+    if (t.dtype == 10 || t.dtype == 11 || t.dtype == 4) continue;
     if (is_gguf_experts(t.name)) continue;
 #ifndef _WIN32
     if (is_experts(t.name)) continue;  // 已在上面登记 host 指针

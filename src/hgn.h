@@ -18,6 +18,9 @@
 //   dtype 8  q8g32 planar: [rows*cols int8 codes][rows*cols/32 fp16 scales];
 //            w[r,c] = code * scale[r*cols/32 + c/32]  (lossless GGUF Q8_0
 //            repack; every row's codes start 16B-aligned for cols%16==0)
+//   dtype 11 IQ4_NL rows (GGUF PLE n-gram table, a borrowed view of the mmap):
+//            per row cols/32 blocks of 18 B [fp16 d][16 B nibbles];
+//            w[32b+j] = d * kvalues_iq4nl[lo nibble of byte j], w[32b+16+j] = .. hi
 #pragma once
 
 #include <cmath>

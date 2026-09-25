@@ -11,8 +11,8 @@
 //   * F32 vectors    -> dtype 1 f32 (norms, conv1d, A_log, dt_bias)
 //   * BF16 indexer q_proj(512)+k_proj(128) -> one bf16 index_qk_proj(640)
 //   * PLE config KV arrays -> dtype 4 u64
-// Routed experts and the PLE n-gram table are NOT built here (experts are
-// read in place by 26_kernels_moe_gguf.inc; the table is streamed).
+// Routed experts are NOT built here (read in place by 26_kernels_moe_gguf.inc);
+// the PLE n-gram table is a borrowed view (add_ple_table, dtype 11 IQ4_NL).
 //
 // GGUF vs HF/engine transforms (semantics from gufo reference.cpp, MIT;
 // verified numerically against hgn by tools/g3_map_check.cpp):
@@ -314,6 +314,21 @@ inline size_t build(hgn::Checkpoint& ck, const gguf::File& g, const gguf::File* 
     build_layer(ck, m, bl, "mtp.layers.0", true, o);
   }
   return ck.synthetic_count() - n0;
+}
+
+// PLE n-gram table: per_layer_token_embd.weight (IQ4_NL [rows][160], same row
+// order as the hgn fp8 table) as a zero-copy dtype 11 view of the mmap; the
+// engine streams 90 B rows from it (40_model.inc ple_rows*, 10_ple_io.inc).
+inline void add_ple_table(hgn::Checkpoint& ck, const gguf::File& g) {
+  const std::string name = "layers.1.ple.ngram_embedding.weight";
+  if (g_keep && !g_keep(name)) return;
+  const gguf::Tensor& t = g.at("per_layer_token_embd.weight");
+  need(t.type == gguf::IQ4_NL && t.ne[0] == 160 && t.row_bytes() == 90,
+       "per_layer_token_embd: expected IQ4_NL [rows][160]");
+  hgn::Tensor d = desc(name, 11, {t.rows(), 160});
+  d.data = t.data;
+  d.data_size = t.nbytes;
+  ck.add_view(d);
 }
 
 // mmproj GGUF (general.architecture clip, projector qwen3vl_merger, e.g.

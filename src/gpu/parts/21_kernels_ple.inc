@@ -88,6 +88,27 @@ __global__ void k_ple_fp8_dequant(const uint8_t* __restrict__ src,
   d4[3] = make_float4(t[12], t[13], t[14], t[15]);
 }
 
+// --- PLE IQ4_NL staging dequant (GGUF table, dtype 11): raw 18 B blocks
+// [fp16 d][16 B nibbles], 5 per 160-wide row, packed 16 rows per token ->
+// f32 embeddings (block b -> dst[32b..32b+31]). Bit-exact with
+// gguf::dequant_row(IQ4_NL) (fp16->f32 exact, one f32 multiply).
+__constant__ int8_t c_kvalues_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
+                                           1,    13,   25,  38,  53,  69,  89,  113};
+__global__ void k_ple_iq4nl_dequant(const uint8_t* __restrict__ src,
+                                    float* __restrict__ dst, size_t nblk) {
+  size_t b = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= nblk) return;
+  const uint8_t* p = src + b * 18;
+  const float d = __half2float(__ushort_as_half((uint16_t)(p[0] | (p[1] << 8))));
+  float* o = dst + b * 32;
+#pragma unroll
+  for (int j = 0; j < 16; j++) {
+    const uint8_t q = p[2 + j];
+    o[j] = d * (float)c_kvalues_iq4nl[q & 0xF];
+    o[j + 16] = d * (float)c_kvalues_iq4nl[q >> 4];
+  }
+}
+
 // --- argmax over n floats -> writes int id
 __global__ void k_argmax(const float* __restrict__ x, int n, int* __restrict__ out) {
   __shared__ float bv[1024];

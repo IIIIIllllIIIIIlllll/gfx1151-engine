@@ -121,6 +121,7 @@
 #ifdef _WIN32
 #include "os_win32.h"
 #else
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>

@@ -1,9 +1,29 @@
-# GGUF 权重（hgn → GGUF 迁移，进行中）
+# GGUF 权重（hgn → GGUF 迁移）
 
 目标：引擎直接加载 llama.cpp / Unsloth 的 `Qwen3.8-Flash-Next-UD-Q4_K_XL` GGUF，用户不再需要
-维护 hgn 这类两个超大的专用权重文件。过渡期 hgn 仍然是默认路径，GGUF 通过环境变量逐步接管。
+维护 hgn 这类两个超大的专用权重文件。G3.3 起可以完全不用 hgn 启动；service.conf 的默认仍是 hgn，
+切换只需改四行配置。
 
-## 用法（混合模式，仍需 hgn）
+## 用法：纯 GGUF（G3.3，不需要任何 .hgn）
+
+service.conf 里取消 GGUF 那四行的注释（或用同名环境变量覆盖）：
+
+```bash
+GGUF_DIR="$HOME/App/llama.cpp/models/Qwen3.8-Flash-Next-UD-Q4_K_XL"
+MODEL_FILE="$GGUF_DIR/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"   # 第 1 个分片
+MTP_FILE="$GGUF_DIR/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"               # MTP sidecar
+VISION_FILE="$GGUF_DIR/mmproj-BF16.gguf"                                   # 视觉塔
+```
+
+- MODEL_FILE 以 `.gguf` 结尾时 start.sh 不传 overlay，MTP_FILE 以 `GDEC_GGUF_MTP` 传给引擎。
+- 命令行 `gdec <第 1 个分片>.gguf ...` 等价于 `GDEC_GGUF=<该分片> GDEC_GGUF_DENSE=1`，基座 Checkpoint 为空，
+  全部张量来自 GGUF；没设 `GDEC_GGUF_MTP` 时自动使用分片目录里唯一的 `mtp-*.gguf`（设成空串则不用 sidecar）。
+- PLE n-gram 表直接用 GGUF 里的 IQ4_NL（90 B/行，约 27 GiB；hgn fp8 为 160 B/行 47.7 GiB），
+  prefill 在 GPU 上解量化（`k_ple_iq4nl_dequant`），decode 在 CPU 上解量化；`PLE_URING=1` 的 io_uring 批量读
+  改为指向表所在的分片。
+- 目前只支持 Linux（`GDEC_GGUF_DENSE` 还没移植到 Windows）。
+
+## 用法：混合模式（过渡，仍需 hgn）
 
 ```bash
 D=~/App/llama.cpp/models/Qwen3.8-Flash-Next-UD-Q4_K_XL
@@ -20,9 +40,8 @@ export VISION_FILE=$D/mmproj-BF16.gguf                                   # G3.2�
 | `GDEC_GGUF_MTP=<sidecar>` | MTP 头从 Q8_0 sidecar 读：非专家张量需 `GDEC_GGUF_DENSE=1`；路由专家（Q8_0 gate/up/down）只要同时设了 `GDEC_GGUF` 就原地映射，走同一套 MoE kernel |
 | `GDEC_GGUF_MTP_EXPERTS=0` | 调试用：MTP 路由专家仍取 hgn |
 | `--vision-tower <mmproj.gguf>` | 路径以 `.gguf` 结尾时按 llama.cpp mmproj（clip / qwen3vl_merger）加载，转成与 hgn 视觉文件相同的 bf16 张量（`gguf_map::build_vision`） |
+| `GDEC_GGUF_PLE=1` | 混合模式下 PLE n-gram 表也用 GGUF 的 IQ4_NL（默认保留 hgn 的 fp8 表，KLD 更好，见下） |
 | `GDEC_GGUF_DENSE_FILTER=a,b,...` | 调试用：只有名字包含其中某个子串的张量来自 GGUF（`!` 前缀表示取反），用于二分定位 |
-
-仍然来自 hgn：PLE n-gram 表（fp8，GGUF 里是 IQ4_NL）。去掉它后才能纯 GGUF 启动（G3.3）。
 
 ## 转换规则（gguf_map.h）
 
@@ -85,11 +104,29 @@ export VISION_FILE=$D/mmproj-BF16.gguf                                   # G3.2�
   视觉塔：333 个张量与 hgn 视觉文件逐位相同；离线 `--vision-test` 前向的 35 个层 dump 逐字节相同
   （`tools/g3_vision_verify.sh`）。加载 1.2 s（hgn 1.0 s）。
 
+- **G3.3（纯 GGUF 启动）。** 和混合模式唯一的数值差别是 PLE n-gram 表：GGUF 里只有 IQ4_NL，
+  比 hgn 的 fp8 粗，KLD 0.0453 → 0.0511。此时引擎和 llama.cpp 用的是逐字节相同的权重（llama.cpp 0.049），
+  剩下的 +0.002 来自计算路径（bf16 KV 等）。表变小后 prefill 反而略快（页缓存压力小）。
+
+  | 同机，`tools/g3_pure_verify.sh` | G3.2（hgn fp8 PLE 表） | 纯 GGUF（IQ4_NL PLE 表） |
+  |---|---|---|
+  | KLD vs BF16（64×512） | 0.0453 | 0.0511 |
+  | top1 一致 | 93.25% | 92.64% |
+  | 1024 token PPL prefill / decode | 6.814 / 6.760 | 6.862 / 6.802 |
+  | pp 8K @ chunk 2048（两轮） | 1126–1155 | 1196–1206 |
+  | pp 32K @ chunk 16384 | 1388 | 1403 |
+  | decode @ 32K（tok/s） | 24.8 | 24.8 |
+  | 投机 8K γ=3 tok/s（commit/round；hgn 51.3 / 3.78） | 46（3.82） | 45.9–46.1（3.82） |
+
+  纯 GGUF 与"hgn 基座 + GGUF 全覆盖 + `GDEC_GGUF_PLE=1`"的 PPL 逐位相同，说明没有任何张量还在读 hgn。
+
 ## 验证脚本
 
 - `tools/g2_verify.sh` — G2（专家）
 - `tools/g3_verify.sh` — G3.1：KLD、decode/prefill PPL、hgn 路径逐位不变、MTP、速度
 - `tools/g3_vision_verify.sh` — G3.2 视觉塔：张量逐位对照 + 端到端前向 dump 逐字节对照
+- `tools/g3_pure_verify.sh` — G3.3 纯 GGUF：start.sh 配置、KLD、与混合启动逐位相同、decode/prefill、
+  hgn 路径逐位不变、MTP、速度
 - `tools/g3_smoke.sh [ENV=...]` — 512 token PPL 冒烟（可带过滤器等 env）
 - `tools/moe_gguf_test.cu` — MoE kernel vs CPU 参考
 - `tools/moe_gguf_gemv_test.cu` — 小 P 专家 GEMV（含去重路径逐位对照）vs CPU 参考

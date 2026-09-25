@@ -11,11 +11,16 @@
 // 热行走缓存、冷行高队列深度下 NVMe 随机读（QD=512）。
 static uint64_t g_ple_foff = 0;  // file offset of the PLE table in that file
 static bool g_ple_off_ok = false;
+// bytes per PLE row (160 codes): 160 = hgn fp8 (dtype 10), 90 = GGUF IQ4_NL
+// (dtype 11, 5 x 18 B blocks). Staging holds 16 raw rows per token back to back.
+static unsigned g_ple_rb = 160;
 
 #ifndef _WIN32
 static int g_ple_fd = -1;        // extra O_RDONLY handle on the base .hgn
 
 static void ple_uring_open(const char* path) {
+  if (g_ple_fd >= 0) close(g_ple_fd);  // re-pointed at the GGUF shard (dtype 11 table)
+  g_ple_fd = -1;
   int fd = open(path, O_RDONLY | O_CLOEXEC);
   if (fd < 0) return;
   if (posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM) != 0) {  // kill readahead
@@ -98,7 +103,7 @@ struct PleUring {
     return false;
   }
 
-  // Pump n preads of 160 B each: row i -> staging + i*160, file offset
+  // Pump n preads of g_ple_rb B each: row i -> staging + i*rb, file offset
   // g_ple_foff + (addrs[i] - table_va). Keeps the ring full; CQE order is
   // irrelevant (distinct destinations). Any failed or short read is fatal —
   // no silent mid-batch fallback onto half-written staging.
@@ -115,8 +120,8 @@ struct PleUring {
         memset(s, 0, sizeof(*s));
         s->opcode = IORING_OP_READ;
         s->fd = g_ple_fd;
-        s->addr = (uint64_t)(uintptr_t)(staging + sub * 160);
-        s->len = 160;
+        s->addr = (uint64_t)(uintptr_t)(staging + sub * g_ple_rb);
+        s->len = g_ple_rb;
         s->off = g_ple_foff + (addrs[sub] - table_va);
         s->user_data = sub;
         sq_array[idx] = idx;
@@ -135,7 +140,7 @@ struct PleUring {
       unsigned ct = __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
       for (; ch != ct; ch++) {
         const io_uring_cqe* c = &cqes[ch & *cq_mask];
-        if (c->res != 160) {
+        if (c->res != (int)g_ple_rb) {
           fprintf(stderr, "ple_uring: read for row %llu failed: res=%d (%s)\n",
                   (unsigned long long)c->user_data, c->res,
                   c->res < 0 ? strerror(-c->res) : "short read");
@@ -168,7 +173,7 @@ static bool ple_uring_ready() {
 #else  // _WIN32 ------------------------------------------------------------
 
 // IOCP 批量读：与 PleUring::run 相同语义——n 个 160B 行从文件偏移
-// g_ple_foff + (addrs[i] - table_va) 读入 staging + i*160；任何失败/短读
+// g_ple_foff + (addrs[i] - table_va) 读入 staging + i*g_ple_rb；任何失败/短读
 // 立即 fatal，不做半途回退。
 struct PleWin {
   HANDLE fh = INVALID_HANDLE_VALUE;
@@ -213,7 +218,7 @@ struct PleWin {
         uint64_t off = g_ple_foff + (addrs[sub] - table_va);
         ov->Offset = (DWORD)(off & 0xffffffffu);
         ov->OffsetHigh = (DWORD)(off >> 32);
-        BOOL r = ReadFile(fh, staging + sub * 160, 160, nullptr, ov);
+        BOOL r = ReadFile(fh, staging + sub * g_ple_rb, g_ple_rb, nullptr, ov);
         if (!r && GetLastError() != ERROR_IO_PENDING) {
           fprintf(stderr, "ple_win: ReadFile row %zu failed: %lu\n", sub,
                   GetLastError());
@@ -226,7 +231,7 @@ struct PleWin {
       OVERLAPPED* pov = nullptr;
       BOOL okr = GetQueuedCompletionStatus(iocp, &got, &key, &pov, INFINITE);
       size_t slot = (size_t)(pov - ovs.data());
-      if (!okr || got != 160) {
+      if (!okr || got != g_ple_rb) {
         fprintf(stderr,
                 "ple_win: read completion failed (row=%zu, got=%lu, err=%lu)\n",
                 pov ? rows[slot] : (size_t)-1, (unsigned long)got,

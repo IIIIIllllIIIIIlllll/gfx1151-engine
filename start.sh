@@ -47,6 +47,12 @@ for cmd in flock ss systemctl stat awk pgrep setsid; do command -v "$cmd" >/dev/
 systemctl --user show-environment >/dev/null || fail 'systemd 用户会话不可用，请通过普通用户 SSH 登录运行'
 [[ -x build/gdec && -x build/gdec-api ]] || fail '缺少编译产物，请先运行 bash build.sh'
 [[ -r "$MODEL_FILE" && -f "$MODEL_FILE" ]] || fail "找不到模型：$MODEL_FILE（修改 service.conf）"
+# GGUF 模式（MODEL_FILE 为第一个分片 *-00001-of-0000N.gguf）：不用 overlay；
+# MTP_FILE 必须是 MTP sidecar *.gguf（设为空则引擎在分片目录里自动找 mtp-*.gguf）。
+gguf=0
+[[ "$MODEL_FILE" == *.gguf ]] && gguf=1
+(( gguf )) && OVERLAY_FILE=""
+(( ! gguf )) || [[ -z "$MTP_FILE" || "$MTP_FILE" == *.gguf ]] || fail "GGUF 模式下 MTP_FILE 须为 MTP sidecar *.gguf：$MTP_FILE"
 [[ -z "$OVERLAY_FILE" || -f "$OVERLAY_FILE" && -r "$OVERLAY_FILE" ]] || fail "找不到 overlay：$OVERLAY_FILE"
 [[ -z "$MTP_FILE" || -f "$MTP_FILE" && -r "$MTP_FILE" ]] || fail "找不到 MTP 权重：$MTP_FILE（可设 MTP_FILE=\"\" 退回 overlay 内置草稿头）"
 [[ -z "$VISION_FILE" || -f "$VISION_FILE" && -r "$VISION_FILE" ]] || fail "找不到视觉塔：$VISION_FILE（纯文本可设 VISION_FILE=\"\"）"
@@ -90,9 +96,16 @@ fi
 export GDEC_PARALLEL="$PARALLEL"
 # --serve reads GDEC_SPEC_GAMMA; --gamma is for offline --spec-gen.
 export GDEC_SPEC_GAMMA="$MTP_GAMMA"
+# GGUF：引擎看到 *.gguf 基座会自己打开 GDEC_GGUF/GDEC_GGUF_DENSE；外部残留的
+# GDEC_GGUF* 一律清掉，保证 service.conf 说了算。
+unset GDEC_GGUF GDEC_GGUF_DENSE GDEC_GGUF_MTP GDEC_GGUF_MTP_EXPERTS GDEC_GGUF_PLE GDEC_GGUF_DENSE_FILTER
 engine=("$ROOT/build/gdec" "$MODEL_FILE")
 [[ -z "$OVERLAY_FILE" ]] || engine+=("$OVERLAY_FILE")
-[[ -z "$MTP_FILE" ]] || engine+=("$MTP_FILE")
+if (( gguf )); then
+  [[ -z "$MTP_FILE" ]] || export GDEC_GGUF_MTP="$MTP_FILE"
+else
+  [[ -z "$MTP_FILE" ]] || engine+=("$MTP_FILE")
+fi
 engine+=(--serve --port "$ENGINE_PORT" --maxctx "$MAX_CONTEXT")
 [[ -z "$VISION_FILE" ]] || engine+=(--vision-tower "$VISION_FILE")
 
