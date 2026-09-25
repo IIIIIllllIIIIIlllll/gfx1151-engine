@@ -262,16 +262,25 @@ static void devarena_init(const Checkpoint& ck, int maxctx) {
 // Adjacent tensors can share a page, and a page may be registered only once,
 // so page-rounded ranges are merged first. The hgn trunk experts are then
 // never registered or touched (their page cache ages out). MTP experts
-// (mtp.layers.0.mlp.experts.*) are not in the main GGUF and stay on hgn.
+// (mtp.layers.0.mlp.experts.*) are not in the main GGUF: with
+// GDEC_GGUF_MTP=<sidecar> they come from its blk.<layers>.ffn_*_exps (Q8_0,
+// same kernels; GDEC_GGUF_MTP_EXPERTS=0 keeps the hgn ones).
 struct GgExperts {
   const uint8_t *gate = nullptr, *up = nullptr, *down = nullptr;
   int tgu = 0, tdn = 0;  // gguf::Type of gate/up and of down
 };
 static gguf::File* g_gguf = nullptr;
+static gguf::File* g_gguf_mtp = nullptr;  // GDEC_GGUF_MTP sidecar
 static std::vector<GgExperts> g_ggx;  // per trunk layer; empty = hgn experts
+static GgExperts g_ggx_mtp;           // gate == nullptr: MTP experts from hgn
 static bool gg_on() { return !g_ggx.empty(); }
+static bool gg_mtp_on() { return g_ggx_mtp.gate != nullptr; }
 static bool is_trunk_experts(const std::string& n) {
   return n.compare(0, 7, "layers.") == 0 && n.find(".mlp.experts.") != std::string::npos;
+}
+static bool is_gguf_experts(const std::string& n) {
+  return (gg_on() && is_trunk_experts(n)) ||
+         (gg_mtp_on() && n.compare(0, 25, "mtp.layers.0.mlp.experts.") == 0);
 }
 
 static void gguf_experts_open() {
@@ -286,13 +295,14 @@ static void gguf_experts_open() {
   std::vector<Range> rs;
   size_t bytes = 0;
   int n_q5k = 0, n_q80 = 0;
-  for (int l = 0; l < g_cfg.layers; l++) {
+  // blk.<l>.ffn_{gate,up,down}_exps of file f -> GgExperts (+ page ranges)
+  auto take = [&](const gguf::File& f, int l, bool mtp) {
     char n[96];
     const gguf::Tensor* t[3];
     const char* nm[3] = {"gate", "up", "down"};
     for (int i = 0; i < 3; i++) {
       snprintf(n, sizeof n, "blk.%d.ffn_%s_exps.weight", l, nm[i]);
-      t[i] = &g_gguf->at(n);
+      t[i] = &f.at(n);
     }
     const uint64_t D = g_cfg.d, M = g_cfg.moe_mid, E = g_cfg.experts;
     if (t[0]->ne[0] != D || t[0]->ne[1] != M || t[0]->ne[2] != E || t[1]->type != t[0]->type ||
@@ -300,21 +310,33 @@ static void gguf_experts_open() {
         t[2]->ne[1] != D || t[2]->ne[2] != E)
       throw std::runtime_error("GDEC_GGUF: unexpected expert shapes/types at layer " +
                                std::to_string(l));
-    if (t[0]->type != gguf::Q4_K && t[0]->type != gguf::Q5_K)
+    if (t[0]->type != gguf::Q4_K && t[0]->type != gguf::Q5_K &&
+        !(mtp && t[0]->type == gguf::Q8_0))
       throw std::runtime_error(std::string("GDEC_GGUF: gate/up type ") +
                                gguf::type_name(t[0]->type) + " unsupported");
     if (t[2]->type != gguf::Q5_1 && t[2]->type != gguf::Q8_0)
       throw std::runtime_error(std::string("GDEC_GGUF: down type ") +
                                gguf::type_name(t[2]->type) + " unsupported");
-    n_q5k += t[0]->type == gguf::Q5_K;
-    n_q80 += t[2]->type == gguf::Q8_0;
-    g_ggx.push_back({t[0]->data, t[1]->data, t[2]->data, (int)t[0]->type, (int)t[2]->type});
     for (auto* x : t) {
       const uintptr_t a = (uintptr_t)x->data & ~(uintptr_t)4095;
       const uintptr_t b = ((uintptr_t)x->data + x->nbytes + 4095) & ~(uintptr_t)4095;
       rs.push_back({a, b});
       bytes += x->nbytes;
     }
+    return GgExperts{t[0]->data, t[1]->data, t[2]->data, (int)t[0]->type, (int)t[2]->type};
+  };
+  std::vector<GgExperts> trunk;
+  for (int l = 0; l < g_cfg.layers; l++) {
+    trunk.push_back(take(*g_gguf, l, false));
+    n_q5k += trunk.back().tgu == gguf::Q5_K;
+    n_q80 += trunk.back().tdn == gguf::Q8_0;
+  }
+  GgExperts mtpx;
+  const char* mp = getenv("GDEC_GGUF_MTP");
+  const char* mx = getenv("GDEC_GGUF_MTP_EXPERTS");
+  if (mp && *mp && !(mx && !strcmp(mx, "0"))) {
+    if (!g_gguf_mtp) g_gguf_mtp = new gguf::File(mp);
+    mtpx = take(*g_gguf_mtp, g_cfg.layers, true);  // the MTP block follows the trunk
   }
   std::sort(rs.begin(), rs.end(), [](const Range& x, const Range& y) { return x.a < y.a; });
   std::vector<Range> merged;
@@ -332,11 +354,14 @@ static void gguf_experts_open() {
       throw std::runtime_error(std::string("GDEC_GGUF: hipHostRegister: ") +
                                hipGetErrorString(re));
   }
+  g_ggx = std::move(trunk);
+  g_ggx_mtp = mtpx;
   double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   fprintf(stderr,
-          "gguf experts: %zu layers from %s (%.1f GiB, %zu ranges, %.1f s; "
+          "gguf experts: %zu layers from %s%s (%.1f GiB, %zu ranges, %.1f s; "
           "Q5_K gate/up %d layers, Q8_0 down %d layers)\n",
-          g_ggx.size(), path, bytes / 1073741824.0, merged.size(), s, n_q5k, n_q80);
+          g_ggx.size(), path, gg_mtp_on() ? " + MTP sidecar" : "", bytes / 1073741824.0,
+          merged.size(), s, n_q5k, n_q80);
 #endif
 }
 
@@ -348,7 +373,6 @@ static void gguf_experts_open() {
 // sidecar gguf> also replaces the MTP head's non-expert tensors. Still from
 // hgn: the PLE n-gram table and the MTP routed experts. The synthetic host
 // copies of large tensors are dropped after upload (gguf_dense_release).
-static gguf::File* g_gguf_mtp = nullptr;
 static bool g_gguf_dense = false;
 static void gguf_dense_apply(Checkpoint& ck) {
   const char* on = getenv("GDEC_GGUF_DENSE");
@@ -427,7 +451,7 @@ static void load_arena(const Checkpoint& ck) {
   for (auto& kv : ck.tensors()) {
     const Tensor& t = kv.second;
     if (t.dtype == 10 || t.dtype == 4) continue;  // PLE table / u64 config
-    if (gg_on() && is_trunk_experts(t.name)) continue;  // served from GGUF
+    if (is_gguf_experts(t.name)) continue;  // served from GGUF
 #ifndef _WIN32
     if (is_experts(t.name)) {
       hipError_t re =
@@ -458,7 +482,7 @@ static void load_arena(const Checkpoint& ck) {
   for (auto& kv : ck.tensors()) {
     const Tensor& t = kv.second;
     if (t.dtype == 10 || t.dtype == 4) continue;
-    if (gg_on() && is_trunk_experts(t.name)) continue;
+    if (is_gguf_experts(t.name)) continue;
 #ifndef _WIN32
     if (is_experts(t.name)) continue;  // 已在上面登记 host 指针
 #endif

@@ -286,6 +286,11 @@ int main(int argc, char** argv) {
       if (g_gguf_mtp)
         for (const auto& mp : g_gguf_mtp->mappings()) kvsnap::g_model_files.push_back(mp.path);
     }
+    if (gg_mtp_on()) {  // MTP routed experts from the sidecar (MTP KV differs)
+      kvsnap::g_model_files.push_back("@gguf-mtp-experts");
+      if (!g_gguf_dense)
+        for (const auto& mp : g_gguf_mtp->mappings()) kvsnap::g_model_files.push_back(mp.path);
+    }
     kvsnap::g_vision_file = vision_tower;
     return serve::run(m, port);
   }

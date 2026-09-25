@@ -6,7 +6,7 @@
 // k_moe_tiles, outputs indexed by slot.
 //
 // Weights stay in their raw llama.cpp block formats (Q4_K / Q5_K for
-// gate+up, Q5_1 / Q8_0 for down). Each stage (two 32-element K blocks) stages
+// gate+up, Q5_1 / Q8_0 for down; the MTP sidecar has Q8_0 gate+up too). Each stage (two 32-element K blocks) stages
 // the packed codes plus one (scale, bias) half2 per (row, K block) in LDS;
 // each wave then decodes only its own 16 rows to F16 right after the LDS read:
 //
@@ -91,7 +91,8 @@ __launch_bounds__(256) __global__
   constexpr bool kQ5 = kType == kQ51;
   constexpr bool kQ5Kt = kType == kQ5K;
   constexpr bool kQ8 = kType == kQ80;
-  static_assert(!kPair || kType == kQ4K || kType == kQ5K, "pair = K-quant gate/up");
+  static_assert(!kPair || kType == kQ4K || kType == kQ5K || kType == kQ80,
+                "pair = K-quant or Q8_0 gate/up");
   constexpr int kChunks = kQ8 ? 2 * BK : BK;
   constexpr int kCodeBytes = BM * kChunks * 16;
   constexpr int kHighBytes = (kQ5 || kQ5Kt) ? BK * BM * 4 : 0;
@@ -417,12 +418,14 @@ __global__ void k_moe_gg_route1(const int* __restrict__ topids, const float* __r
 static bool moe_gg_up(int type, const uint8_t* gate, const uint8_t* up, const __half* x,
                       const int* tokidx, const MoeTile* tiles, const int* ntiles, int max_tiles,
                       __half* hid, int m, int k, hipStream_t st) {
-  if (m % 64 || k % 256) return false;
+  if (m % 64 || k % (type == moegg::kQ80 ? 64 : 256)) return false;
   dim3 grid(m / 64, max_tiles);
   if (type == moegg::kQ4K)
     k_moe_gg<moegg::kQ4K, true><<<grid, 256, 0, st>>>(gate, up, x, tokidx, tiles, ntiles, nullptr, hid, m, k);
   else if (type == moegg::kQ5K)
     k_moe_gg<moegg::kQ5K, true><<<grid, 256, 0, st>>>(gate, up, x, tokidx, tiles, ntiles, nullptr, hid, m, k);
+  else if (type == moegg::kQ80)  // MTP sidecar experts
+    k_moe_gg<moegg::kQ80, true><<<grid, 256, 0, st>>>(gate, up, x, tokidx, tiles, ntiles, nullptr, hid, m, k);
   else
     return false;
   return true;
@@ -857,14 +860,17 @@ static bool moe_gg_gemv(int tgu, int tdn, const uint8_t* gate, const uint8_t* up
   if (d % 256 || mid % 32) return false;
   if (uq_meta && uq_pairs && P >= 2 && P <= moegg::kUqMaxP) {
     // expert dedup (meta/pairs scratch: kUqInts ints, P*KPT*d floats)
-    if ((tgu != moegg::kQ4K && tgu != moegg::kQ5K) || (tdn != moegg::kQ51 && tdn != moegg::kQ80))
+    if ((tgu != moegg::kQ4K && tgu != moegg::kQ5K && tgu != moegg::kQ80) ||
+        (tdn != moegg::kQ51 && tdn != moegg::kQ80))
       return false;
     k_moe_gg_uniq<<<1, 128, 0, st>>>(ids, uq_meta, P, KPT, id_stride);
     const unsigned gb = (unsigned)(((size_t)P * KPT * mid + 7) / 8);
     if (tgu == moegg::kQ4K)
       k_moe_gg_gemv_gu_uq<moegg::kQ4K><<<gb, 256, 0, st>>>(gate, up, x, uq_meta, hid, mid, d, KPT);
-    else
+    else if (tgu == moegg::kQ5K)
       k_moe_gg_gemv_gu_uq<moegg::kQ5K><<<gb, 256, 0, st>>>(gate, up, x, uq_meta, hid, mid, d, KPT);
+    else
+      k_moe_gg_gemv_gu_uq<moegg::kQ80><<<gb, 256, 0, st>>>(gate, up, x, uq_meta, hid, mid, d, KPT);
     constexpr int LPR = MOE_GG_DN_LPR, RPW = 32 / LPR;
     const unsigned db = (unsigned)(((size_t)P * KPT * ((d + RPW - 1) / RPW) + 7) / 8);
     if (tdn == moegg::kQ51)
@@ -879,6 +885,8 @@ static bool moe_gg_gemv(int tgu, int tdn, const uint8_t* gate, const uint8_t* up
     k_moe_gg_gemv_gu<moegg::kQ4K><<<gu_blocks, 256, 0, st>>>(gate, up, x, ids, hid, mid, d, KPT, id_stride, P);
   else if (tgu == moegg::kQ5K)
     k_moe_gg_gemv_gu<moegg::kQ5K><<<gu_blocks, 256, 0, st>>>(gate, up, x, ids, hid, mid, d, KPT, id_stride, P);
+  else if (tgu == moegg::kQ80)
+    k_moe_gg_gemv_gu<moegg::kQ80><<<gu_blocks, 256, 0, st>>>(gate, up, x, ids, hid, mid, d, KPT, id_stride, P);
   else
     return false;
   constexpr int LPR = MOE_GG_DN_LPR, RPW = 32 / LPR;

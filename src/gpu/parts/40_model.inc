@@ -1243,15 +1243,15 @@ struct GpuModel {
         d_moeacc, topids, d_topw, (uint64_t)g_cfg.d, dn.cols, dn.scale_stride,
         (uint64_t)g_cfg.moe_mid, k, 16 /*id_stride*/, 0 /*acc_stride*/, k);
   }
-  // GGUF routed experts of trunk layer l (gg_on()): x f32 [P][d] with top-k
+  // GGUF routed experts g (trunk layer g_ggx[l] or the MTP layer g_ggx_mtp;
+  // needs gg_on() for the scratch buffers): x f32 [P][d] with top-k
   // rows (16 wide) -> acc f32 [P][d], every element overwritten (no memset).
   // P == 1 (decode graph): sort-free per-pair tiles on private scratch.
   // P > 1: stable GPU bucketing + 64-slot tiles on the prefill workspaces
   // (F16 x in d_xbf16b, which is never cached; hid F16 in d_hidb; unweighted
   // pairs in d_guvb, dead again once the weighted reduce has run).
-  void moe_gguf(int l, const float* x, const int* topids, const float* topw, float* acc,
-                int P) {
-    const GgExperts& g = g_ggx.at(l);
+  void moe_gguf(const GgExperts& g, const float* x, const int* topids, const float* topw,
+                float* acc, int P) {
     const int k = g_cfg.topk, E = g_cfg.experts, d = g_cfg.d, mid = g_cfg.moe_mid;
     // Small P (decode, spec verify): raw-block GEMVs, FP32 hid, weighted sum in
     // expert-rank order written straight to acc (26_kernels_moe_gguf.inc).
@@ -1319,7 +1319,7 @@ struct GpuModel {
     }
 
     if (gg_on()) {
-      moe_gguf(l, x, d_topids, d_topw, d_moeacc, 1);
+      moe_gguf(g_ggx.at(l), x, d_topids, d_topw, d_moeacc, 1);
     } else {
       snprintf(buf, sizeof buf, "layers.%d.mlp.experts.gate_up_proj.weight", l);
       WView gu = wview(ckpt.at(buf));
@@ -2765,7 +2765,7 @@ struct GpuModel {
     int k = g_cfg.topk;
     k_router_topk<<<P, 512, 0, g_str>>>(d_routerb, d_topidsb, d_topwb, g_cfg.experts, k);
     if (gg_on()) {
-      moe_gguf(l, d_xb, d_topidsb, d_topwb, acc, P);
+      moe_gguf(g_ggx.at(l), d_xb, d_topidsb, d_topwb, acc, P);
       moe_b_shared(l, P, acc, direct_output);
       return;
     }
@@ -3825,20 +3825,24 @@ struct GpuModel {
     int k = g_cfg.topk;
     k_router_topk<<<1, 512, 0, g_str>>>(d_router, d_topids, d_topw, g_cfg.experts,
                                         k);
-    snprintf(buf, sizeof buf, "%s.experts.gate_up_proj.weight", pfx);
-    WView gu = wview(ckpt.at(buf));
-    snprintf(buf, sizeof buf, "%s.experts.down_proj.weight", pfx);
-    WView dn = wview(ckpt.at(buf));
-    if (!moe_down_direct(k, dn)) CK(hipMemsetAsync(d_moeacc, 0, g_cfg.d * 4, g_str));
-    const int* topids = d_topids;  // 直读:ids 即专家号,免 D2H 同步
-    uint64_t pairs = (uint64_t)k * g_cfg.moe_mid;
-    k_q4cp_gemv_gg<<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
-        gu.data + 64, gu.data + 64 + gu.rows * gu.cols / 2, (const float*)gu.data,
-        x, d_guv, topids, (uint64_t)2 * g_cfg.moe_mid, gu.cols, gu.scale_stride,
-        k, 0 /*x_stride*/, 16 /*id_stride*/, k);
-    k_silu_mul_g<<<(k * g_cfg.moe_mid + 255) / 256, 256, 0, g_str>>>(
-        d_guv, d_hid, g_cfg.moe_mid, k);
-    moe_down1(k, dn, topids);
+    if (gg_mtp_on()) {  // GGUF sidecar experts (Q8_0)
+      moe_gguf(g_ggx_mtp, x, d_topids, d_topw, d_moeacc, 1);
+    } else {
+      snprintf(buf, sizeof buf, "%s.experts.gate_up_proj.weight", pfx);
+      WView gu = wview(ckpt.at(buf));
+      snprintf(buf, sizeof buf, "%s.experts.down_proj.weight", pfx);
+      WView dn = wview(ckpt.at(buf));
+      if (!moe_down_direct(k, dn)) CK(hipMemsetAsync(d_moeacc, 0, g_cfg.d * 4, g_str));
+      const int* topids = d_topids;  // 直读:ids 即专家号,免 D2H 同步
+      uint64_t pairs = (uint64_t)k * g_cfg.moe_mid;
+      k_q4cp_gemv_gg<<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
+          gu.data + 64, gu.data + 64 + gu.rows * gu.cols / 2, (const float*)gu.data,
+          x, d_guv, topids, (uint64_t)2 * g_cfg.moe_mid, gu.cols, gu.scale_stride,
+          k, 0 /*x_stride*/, 16 /*id_stride*/, k);
+      k_silu_mul_g<<<(k * g_cfg.moe_mid + 255) / 256, 256, 0, g_str>>>(
+          d_guv, d_hid, g_cfg.moe_mid, k);
+      moe_down1(k, dn, topids);
+    }
     snprintf(buf, sizeof buf, "%s.shared_expert.gate_proj.weight", pfx);
     gemv(wview(ckpt.at(buf)), x, d_guv);
     snprintf(buf, sizeof buf, "%s.shared_expert.up_proj.weight", pfx);
@@ -4087,6 +4091,11 @@ struct GpuModel {
     int k = g_cfg.topk, E = g_cfg.experts, npairs = P * k;
     k_router_topk<<<P, 512, 0, g_str>>>(d_routerb, d_topidsb, d_topwb,
                                         g_cfg.experts, k);
+    if (gg_mtp_on()) {  // GGUF sidecar experts; overwrites d_moeaccb
+      moe_gguf(g_ggx_mtp, d_xb, d_topidsb, d_topwb, d_moeaccb, P);
+      mtp_moe_b_shared(P);
+      return;
+    }
     CK(hipMemsetAsync(d_moeaccb, 0, (size_t)P * g_cfg.d * 4, g_str));
     snprintf(buf, sizeof buf, "%s.experts.gate_up_proj.weight", pfx);
     const Tensor& gu_t = ckpt.at(buf);
@@ -4114,6 +4123,12 @@ struct GpuModel {
         (const uint16_t*)d_hidb);
     k_moe_reduce_fast<10><<<dim3((g_cfg.d + 255) / 256, P), 256, 0, g_str>>>(
         d_guvb, d_pairids, d_moeaccb, P, g_cfg.d);
+    mtp_moe_b_shared(P);
+  }
+  // shared expert + gate into d_moeaccb, then d_yb = d_moeaccb
+  void mtp_moe_b_shared(int P) {
+    const char* pfx = "mtp.layers.0.mlp";
+    char buf[128];
     snprintf(buf, sizeof buf, "%s.shared_expert.gate_proj.weight", pfx);
     gemm(wview(ckpt.at(buf)), d_xb, d_guvb, P);
     snprintf(buf, sizeof buf, "%s.shared_expert.up_proj.weight", pfx);
