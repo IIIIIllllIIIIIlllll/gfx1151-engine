@@ -83,6 +83,12 @@ static uint64_t seed_for(bool mrope, uint64_t img_hash,
     for (int v : g) h = mix64(h ^ (uint32_t)v);
   return h;
 }
+// Seed of a live-state prefix: one without image tokens is text KV (see
+// has_image_tok) and is keyed like a text request's, so it is shared.
+static uint64_t seed_of(const GpuModel& m, const int* toks, size_t n) {
+  if (!m.mrope_active_ || !has_image_tok(toks, n)) return g_fp;
+  return seed_for(true, m.img_hash_, m.mrope_grids_);
+}
 
 // ---- geometry and file layouts ----------------------------------------------
 struct Geo {
@@ -529,7 +535,7 @@ static void capture(GpuModel& m, const std::vector<int>& toks, bool mtp,
   mtp = mtp && m.kv_nl > G.nqsa && m.mtp_pos == m.pos - 1;
   const int nc = (n - 1) / KV_PAGE, nt = n - nc * KV_PAGE;
   auto e = std::make_shared<CkEnt>();
-  e->seed = seed_for(m.mrope_active_, m.img_hash_, m.mrope_grids_);
+  e->seed = seed_of(m, toks.data(), (size_t)n);
   std::vector<uint64_t> ch = chain(e->seed, toks.data(), nc);
   e->base = ch[(size_t)nc];
   e->id = ck_id(e->seed, toks.data(), (size_t)n);
@@ -642,7 +648,9 @@ static bool page_image(GpuModel& m, const Geo& G, bool mtp, int i, uint64_t key,
 // files hold yet, and hand everything to the writer. Every pending state is
 // a prefix of `hist` (cut states of this prompt), so the live KV still holds
 // their pages: KV rows and MTP rows below each checkpoint are append-only.
-static void commit(GpuModel& m, const std::vector<int>& hist, std::vector<Pending>& pend) {
+// All of `pend` shares `seed` (commit() groups them).
+static void commit_seed(GpuModel& m, const std::vector<int>& hist,
+                        std::vector<Pending>& pend, uint64_t seed) {
   if (!g_on || pend.empty() || (int)hist.size() != m.pos) {
     pend.clear();
     return;
@@ -651,7 +659,6 @@ static void commit(GpuModel& m, const std::vector<int>& hist, std::vector<Pendin
   const Geo G = geo(m);
   std::sort(pend.begin(), pend.end(),
             [](const Pending& a, const Pending& b) { return a.ck->n < b.ck->n; });
-  const uint64_t seed = seed_for(m.mrope_active_, m.img_hash_, m.mrope_grids_);
   const int np = (int)((hist.size() - 1) / KV_PAGE);
   const std::vector<uint64_t> ch = chain(seed, hist.data(), np);
   std::vector<char> need_ch((size_t)np, 0), need_mt((size_t)np, 0);
@@ -745,19 +752,45 @@ static void commit(GpuModel& m, const std::vector<int>& hist, std::vector<Pendin
   pend.clear();
 }
 
+// A vision request's state before its first image is keyed as text
+// (seed_of), later states with its image seed: one pass per seed, since the
+// page keys chain from the seed (pages below the first image may then be
+// stored under both).
+static void commit(GpuModel& m, const std::vector<int>& hist, std::vector<Pending>& pend) {
+  std::vector<Pending> img;
+  for (size_t i = 0; i < pend.size();) {
+    if (pend[i].ck->seed != g_fp) {
+      img.push_back(std::move(pend[i]));
+      pend.erase(pend.begin() + (std::ptrdiff_t)i);
+    } else {
+      i++;
+    }
+  }
+  commit_seed(m, hist, pend, g_fp);
+  commit_seed(m, hist, img, seed_for(m.mrope_active_, m.img_hash_, m.mrope_grids_));
+}
+
 // ---- restore -----------------------------------------------------------------
 // Longest published checkpoint whose tokens are a strict prefix of `prompt`
 // (strictly shorter: a full-length match has no logits to resume from).
-// The returned entry is marked busy until restore() releases it.
-static std::shared_ptr<CkEnt> match(const std::vector<int>& prompt, uint64_t seed) {
+// `seed2` (optional): a second seed to search, e.g. g_fp for the text
+// prefix of a vision prompt. The returned entry is marked busy until
+// restore() releases it.
+static std::shared_ptr<CkEnt> match(const std::vector<int>& prompt, uint64_t seed,
+                                    uint64_t seed2 = 0) {
   if (!g_on || prompt.size() < 2) return nullptr;
+  if (seed2 == seed) seed2 = 0;
   const int np = (int)((prompt.size() - 1) / KV_PAGE);
   const std::vector<uint64_t> ch = chain(seed, prompt.data(), np);
+  const std::vector<uint64_t> ch2 =
+      seed2 ? chain(seed2, prompt.data(), np) : std::vector<uint64_t>();
   std::lock_guard<std::mutex> lk(g_mtx);
   std::shared_ptr<CkEnt> best;
   for (auto& e : g_ck) {
-    if (!e->pub || e->seed != seed || (size_t)e->n >= prompt.size() ||
-        (best && e->n <= best->n) || e->nc > np || ch[(size_t)e->nc] != e->base ||
+    if (!e->pub || (e->seed != seed && (!seed2 || e->seed != seed2))) continue;
+    const std::vector<uint64_t>& c = e->seed == seed ? ch : ch2;
+    if ((size_t)e->n >= prompt.size() ||
+        (best && e->n <= best->n) || e->nc > np || c[(size_t)e->nc] != e->base ||
         !std::equal(e->tail.begin(), e->tail.end(),
                     prompt.begin() + (size_t)e->nc * KV_PAGE))
       continue;
@@ -1598,8 +1631,54 @@ static int pick_slot(const std::vector<int>& ids) {
   return best >= 0 ? best : empty >= 0 ? empty : orphan >= 0 ? orphan : lru;
 }
 
+// Admission miss diagnostic (under g_sm, before claiming `chosen`): when no
+// idle slot's live tokens are a strict prefix of the prompt, log the closest
+// one and the tokens around its first mismatch. An lcp deep inside an earlier
+// reply means the client re-tokenized history differently from what was
+// generated; a short lcp is just another conversation.
+static void log_prefix_miss(long long req, const std::vector<int>& ids, int chosen) {
+  const std::vector<int>& ch = g_slots[(size_t)chosen].hist;
+  if (!ch.empty() && ch.size() < ids.size() &&
+      std::equal(ch.begin(), ch.end(), ids.begin()))
+    return;  // live continuation
+  int best = -1;
+  size_t bl = 0;
+  for (int i = 0; i < (int)g_slots.size(); i++) {
+    const Slot& s = g_slots[(size_t)i];
+    if (s.busy || s.hist.empty()) continue;
+    size_t l = 0;
+    while (l < s.hist.size() && l < ids.size() && s.hist[l] == ids[l]) l++;
+    if (best < 0 || l > bl) {
+      best = i;
+      bl = l;
+    }
+  }
+  if (best < 0) return;
+  const std::vector<int>& h = g_slots[(size_t)best].hist;
+  std::string why;
+  if (bl < h.size() && bl < ids.size()) {
+    char b[64];
+    why = "first mismatch at " + std::to_string(bl) + ": live";
+    for (size_t k = bl; k < h.size() && k < bl + 4; k++) {
+      snprintf(b, sizeof b, " %d", h[k]);
+      why += b;
+    }
+    why += " vs prompt";
+    for (size_t k = bl; k < ids.size() && k < bl + 4; k++) {
+      snprintf(b, sizeof b, " %d", ids[k]);
+      why += b;
+    }
+  } else {  // a strict-prefix slot would have been picked
+    why = "prompt ends within the live tokens";
+  }
+  fprintf(stderr, "%s req %lld: no live prefix; closest slot %d matches %zu "
+          "of %zu live tokens (prompt %zu), %s\n", log_ts(), req, best, bl,
+          h.size(), ids.size(), why.c_str());
+}
+
 // Wait (FIFO) for an idle slot and claim it; -1 if cancelled while queued.
-static int slot_admit(const std::vector<int>& ids, const std::atomic<bool>& cancel) {
+static int slot_admit(const std::vector<int>& ids, const std::atomic<bool>& cancel,
+                      long long req) {
   std::unique_lock<std::mutex> lk(g_sm);
   const uint64_t t = g_ticket++;
   g_wait.push_back(t);
@@ -1607,6 +1686,7 @@ static int slot_admit(const std::vector<int>& ids, const std::atomic<bool>& canc
     if (g_wait.front() == t) {
       const int s = pick_slot(ids);
       if (s >= 0) {
+        log_prefix_miss(req, ids, s);
         g_wait.pop_front();
         Slot& sl = g_slots[(size_t)s];
         sl.busy = true;
@@ -1759,7 +1839,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       return;
     }
   }
-  const int s = slot_admit(g.ids, cancel);
+  const int s = slot_admit(g.ids, cancel, (long long)g.req);
   if (s < 0) {
     snprintf(db, sizeof db, "D %lld cancel 0 0 0.0 0.0\n", (long long)g.req);
     finish(db);
@@ -1823,9 +1903,20 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // positions come from the d_ropecs table (ensure_rope_cs handles
     // base=q+1 out-of-range rows with rope_delta_), and the drafter
     // paths rotate with *d_rdelta, so only acceptance rate is at stake.
+    // Only the images the live prefix holds need the same pixels (its
+    // request's grids/hash; none for a text prefix, which is text KV
+    // whatever this request's images are — see has_image_tok): a
+    // follow-up that keeps the earlier images and adds new ones continues.
+    const auto& live_g = m.mrope_grids_;
+    const bool live_imgs_same =
+        live_g.size() <= g.mrope_grids.size() &&
+        std::equal(live_g.begin(), live_g.end(), g.mrope_grids.begin()) &&
+        fnv1a_patches(vpatches, live_g.size()) == m.img_hash_;
     if (!g.mrope_grids.empty() && cont &&
-        (fnv1a_patches(vpatches) != m.img_hash_ ||
+        ((!live_imgs_same && has_image_tok(hist.data(), mcp)) ||
          getenv("GDEC_VISION_NOCONT"))) {
+      fprintf(stderr, "%s vision: req %lld: live prefix %zu not reused "
+              "(its images differ)\n", log_ts(), (long long)g.req, mcp);
       cont = false;
       n_cached = 0;
     }
@@ -1862,7 +1953,8 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       // checkpoint saved with the MTP layer in lockstep restores it too.
       const bool is_mrope = !g.mrope_grids.empty();
       const uint64_t req_ih = is_mrope ? fnv1a_patches(vpatches) : 0;
-      auto ck = kvsnap::match(g.ids, kvsnap::seed_for(is_mrope, req_ih, g.mrope_grids));
+      auto ck = kvsnap::match(g.ids, kvsnap::seed_for(is_mrope, req_ih, g.mrope_grids),
+                              kvsnap::g_fp);  // + the text prefix of a vision prompt
       bool ck_mtp = false;
       if (ck) {
         if (kvsnap::restore(m, ck, g.ids, hist, &ck_mtp)) {  // hist := its tokens

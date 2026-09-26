@@ -512,11 +512,15 @@ __global__ void k_img_inject_bf16(const uint16_t* __restrict__ emb,
 // FNV-1a over the raw patch bytes of every image in a request. Guards the
 // M-RoPE cont path: placeholder token runs are pixel-agnostic, so prefix
 // matching alone would pair a re-sent history with a DIFFERENT same-shape
-// image's cached KV.
-static uint64_t fnv1a_patches(const std::vector<std::vector<float>>& vp) {
-  if (vp.empty()) return 0;
+// image's cached KV. `count`: hash only the first `count` images (the ones a
+// cached prefix holds); 0 images hash to 0.
+static uint64_t fnv1a_patches(const std::vector<std::vector<float>>& vp,
+                              size_t count = SIZE_MAX) {
+  count = std::min(count, vp.size());
+  if (count == 0) return 0;
   uint64_t h = 14695981039346656037ull;
-  for (const auto& v : vp) {
+  for (size_t k = 0; k < count; k++) {
+    const auto& v = vp[k];
     const uint8_t* p = (const uint8_t*)v.data();
     size_t n = v.size() * sizeof(float);
     for (size_t i = 0; i < n; i++) {

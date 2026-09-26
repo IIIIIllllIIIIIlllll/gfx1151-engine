@@ -4,12 +4,14 @@
 // schemas and project-owned black-box conformance fixtures. The tokenizer and
 // chat template are verified by tools/tok_ab.py and tools/template_ab.py.
 //
-// KV reuse: text-only chat/responses requests send SNAPS hints (semantic
-// message-boundary token cuts, see compute_snap_cuts); the engine keeps RAM
-// checkpoints (rckpt) at those cuts, so edit-and-resend and multi-turn
-// retokenization wobble hit the cache instead of re-prefilling. Vision
-// requests and raw completions send no hints — the engine's `cont` strict-
-// prefix reuse and the SSD kvsnap tier still apply.
+// KV reuse: prompts reuse the exact ids of earlier requests for their
+// byte-identical prefix (TokenCache), so a history holding a generated reply
+// stays a token prefix of what the engine holds. Chat/responses requests also
+// send SNAPS hints (semantic message-boundary token cuts before the first
+// image, see compute_snap_cuts); the engine keeps RAM checkpoints (rckpt) at
+// those cuts, so edit-and-resend hits the cache instead of re-prefilling. Raw
+// completions send no hints — the engine's `cont` strict-prefix reuse and the
+// SSD kvsnap tier still apply.
 #include <atomic>
 #include <algorithm>
 #include <array>
@@ -17,6 +19,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -259,6 +262,217 @@ class Detokenizer {
     std::string pending_;
 };
 
+// ------------------------------------------------------ transcript cache ---
+// The engine reuses KV only for an exact token prefix of what it holds, but
+// generated ids are not canonical BPE (the model may write "/meta" as
+// 14+5317 where encode() gives 66862). Re-encoding a history that contains a
+// long reply therefore diverges inside the reply and the next turn re-prefills
+// everything. So every request's sent + generated ids are remembered, and a
+// prompt whose text starts with the same bytes reuses those ids; only the rest
+// is encoded. GDEC_API_TOKCACHE=<tokens> sizes the cache (0 = off).
+
+constexpr int kImagePadId = 248056, kVideoPadId = 248057;
+constexpr const char* kVisionPadSpan = "<|vision_start|><|image_pad|><|vision_end|>";
+
+bool is_pad_id(int id) { return id == kImagePadId || id == kVideoPadId; }
+
+class TokenCache {
+  public:
+    void set_capacity(size_t tokens) { cap_tokens_ = tokens; }
+    bool enabled() const { return cap_tokens_ > 0; }
+
+    // Remember what the engine saw for one request (prompt + generated ids).
+    void record(std::vector<int> ids) {
+        if (!enabled() || ids.empty() || ids.size() > cap_tokens_) return;
+        auto t = std::make_shared<Entry>();
+        t->off.reserve(ids.size() + 1);
+        const int vstart = g_tok.added_token_id("<|vision_start|>");
+        for (size_t i = 0; i < ids.size(); ++i) {
+            t->off.push_back(static_cast<uint32_t>(t->bytes.size()));
+            // The prompt text holds one <|image_pad|> per image; the ids hold
+            // pad_tokens() copies. Only the first copy of a run has bytes.
+            const bool run_cont = i > 0 && is_pad_id(ids[i]) && is_pad_id(ids[i - 1]);
+            if (is_pad_id(ids[i]) && !run_cont) {
+                t->runs.push_back({static_cast<uint32_t>(i), 0});
+            }
+            if (is_pad_id(ids[i])) {
+                t->runs.back().second++;
+                if (run_cont) continue;
+            }
+            t->bytes += g_tok.decode_bytes(std::vector<int>{ids[i]}, /*skip_special=*/false);
+        }
+        t->off.push_back(static_cast<uint32_t>(t->bytes.size()));
+        t->vstart = vstart;
+        t->ids = std::move(ids);
+        std::lock_guard<std::mutex> lk(mtx_);
+        t->used = ++clock_;
+        // A multi-turn conversation re-sends its own history: the new
+        // transcript supersedes every entry that is a prefix of it.
+        for (auto it = entries_.begin(); it != entries_.end();) {
+            const auto& e = (*it)->ids;
+            if (e.size() <= t->ids.size() && std::equal(e.begin(), e.end(), t->ids.begin())) {
+                total_ -= e.size();
+                it = entries_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        total_ += t->ids.size();
+        entries_.push_back(std::move(t));
+        while (entries_.size() > kMaxEntries || total_ > cap_tokens_) {
+            auto lru = std::min_element(entries_.begin(), entries_.end(),
+                                        [](const auto& a, const auto& b) { return a->used < b->used; });
+            total_ -= (*lru)->ids.size();
+            entries_.erase(lru);
+        }
+    }
+
+    struct Hit {
+        std::vector<int> ids;        // reused ids
+        std::vector<size_t> starts;  // their byte offsets in the text
+        size_t bytes = 0;            // text bytes they cover
+        size_t images = 0;           // image pad runs among them
+    };
+
+    // Longest reusable prefix of `text`. pad_counts = pad tokens per image of
+    // this request, in order (an image run is only reused when it matches).
+    Hit splice(const std::string& text, const std::vector<int>& pad_counts) {
+        Hit best;
+        if (!enabled()) return best;
+        std::shared_ptr<Entry> pick;
+        size_t pick_k = 0;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            for (const auto& t : entries_) {
+                const size_t k = cut(*t, text, pad_counts);
+                if (k == 0) continue;
+                const size_t b = t->off[k];
+                if (!pick || b > pick->off[pick_k] ||
+                    (b == pick->off[pick_k] && t->used > pick->used)) {
+                    pick = t;
+                    pick_k = k;
+                }
+            }
+            if (pick) pick->used = ++clock_;
+        }
+        if (!pick) return best;
+        best.ids.assign(pick->ids.begin(), pick->ids.begin() + pick_k);
+        best.starts.assign(pick->off.begin(), pick->off.begin() + pick_k);
+        best.bytes = pick->off[pick_k];
+        for (const auto& run : pick->runs)
+            if (run.first < pick_k) best.images++;
+        return best;
+    }
+
+  private:
+    struct Entry {
+        std::vector<int> ids;
+        std::string bytes;           // what the ids decode to (a pad run = one pad)
+        std::vector<uint32_t> off;   // off[i] = byte offset of ids[i]; off[n] = bytes.size()
+        std::vector<std::pair<uint32_t, uint32_t>> runs;  // image pad runs: (first id, count)
+        int vstart = -1;
+        uint64_t used = 0;
+    };
+
+    // Reusable id count of `t` for `text` (0 = none).
+    size_t cut(const Entry& t, const std::string& text, const std::vector<int>& pad_counts) const {
+        const size_t n = t.ids.size();
+        const size_t lim = std::min(t.bytes.size(), text.size());
+        const size_t same = static_cast<size_t>(
+            std::mismatch(t.bytes.begin(), t.bytes.begin() + lim, text.begin()).first -
+            t.bytes.begin());
+        // Last id boundary inside the equal bytes.
+        size_t k = static_cast<size_t>(
+            std::upper_bound(t.off.begin(), t.off.end(), static_cast<uint32_t>(same)) -
+            t.off.begin()) - 1;
+        // The whole transcript matched: the engine's `cont` resumes right at its
+        // end, so cut there (unless the text continues inside a UTF-8 char).
+        bool whole = k == n && !(same < text.size() && (uint8_t(text[same]) & 0xC0) == 0x80);
+        for (;;) {
+            // Otherwise the engine can only resume from a checkpoint below k
+            // anyway, so cut right after an added token: the rest of the text
+            // then encodes exactly as encode() would encode it in full. Never
+            // inside or right after an image placeholder (its span must stay whole).
+            if (!whole) {
+                while (k > 0 && !(g_tok.is_added_token(t.ids[k - 1]) &&
+                                  t.ids[k - 1] != t.vstart && !is_pad_id(t.ids[k - 1])))
+                    k--;
+            } else if (k > 0 && (t.ids[k - 1] == t.vstart || is_pad_id(t.ids[k - 1]))) {
+                whole = false;
+                k--;
+                continue;
+            }
+            // Every image run inside the prefix must match this request's image.
+            size_t bad = SIZE_MAX;
+            for (size_t j = 0; j < t.runs.size() && t.runs[j].first < k; ++j) {
+                if (j >= pad_counts.size() ||
+                    static_cast<int>(t.runs[j].second) != pad_counts[j]) {
+                    bad = t.runs[j].first;
+                    break;
+                }
+            }
+            if (bad == SIZE_MAX) return k;
+            whole = false;
+            k = bad;  // before the pad; the loop steps back past <|vision_start|>
+        }
+    }
+
+    static constexpr size_t kMaxEntries = 64;
+    std::mutex mtx_;
+    std::vector<std::shared_ptr<Entry>> entries_;
+    size_t total_ = 0;
+    size_t cap_tokens_ = 4u << 20;
+    uint64_t clock_ = 0;
+};
+
+TokenCache g_tcache;
+
+// Encode a rendered prompt, reusing the transcript cache for its prefix.
+// frames == nullptr: raw text (no image expansion, like encode()). starts
+// receives each id's byte offset in `text`.
+bool encode_spliced(const std::string& text, const std::vector<vision::Frame>* frames,
+                    std::vector<int>* ids, std::vector<size_t>* starts, std::string* error) {
+    std::vector<int> pad_counts;
+    if (frames)
+        for (const auto& f : *frames) pad_counts.push_back(f.pad_tokens());
+    TokenCache::Hit hit = g_tcache.splice(text, pad_counts);
+    // The reused text must hold exactly the images the reused ids hold.
+    if (hit.bytes > 0) {
+        size_t spans = 0;
+        const std::string head = text.substr(0, hit.bytes);
+        for (size_t at = 0; (at = head.find(kVisionPadSpan, at)) != std::string::npos;
+             at += std::strlen(kVisionPadSpan))
+            spans++;
+        if (spans != hit.images || (!frames && hit.images > 0)) hit = TokenCache::Hit{};
+    }
+    const std::string tail_text = text.substr(hit.bytes);
+    std::vector<int> tail;
+    std::vector<size_t> tail_starts;
+    if (frames) {
+        std::vector<vision::Frame> rest;
+        for (size_t i = hit.images; i < frames->size(); ++i) {
+            vision::Frame f;
+            f.grid = (*frames)[i].grid;
+            rest.push_back(f);
+        }
+        if (!vision::encode_prompt(tail_text, g_tok, rest, &tail, error, &tail_starts))
+            return false;
+    } else {
+        for (const auto& s : g_tok.encode_with_offsets(tail_text)) {
+            tail.push_back(s.id);
+            tail_starts.push_back(s.start);
+        }
+    }
+    if (!hit.ids.empty())
+        fprintf(stderr, "tcache: reused %zu ids (%zu of %zu bytes), encoded %zu\n",
+                hit.ids.size(), hit.bytes, text.size(), tail.size());
+    *ids = std::move(hit.ids);
+    ids->insert(ids->end(), tail.begin(), tail.end());
+    *starts = std::move(hit.starts);
+    for (size_t s : tail_starts) starts->push_back(s + hit.bytes);
+    return true;
+}
+
 // ------------------------------------------------------------ generation ---
 
 struct GenSpec {
@@ -413,6 +627,12 @@ GenOutcome run_generation(GenSpec& spec,
         return emit(detok.push(tok));
     }, wait_callback);
     out.ttft_ms = ttft;
+    if (r.transport_ok && r.reason != "error") {
+        // Before the response ends, so a client's next turn always sees it.
+        std::vector<int> seen = spec.ids;
+        seen.insert(seen.end(), r.tokens.begin(), r.tokens.end());
+        g_tcache.record(std::move(seen));
+    }
 
     if (!r.transport_ok) {
         if (r.timed_out) http::fail(504, "engine timed out while generating", "server_error", "server_error");
@@ -1309,11 +1529,13 @@ void handle_completions(const http::Request& q, http::Response* r, http::Stream*
     GenSpec spec;
     if (body.contains("prompt")) {
         const json& p = body["prompt"];
-        if (p.is_string()) spec.ids = g_tok.encode(p.get<std::string>());
-        else if (p.is_array() && !p.empty() && p[0].is_string())
-            spec.ids = g_tok.encode(p[0].get<std::string>());
-        else
-            http::fail(400, kEngineRejected);
+        const json* text = p.is_string() ? &p
+                           : (p.is_array() && !p.empty() && p[0].is_string()) ? &p[0]
+                                                                               : nullptr;
+        if (text == nullptr) http::fail(400, kEngineRejected);
+        std::vector<size_t> starts;
+        std::string err;
+        encode_spliced(text->get_ref<const std::string&>(), nullptr, &spec.ids, &starts, &err);
     } else {
         http::fail(400, kEngineRejected);  // an empty prompt is an engine rejection
     }
@@ -1488,12 +1710,15 @@ class ThinkSplitter {
 // before its closing tag). The engine keeps cheap RAM checkpoints at these
 // cuts, which is what makes edit-and-resend and multi-turn retokenization
 // wobble hit the cache instead of re-prefilling. A cut is only sent when its
-// character boundary is an exact token start in the final encoding, so every
-// hint is a real token boundary of this prompt.
+// character boundary is an exact token start in the final ids (`starts` =
+// each id's byte offset in `text`), so every hint is a real token boundary of
+// this prompt. Cuts stop at the first image: a prefix without image tokens is
+// the same KV for text and vision requests, one past it is not.
 std::vector<long long> compute_snap_cuts(const json& messages,
                                          chat_template::Options opts,
                                          const std::string& text,
-                                         size_t n_ids) {
+                                         const std::vector<int>& ids,
+                                         const std::vector<size_t>& starts) {
     std::vector<size_t> cut_chars;
     opts.add_generation_prompt = nullptr;  // prefix renders stop at message ends
     for (size_t k = 1; k < messages.size(); k++) {
@@ -1521,12 +1746,12 @@ std::vector<long long> compute_snap_cuts(const json& messages,
                     cut_chars.end());
     std::vector<long long> cuts;
     if (cut_chars.empty()) return cuts;
-    const std::vector<gdec::TokenSpan> spans = g_tok.encode_with_offsets(text);
+    const size_t n_text = static_cast<size_t>(
+        std::find_if(ids.begin(), ids.end(), is_pad_id) - ids.begin());
     size_t ti = 0;
     for (size_t cc : cut_chars) {
-        while (ti < spans.size() && spans[ti].start < cc) ti++;
-        if (ti < spans.size() && spans[ti].start == cc && ti > 0 && ti < n_ids)
-            cuts.push_back((long long)ti);
+        while (ti < n_text && starts[ti] < cc) ti++;
+        if (ti < n_text && starts[ti] == cc && ti > 0) cuts.push_back((long long)ti);
     }
     if (cuts.size() > 8) cuts.erase(cuts.begin(), cuts.end() - 8);
     return cuts;
@@ -1572,17 +1797,15 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
     rr.text += tool_setup.choice.prompt_suffix(thinking_enabled);
 
     GenSpec spec;
-    if (!vision::encode_prompt(rr.text, g_tok, frames, &spec.ids, &normalize_error))
+    std::vector<size_t> starts;
+    if (!encode_spliced(rr.text, &frames, &spec.ids, &starts, &normalize_error))
         http::fail(400, normalize_error);
     for (auto& frame : frames) {
         spec.mrope_grids.push_back(frame.grid);
         spec.patches.push_back(std::move(frame.patches));
     }
     if (spec.ids.empty()) http::fail(400, kEngineRejected);
-    // Text-only: offsets across image pads are not meaningful, so vision
-    // requests go without hints (plain `cont` reuse still applies).
-    if (frames.empty())
-        spec.snaps = compute_snap_cuts(messages, opts, rr.text, spec.ids.size());
+    spec.snaps = compute_snap_cuts(messages, opts, rr.text, spec.ids, starts);
     apply_sampling(body, &spec);
 
     const bool stream = bool_field(body, "stream", false) && st != nullptr;
@@ -1770,17 +1993,15 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
     rr.text += tool_setup.choice.prompt_suffix(thinking_enabled);
 
     GenSpec spec;
-    if (!vision::encode_prompt(rr.text, g_tok, frames, &spec.ids, &vision_error))
+    std::vector<size_t> starts;
+    if (!encode_spliced(rr.text, &frames, &spec.ids, &starts, &vision_error))
         http::fail(400, vision_error);
     for (auto& frame : frames) {
         spec.mrope_grids.push_back(frame.grid);
         spec.patches.push_back(std::move(frame.patches));
     }
     if (spec.ids.empty()) http::fail(400, kEngineRejected);
-    // Text-only: offsets across image pads are not meaningful, so vision
-    // requests go without hints (plain `cont` reuse still applies).
-    if (frames.empty())
-        spec.snaps = compute_snap_cuts(messages, opts, rr.text, spec.ids.size());
+    spec.snaps = compute_snap_cuts(messages, opts, rr.text, spec.ids, starts);
     apply_sampling(body, &spec);
 
     const std::string id = make_id("resp_");
@@ -2131,6 +2352,8 @@ int main(int argc, char** argv) {
     }
     // Environment, not argv: keeps the key out of `ps`.
     if (const char* k = std::getenv("GDEC_API_ADMIN_KEY")) g_cfg.admin_key = k;
+    if (const char* t = std::getenv("GDEC_API_TOKCACHE"))
+        g_tcache.set_capacity(std::strtoull(t, nullptr, 10));
     load_overrides();
 
     std::string err;

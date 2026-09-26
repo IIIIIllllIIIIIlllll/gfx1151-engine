@@ -89,6 +89,9 @@ class Tokenizer {
     // Look up an added token's id by literal content; -1 if not found.
     int added_token_id(const std::string& content) const;
     bool is_special_token(int id) const;
+    // Any added token (special or not). encode() splits on these before BPE,
+    // so the text after one encodes independently of the text before it.
+    bool is_added_token(int id) const { return added_special_.count(id) != 0; }
     int vocab_size() const { return static_cast<int>(id_to_token_.size()); }
     int eos_token_id() const { return eos_id_; }   // <|im_end|>
     int pad_token_id() const { return pad_id_; }   // <|endoftext|>

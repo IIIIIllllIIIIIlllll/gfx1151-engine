@@ -19,6 +19,17 @@
 // h_{pos-1}, d_miraw, mtp_pos); restoring it keeps speculation available
 // (the cont boundary step pairs d_R with the first new token).
 
+// Image placeholder ids present? A prefix without them is plain text KV:
+// set_mrope gives the text before the first image positions {p,p,p}, which
+// ensure_rope_cs turns into exactly the plain-RoPE table, so such a prefix
+// is reusable by text and vision requests alike, whatever the images.
+template <class T>
+static bool has_image_tok(const T* t, size_t n) {
+  for (size_t i = 0; i < n; i++)
+    if (t[i] == 248056 || t[i] == 248057) return true;
+  return false;
+}
+
 namespace rckpt {
 
 struct Ck {
@@ -30,7 +41,9 @@ struct Ck {
   int mtp_pos = 0;
   std::vector<float> mR, miraw;  // d_R (h_{pos-1}), d_miraw
   // M-RoPE guard (KVS2 meta semantics): placeholder ids are pixel-agnostic,
-  // so a vision checkpoint only matches the same grids and patch hash.
+  // so a vision checkpoint only matches the same grids and patch hash. A
+  // checkpoint without image tokens is saved as text (mrope false) and
+  // matches any request.
   bool mrope = false;
   int rope_delta = 0;
   uint64_t img_hash = 0;
@@ -155,10 +168,12 @@ void save(GpuModel& m, const std::vector<int>& toks, bool mtp = false) {
     }
     ck.mtp_pos = m.mtp_pos;
   }
-  ck.mrope = m.mrope_active_;
-  ck.rope_delta = m.rope_delta_;
-  ck.img_hash = m.img_hash_;
-  ck.grids = m.mrope_grids_;
+  if (m.mrope_active_ && has_image_tok(ck.toks.data(), ck.toks.size())) {
+    ck.mrope = true;
+    ck.rope_delta = m.rope_delta_;
+    ck.img_hash = m.img_hash_;
+    ck.grids = m.mrope_grids_;
+  }
   prune(m.chist);
   if (g_pin) ck.pages = m.kv_pin(m.pos);
   g_list.push_back(std::move(ck));
@@ -179,8 +194,8 @@ int match(const std::vector<int>& prompt, const std::vector<int64_t>& chist,
     const Ck& ck = g_list[i];
     const size_t n = ck.toks.size();
     if (n >= prompt.size() || n <= bestn) continue;
-    if (ck.mrope != req_mrope) continue;
-    if (ck.mrope && (ck.grids != *req_grids || ck.img_hash != req_img_hash))
+    if (ck.mrope && (!req_mrope || ck.grids != *req_grids ||
+                     ck.img_hash != req_img_hash))
       continue;
     if (!std::equal(ck.toks.begin(), ck.toks.end(), prompt.begin())) continue;
     best = (int)i;

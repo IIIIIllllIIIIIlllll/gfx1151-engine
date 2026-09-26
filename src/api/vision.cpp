@@ -516,7 +516,7 @@ bool prepare_messages(const json& messages, std::vector<Frame>* frames,
 
 bool encode_prompt(const std::string& prompt, const gdec::Tokenizer& tokenizer,
                    const std::vector<Frame>& frames, std::vector<int>* ids,
-                   std::string* error) {
+                   std::string* error, std::vector<size_t>* starts) {
     std::vector<size_t> pad_offsets;
     size_t at = 0;
     const size_t pad_in_span = std::string("<|vision_start|>").size();
@@ -531,15 +531,18 @@ bool encode_prompt(const std::string& prompt, const gdec::Tokenizer& tokenizer,
 
     const std::vector<gdec::TokenSpan> spans = tokenizer.encode_with_offsets(prompt);
     ids->clear();
+    if (starts) starts->clear();
     size_t image_index = 0;
     for (const auto& token : spans) {
         if (image_index < pad_offsets.size() && token.id == kImageToken &&
             token.start == pad_offsets[image_index]) {
             const int count = frames[image_index].pad_tokens();
             ids->insert(ids->end(), static_cast<size_t>(count), kImageToken);
+            if (starts) starts->insert(starts->end(), static_cast<size_t>(count), token.start);
             ++image_index;
         } else {
             ids->push_back(token.id);
+            if (starts) starts->push_back(token.start);
         }
     }
     if (image_index != frames.size()) {

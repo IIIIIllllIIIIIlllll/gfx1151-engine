@@ -32,8 +32,11 @@ bool prepare_messages(const json& messages, std::vector<Frame>* frames,
                       std::string* error);
 
 // Expand only image-pad tokens inside complete vision placeholder spans.
+// `starts` (optional) receives each id's byte offset in `prompt` (the copies
+// of an expanded pad share the pad's offset). Only frames[i].pad_tokens() is
+// read, so the frames may carry grids without patches.
 bool encode_prompt(const std::string& prompt, const gdec::Tokenizer& tokenizer,
                    const std::vector<Frame>& frames, std::vector<int>* ids,
-                   std::string* error);
+                   std::string* error, std::vector<size_t>* starts = nullptr);
 
 }  // namespace vision
