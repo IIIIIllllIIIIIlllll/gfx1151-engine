@@ -2,27 +2,44 @@
 """flashnext2hgn.py — convert a Qwen3.8-Flash-Next (qwen4_exp) HF safetensors
 model into the .hgn checkpoint format consumed by gdec (gfx1151).
 
-Self-contained: stdlib + numpy only (no torch, no safetensors).
+Self-contained: stdlib + numpy only (no torch, no safetensors); uses the
+sibling modules q4cp_imat.py and (for GGUF imatrix files) gguf_mini.py.
 
 Usage:
-  flashnext2hgn.py MODEL_DIR --out OUTDIR [--name NAME]
-                 [--skip-vision] [--skip-ple] [--skip-mtp-sidecar]
+  flashnext2hgn.py MODEL_DIR --out OUTDIR [--name NAME] [--imatrix FILE]
+                 [--jobs N] [--skip-overlay | --only-overlay] [--overlay-skip S]
+                 [--expert-codebook universal|trained]
+                 [--skip-vision] [--skip-ple] [--skip-mtp-sidecar] [--classic]
   flashnext2hgn.py --quant-selftest
 
 Outputs (into OUTDIR):
   <name>.hgn          base checkpoint (q4cp linears, bf16 norms, fp8 PLE table)
+  <name>.overlay.hgn  8-bit dense overlay (q8g32 attention/GDN/HC/shared
+                      expert/lm_head/embed); load it after the base
   <name>-mtp.hgn      MTP sidecar (q8g64 linears; optional at engine launch)
   <name>-vision.hgn   vision tower (all bf16; optional --vision-tower arg)
   tokenizer/          tokenizer files copied from MODEL_DIR
+  start.sh            engine + API launcher: gdec base overlay mtp ...
 
 Only this exact architecture shape is supported (the engine hardcodes it):
 48 layers (GDN + every-4th QSA), hidden 2560, 512 experts, 24 heads,
 vocab 248320, MTP 1 layer, vision depth 27. config.json is validated.
 
-Quantization is data-free RTN: q4cp uses a per-tensor 16-level Lloyd codebook
-in group-absmax-normalized space (groups of 32 columns, fp16 scales);
-q8g64 is per-64-column affine uint8; the PLE table is fp8 e4m3 with one
-global scale. No calibration data is needed.
+Quantization (default, "HQ"; see HGN-HQ.md):
+  routed experts  q4cp (groups of 32 columns, fp16 scales): the scale of
+                  every group is searched to minimize the weighted error,
+                  weights = imatrix * sqrt(sigma^2 + x^2) with --imatrix,
+                  else x^2 (tools/q4cp_imat.py); codebook = the fixed
+                  universal expert codebook (UNIVERSAL_EXPERT_CB), or with
+                  --expert-codebook trained one trained per tensor for the
+                  weighted error (weighted Lloyd + alternating scale search /
+                  least-squares refit on a 1M-value sample)
+  dense           q8g32 in the overlay (llama.cpp Q8_0 math); the base keeps
+                  a q4cp copy so it still runs without the overlay
+  MTP sidecar     q8g64 per-64-column affine uint8
+  PLE table       fp8 e4m3 with one global scale
+--classic is the original data-free converter (absmax q4cp everywhere, no
+overlay), bit-identical to earlier releases.
 
 Layout reference (must match src/hgn.h):
   header 104B: magic "HGN1" | u32 version | u32 count | u32 reserved |
@@ -38,15 +55,21 @@ import json
 import math
 import mmap
 import os
+import re
 import shutil
 import struct
 import sys
 import time
+import zlib
 
 import numpy as np
 
-DT_BF16, DT_I64, DT_Q4CP, DT_Q8G64, DT_FP8 = 0, 4, 5, 7, 10
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import q4cp_imat  # noqa: E402  (weighted q4cp group quantizer, numpy only)
+
+DT_BF16, DT_I64, DT_Q4CP, DT_Q8G64, DT_Q8G32, DT_FP8 = 0, 4, 5, 7, 8, 10
 HDR, REC = 104, 160
+DONTNEED = getattr(os, "POSIX_FADV_DONTNEED", None)
 
 # ----------------------------------------------------------------------------
 # safetensors reading (zero-copy over mmap)
@@ -138,19 +161,30 @@ def q4cp_size(rows, cols):
     return 64 + rows * cols // 2 + rows * stride, stride
 
 
+def q4cp_codebook(w, rng):
+    """Per-tensor 16-entry codebook: Lloyd on a group-absmax-normalized row
+    subsample. w: [R, C] float32, or uint16 raw bf16 (same values, no full
+    f32 copy). Consumes rng exactly like quant_q4cp always did."""
+    R, C = w.shape
+    n_rows = min(R, max(1, (1 << 21) // C))
+    ridx = rng.choice(R, size=n_rows, replace=False) if n_rows < R else np.arange(R)
+    sub = w[ridx]
+    if sub.dtype == np.uint16:
+        sub = (sub.astype(np.uint32) << 16).view(np.float32)
+    sub = sub.reshape(-1, 32)
+    am = np.abs(sub).max(axis=1, keepdims=True)
+    xn = (sub / np.where(am == 0, 1.0, am)).ravel()
+    return lloyd_codebook_normalized(xn[:: max(1, xn.size // (1 << 21))])
+
+
 def quant_q4cp(w, rng):
-    """w: float32 [R, C], C%32==0 -> (blob bytes, max_rel_err_sample)."""
+    """w: float32 [R, C], C%32==0 -> blob bytes (data-free RTN: scale =
+    group absmax, nearest code)."""
     R, C = w.shape
     assert C % 32 == 0
     G = C // 32
     blob_size, stride = q4cp_size(R, C)
-    # codebook from a normalized row subsample
-    n_rows = min(R, max(1, (1 << 21) // C))
-    ridx = rng.choice(R, size=n_rows, replace=False) if n_rows < R else np.arange(R)
-    sub = w[ridx].reshape(-1, 32)
-    am = np.abs(sub).max(axis=1, keepdims=True)
-    xn = (sub / np.where(am == 0, 1.0, am)).ravel()
-    cb = lloyd_codebook_normalized(xn[:: max(1, xn.size // (1 << 21))])
+    cb = q4cp_codebook(w, rng)
     codes = np.empty((R, C // 2), np.uint8)
     scales = np.zeros((R, stride), np.uint8)
     rows_chunk = max(1, (1 << 24) // C)  # ~64MB f32 per chunk
@@ -199,6 +233,39 @@ def quant_q8g64(w):
         sm = np.stack([sc16, mn16], axis=2)  # [r, G, 2] fp16
         out[r0:r1, C:] = sm.view(np.uint8).reshape(r1 - r0, G * 4)
     return out.tobytes()
+
+
+def q8g32_size(rows, cols):
+    return rows * cols + rows * cols // 32 * 2
+
+
+def quant_q8g32(w):
+    """w float32 [R, C], C%32==0 -> planar blob [R*C int8][R*C/32 fp16]
+    (llama.cpp Q8_0 math: d = amax/127, q = roundf(x/d))."""
+    R, C = w.shape
+    assert C % 32 == 0
+    codes = np.empty((R, C), np.int8)
+    scales = np.empty((R, C // 32), np.float16)
+    rows_chunk = max(1, (1 << 24) // C)
+    for r0 in range(0, R, rows_chunk):
+        r1 = min(R, r0 + rows_chunk)
+        g = w[r0:r1].reshape(-1, 32)
+        d = np.abs(g).max(axis=1) / 127.0
+        idv = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0).astype(np.float32)
+        q = np.rint(g * idv[:, None])
+        # np.rint rounds half to even; roundf rounds exact .5 ties away from zero
+        frac = g * idv[:, None]
+        tie = np.abs(frac - np.trunc(frac)) == 0.5
+        q = np.where(tie, np.trunc(frac) + np.sign(frac), q)
+        codes[r0:r1] = np.clip(q, -127, 127).astype(np.int8).reshape(r1 - r0, C)
+        scales[r0:r1] = d.astype(np.float16).reshape(r1 - r0, C // 32)
+    return codes.tobytes() + scales.tobytes()
+
+
+def dequant_q8g32(blob, R, C):
+    q = np.frombuffer(blob, np.int8, R * C).reshape(R, C // 32, 32).astype(np.float32)
+    s = np.frombuffer(blob, np.float16, R * C // 32, R * C).astype(np.float32)
+    return (q * s.reshape(R, C // 32, 1)).reshape(R, C)
 
 
 # fp8 e4m3: magnitude codes 0x00..0x7E are ascending (0x7F = nan, unused).
@@ -337,6 +404,255 @@ def base_dtype(mapped):
     return DT_Q4CP
 
 
+# routed experts (trunk layers.N and the MTP layer): [512, rows, cols]
+EXP_RE = re.compile(
+    r"^(mtp\.)?layers\.(\d+)\.mlp\.experts\.(gate_up_proj|down_proj)\.weight$")
+
+# overlay: few-row matrices that stay bf16 (the engine runs them in bf16 on
+# the GGUF path too); everything else in the overlay is q8g32
+OVL_BF16 = (
+    "linear_attn.in_proj_a.weight",
+    "linear_attn.in_proj_b.weight",
+    "mlp.shared_expert_gate.weight",
+    "block_inject_weight.weight",
+    "indexer.index_qk_proj.weight",
+)
+
+
+def overlay_names(base_names, skip=()):
+    """Overlay = every q4cp base tensor that is not a routed expert and not
+    mtp.* (the MTP sidecar covers those): attention/GDN/HC/shared expert/
+    lm_head, plus embed_tokens last (order as tools/hgn_hq.py --embed).
+    Names containing a `skip` substring are left out (they stay 4-bit from
+    the base)."""
+    ns = [m for m in base_names
+          if base_dtype(m) == DT_Q4CP and not m.startswith("mtp.")
+          and not EXP_RE.match(m) and not any(s in m for s in skip)]
+    emb = "embed_tokens.weight"
+    return sorted(n for n in ns if n != emb) + ([emb] if emb in ns else [])
+
+
+# ----------------------------------------------------------------------------
+# imatrix (llama.cpp): GGUF (*.gguf / imatrix_unsloth.gguf_file) or legacy .dat
+# ----------------------------------------------------------------------------
+
+
+class Imatrix:
+    """Per-expert mean squared input activation, [E, C] per expert tensor."""
+
+    def __init__(self, path):
+        self.path = path
+        with open(path, "rb") as f:
+            magic = f.read(4)
+        if magic == b"GGUF":
+            from gguf_mini import GGUF
+            self.g = GGUF(path)
+            self.leg = None
+        else:
+            self.g = None
+            self.leg = self._legacy(path)
+
+    @staticmethod
+    def _legacy(path):
+        buf = open(path, "rb").read()
+        p = 0
+
+        def i32():
+            nonlocal p
+            v = struct.unpack_from("<i", buf, p)[0]
+            p += 4
+            return v
+
+        n = i32()
+        if not 0 < n < 100000:
+            raise SystemExit(f"{path}: neither GGUF nor a legacy imatrix.dat")
+        out = {}
+        for _ in range(n):
+            ln = i32()
+            name = buf[p:p + ln].decode("utf-8", "replace")
+            p += ln
+            ncall, nval = i32(), i32()
+            out[name] = (ncall, np.frombuffer(buf, np.float32, nval, p))
+            p += 4 * nval
+        return out
+
+    def has(self, name):
+        if self.g is not None:
+            return name + ".in_sum2" in self.g.tensors
+        return name in self.leg
+
+    def experts(self, layer, kind, E, C):
+        """kind 'gate' (gate_up input) or 'down'. None if the imatrix has no
+        entry (e.g. the MTP layer) -> caller falls back to x^2 weighting.
+        Experts never routed during calibration get the layer mean."""
+        cands = ("gate", "up") if kind == "gate" else ("down",)
+        name = next((f"blk.{layer}.ffn_{k}_exps.weight" for k in cands
+                     if self.has(f"blk.{layer}.ffn_{k}_exps.weight")), None)
+        if name is None:
+            return None
+        if self.g is not None:
+            s = self.g.array(name + ".in_sum2").astype(np.float32).reshape(-1)
+            c = self.g.array(name + ".counts").astype(np.float32).reshape(-1)
+            if s.size != E * C or c.size != E:
+                raise SystemExit(f"imatrix {name}: {s.size}/{c.size} values, "
+                                 f"expected {E}x{C}")
+            v = s.reshape(E, C) / np.maximum(c, 1)[:, None]
+            good = c > 0
+        else:
+            ncall, vals = self.leg[name]
+            if vals.size != E * C:
+                raise SystemExit(f"imatrix {name}: {vals.size} values, expected {E}x{C}")
+            v = vals.reshape(E, C) / max(ncall, 1)
+            good = np.isfinite(v).all(axis=1) & (v.sum(axis=1) > 0)
+        if not good.any():
+            return None
+        v = v.copy()
+        if not good.all():
+            v[~good] = v[good].mean(axis=0)
+        return np.ascontiguousarray(v, np.float32)
+
+
+# ----------------------------------------------------------------------------
+# weighted q4cp for routed experts (multiprocessing, one task = a few experts)
+# ----------------------------------------------------------------------------
+
+_WST = {}
+
+CB_SAMPLE = 1 << 20  # values used to train an expert codebook
+CB_ROUNDS = 8
+
+# Default routed-expert codebook ("universal"): the shared shape of the
+# production w4b.hgn expert codebooks (98 tensors, per-entry std <= 0.004),
+# symmetrized and normalized to max|cb| = 1. With the weighted scale search
+# it gives KLD 0.0558 vs 0.0587 for per-tensor trained codebooks and 0.0615
+# for the classic Lloyd codebook (HGN-HQ.md), although the trained ones have
+# lower imatrix-weighted error: that proxy does not rank codebooks reliably.
+_UCB_HALF = (0.042080, 0.128362, 0.220943, 0.324402, 0.444132, 0.587296, 0.765293, 1.0)
+UNIVERSAL_EXPERT_CB = np.array([-x for x in _UCB_HALF[::-1]] + list(_UCB_HALF), "<f4")
+
+
+def _cb_weights(g, qw):
+    """Per-value weights quant_groups minimizes (imatrix*sqrt(s2+x^2), or x^2)."""
+    g2 = g * g
+    if qw is None:
+        return g2
+    return qw * np.sqrt(2.0 * g2.mean(axis=1, keepdims=True) + g2)
+
+
+def _cb_werr(g, qw, wt, cb):
+    nib, s16 = q4cp_imat.quant_groups(g, qw, cb)
+    d = q4cp_imat.dequant(nib, s16, cb)
+    return float((wt * (d - g) ** 2).sum())
+
+
+def train_expert_codebook(u16, R, C, iv, cb0, seed):
+    """Data-weighted 16-entry codebook for a routed-expert tensor.
+
+    u16: raw bf16 [E*R, C]; iv: [E, C] imatrix or None (-> x^2 weights);
+    cb0: the classic codebook (kept if training does not beat it).
+    Weighted Lloyd on absmax-normalized values (quantile init), then
+    CB_ROUNDS rounds alternating quant_groups (scale search) with a weighted
+    least-squares codebook refit; normalized so max|cb| = 1. Uses its own
+    rng (seed), so the converter's main rng stream is untouched.
+    Returns (cb, err_classic, err_trained) on the sample."""
+    rs = np.random.default_rng(seed)
+    n = min(u16.shape[0], max(1, CB_SAMPLE // C))
+    rows = np.sort(rs.choice(u16.shape[0], size=n, replace=False))
+    g = (u16[rows].astype(np.uint32) << 16).view(np.float32).reshape(-1, 32)
+    qw = None
+    if iv is not None:
+        qw = np.ascontiguousarray(iv[rows // R], np.float32).reshape(-1, 32)
+    wt = _cb_weights(g, qw)
+    # weighted Lloyd in the absmax-normalized domain (error scales with am^2)
+    am = np.abs(g).max(axis=1, keepdims=True)
+    am = np.where(am == 0, 1.0, am)
+    x = (g / am).ravel().astype(np.float64)
+    w = (wt * am * am).ravel().astype(np.float64)
+    cb = np.quantile(x, (np.arange(16) + 0.5) / 16)
+    for _ in range(200):
+        a = np.searchsorted((cb[:-1] + cb[1:]) * 0.5, x)
+        s = np.bincount(a, weights=x * w, minlength=16)
+        c = np.bincount(a, weights=w, minlength=16)
+        new = np.where(c > 0, s / np.where(c > 0, c, 1.0), cb)
+        done = np.abs(new - cb).max() < 1e-6
+        cb = new
+        if done:
+            break
+    del x, w
+    cb = np.sort(cb)
+    cb = (cb / np.abs(cb).max()).astype(np.float32)
+    # alternate: scale search with this codebook, then LS codebook refit
+    for _ in range(CB_ROUNDS):
+        nib, s16 = q4cp_imat.quant_groups(g, qw, cb)
+        sc = s16.astype(np.float32)[:, None]
+        num = np.bincount(nib.ravel(), weights=(wt * sc * g).ravel(), minlength=16)
+        den = np.bincount(nib.ravel(), weights=(wt * sc * sc).ravel(), minlength=16)
+        cb = np.where(den > 0, num / np.where(den > 0, den, 1.0), cb)
+        cb = np.sort(cb)
+        cb = (cb / np.abs(cb).max()).astype(np.float32)
+    e0 = _cb_werr(g, qw, wt, cb0)
+    e1 = _cb_werr(g, qw, wt, cb)
+    if not (np.isfinite(cb).all() and np.all(np.diff(cb) > 0) and e1 < e0):
+        return cb0, e0, e0
+    return cb.astype("<f4"), e0, e1
+
+
+def _qjob(args):
+    """Worker: experts e0..e1 of one [E, R, C] bf16 tensor -> (codes, scales)."""
+    path, src, e0, e1, R, C, cb, iv = args
+    st = _WST.get(path)
+    if st is None:
+        st = _WST[path] = STFile(path)
+    u16 = np.frombuffer(st.raw(src)[2], np.uint16)
+    codes, scales = [], []
+    for k, e in enumerate(range(e0, e1)):
+        w = (u16[e * R * C:(e + 1) * R * C].astype(np.uint32) << 16).view(np.float32)
+        qw = None
+        if iv is not None:
+            qw = np.broadcast_to(iv[k].reshape(1, C), (R, C)).reshape(-1, 32)
+        nib, s16 = q4cp_imat.quant_groups(w.reshape(-1, 32), qw, cb)
+        c, s = q4cp_imat.pack(nib, s16, R, C)
+        codes.append(c)
+        scales.append(s)
+    if DONTNEED is not None:
+        a = st.base + st.hdr[src]["data_offsets"][0]
+        os.posix_fadvise(st.fd, a + e0 * R * C * 2, (e1 - e0) * R * C * 2, DONTNEED)
+    return b"".join(codes), b"".join(scales)
+
+
+def expert_spot_check(st, src, out_path, off, E, R, C, iv, ref_cb=None):
+    """Weighted rel. error of experts 0 and E-1 read back from the output
+    vs the data-free absmax quantizer with ref_cb (the classic codebook,
+    i.e. what --classic writes; default: the written codebook). Returns
+    (absmax_err, written_err); written must be lower."""
+    u16 = np.frombuffer(st.raw(src)[2], np.uint16)
+    stride = ((C // 32 * 2) + 15) & ~15
+    res = [0.0, 0.0]
+    with open(out_path, "rb") as f:
+        f.seek(off)
+        cb = np.frombuffer(f.read(64), np.float32).copy()
+        for e in (0, E - 1):
+            x = (u16[e * R * C:(e + 1) * R * C].astype(np.uint32) << 16).view(
+                np.float32).reshape(R, C)
+            qw = (iv[e].reshape(1, C) if iv is not None else x * x)
+            f.seek(off + 64 + e * R * C // 2)
+            cd = np.frombuffer(f.read(R * C // 2), np.uint8).reshape(R, C // 2)
+            f.seek(off + 64 + E * R * C // 2 + e * R * stride)
+            sc = np.frombuffer(f.read(R * stride), np.uint8).reshape(R, stride)
+            sc = sc[:, : C // 32 * 2].copy().view(np.float16).astype(np.float32)
+            nib = np.empty((R, C), np.uint8)
+            nib[:, 0::2] = cd & 15
+            nib[:, 1::2] = cd >> 4
+            dw = (cb[nib].reshape(R, C // 32, 32) * sc[:, :, None]).reshape(R, C)
+            rc = cb if ref_cb is None else ref_cb
+            nn, a16 = q4cp_imat.naive_groups(x.reshape(-1, 32), rc)
+            dn = q4cp_imat.dequant(nn, a16, rc).reshape(R, C)
+            den = float((x * x * qw).sum()) or 1.0
+            res[0] += float(((dn - x) ** 2 * qw).sum()) / den
+            res[1] += float(((dw - x) ** 2 * qw).sum()) / den
+    return res[0] / 2, res[1] / 2
+
+
 # ----------------------------------------------------------------------------
 # hgn writer
 # ----------------------------------------------------------------------------
@@ -397,6 +713,27 @@ class HgnWriter:
             self.f.write(b"\0" * pad)
         self._cur += 1
 
+    def write_stream(self, parts):
+        """Like write(), but the blob comes as an iterable of byte chunks."""
+        name, _, _, size = self.entries[self._cur]
+        n = 0
+        for p in parts:
+            self.f.write(p)
+            n += len(p)
+        assert n == size, f"{name}: streamed {n} != planned {size}"
+        pad = (-size) % 64
+        if pad:
+            self.f.write(b"\0" * pad)
+        self._cur += 1
+
+    def drop_cache(self):
+        """Flush and drop the written pages from the page cache (keeps a
+        100+ GiB conversion from filling RAM; bytes unchanged)."""
+        self.f.flush()
+        if DONTNEED is not None:
+            os.fdatasync(self.f.fileno())
+            os.posix_fadvise(self.f.fileno(), 0, 0, DONTNEED)
+
     def finish(self):
         assert self._cur == len(self.entries)
         self.f.close()
@@ -411,7 +748,8 @@ def human(n):
     return f"{n / 2**30:.2f} GiB"
 
 
-def write_start_script(outdir, name, has_mtp, has_vision, engine_dir):
+def write_start_script(outdir, name, has_mtp, has_vision, engine_dir,
+                       has_overlay=False):
     """Emit a self-contained start.sh next to the converted model."""
     def pick(*cands):
         for c in cands:
@@ -463,6 +801,8 @@ export GDEC_SPEC_GAMMA="$GAMMA"
 
 engine_cmd=("$ENGINE" "$HERE/{name}.hgn")
 """
+    if has_overlay:
+        script += f'engine_cmd+=("$HERE/{name}.overlay.hgn")\n'
     if has_mtp:
         script += f'engine_cmd+=("$HERE/{name}-mtp.hgn")\n'
     script += 'engine_cmd+=(--serve --port "$ENGINE_PORT" --maxctx "$MAXCTX")\n'
@@ -513,9 +853,77 @@ wait -n "$engine_pid" "$api_pid"
     return path
 
 
+def drop_src(st, src):
+    """Drop a source tensor's pages from the page cache (bytes unchanged)."""
+    if DONTNEED is not None:
+        _, _, (a, b) = st.meta(src)
+        os.posix_fadvise(st.fd, st.base + a, b - a, DONTNEED)
+
+
+def write_overlay(path, model_name, base_src, skip=(), check=25):
+    """8-bit dense overlay: q8g32 (dtype 8) for every overlay_names() tensor,
+    bf16 for the OVL_BF16 few-row ones. Byte-identical (after the header
+    name) to tools/hgn_hq.py --embed on the same safetensors."""
+    names = overlay_names(base_src, skip)
+    tmp = path + ".part"
+    w = HgnWriter(tmp, model_name)
+    kinds = []
+    for n in names:
+        _st, sdt, shape, _src = base_src[n]
+        if sdt != "BF16":
+            raise SystemExit(f"overlay {n}: source dtype {sdt}, expected BF16")
+        R, C = int(np.prod(shape[:-1])), shape[-1]
+        if any(n.endswith(s) for s in OVL_BF16):
+            kinds.append("bf16")
+            w.plan(n, DT_BF16, shape, R * C * 2)
+        else:
+            if C % 32:
+                raise SystemExit(f"overlay {n}: cols {C} not a multiple of 32")
+            kinds.append("q8")
+            w.plan(n, DT_Q8G32, shape, q8g32_size(R, C))
+    w.begin()
+    worst = (0.0, "")
+    t0 = time.time()
+    for i, (n, k) in enumerate(zip(names, kinds)):
+        st, _sdt, shape, src = base_src[n]
+        R, C = int(np.prod(shape[:-1])), shape[-1]
+        if k == "bf16":
+            w.write(bytes(st.raw(src)[2]))
+        else:
+            x = st.f32(src).reshape(R, C)
+            blob = quant_q8g32(x)
+            if check and i % check == 0:
+                ref = x.astype(np.float64)
+                e = np.linalg.norm(dequant_q8g32(blob, R, C) - ref) / (np.linalg.norm(ref) or 1.0)
+                worst = max(worst, (float(e), n))
+            w.write(blob)
+            del x, blob
+        drop_src(st, src)
+        if (i + 1) % 100 == 0 or i + 1 == len(names):
+            print(f"  overlay [{i + 1}/{len(names)}] {time.time() - t0:.0f}s", flush=True)
+    w.finish()
+    if worst[0] > 1e-2:
+        raise SystemExit(f"FAIL: overlay q8g32 rel-L2 {worst[0]:.2e} on {worst[1]}")
+    os.replace(tmp, path)
+    print(f"wrote {path} ({human(os.path.getsize(path))}; {kinds.count('q8')} q8g32 + "
+          f"{kinds.count('bf16')} bf16; worst sampled q8 rel-L2 {worst[0]:.1e})", flush=True)
+
+
 def convert(model_dir, outdir, name, skip_vision, skip_ple, skip_mtp_sidecar,
-            dry_run=False, engine_dir=None):
+            dry_run=False, engine_dir=None, classic=False, imatrix=None, jobs=1,
+            overlay=True, only_overlay=False, overlay_skip=(), per_job=4,
+            expert_cb="universal"):
+    """classic=True reproduces the original data-free converter bit for bit
+    (absmax q4cp experts, no overlay). Otherwise (HQ, default): routed
+    experts get weighted q4cp (imatrix if given, else x^2 weighting) with
+    the universal expert codebook (expert_cb="trained": per-tensor trained;
+    all other codebooks as classic), and
+    <name>.overlay.hgn holds the dense weights in 8-bit."""
     t_start = time.time()
+    hq = not classic
+    if classic and (imatrix or only_overlay):
+        raise SystemExit("--classic cannot be combined with --imatrix/--only-overlay")
+    overlay = overlay and hq
     cfg = json.load(open(os.path.join(model_dir, "config.json")))
     check_config(cfg)
     print(f"scanning {model_dir} ...", flush=True)
@@ -550,6 +958,38 @@ def convert(model_dir, outdir, name, skip_vision, skip_ple, skip_mtp_sidecar,
               "table (engine falls back to ple=off)")
 
     rng = np.random.default_rng(0x5EED)
+    ovl_path = os.path.join(outdir, f"{name}.overlay.hgn")
+
+    imat = None
+    if hq:
+        n_exp = sum(1 for m in base_src if EXP_RE.match(m))
+        if imatrix:
+            imat = Imatrix(imatrix)
+            miss = sorted({int(EXP_RE.match(m).group(2)) for m in base_src
+                           if EXP_RE.match(m) and not EXP_RE.match(m).group(1)
+                           and not imat.has(f"blk.{EXP_RE.match(m).group(2)}.ffn_"
+                                            f"{'down' if 'down_proj' in m else 'gate'}_exps.weight")})
+            if miss:
+                raise SystemExit(f"imatrix {imatrix} has no expert entries for layers {miss}")
+            print(f"HQ mode: {n_exp} expert tensors, imatrix-weighted q4cp "
+                  f"({'GGUF' if imat.g is not None else 'legacy .dat'} imatrix; MTP "
+                  f"layer uses x^2 weighting unless the imatrix has blk.48)", flush=True)
+        else:
+            print(f"HQ mode: {n_exp} expert tensors, x^2-weighted q4cp (no imatrix)",
+                  flush=True)
+        if overlay:
+            nov = overlay_names(base_src, overlay_skip)
+            print(f"  overlay: {len(nov)} dense tensors -> 8-bit {ovl_path}", flush=True)
+    else:
+        print("classic mode: data-free absmax q4cp, no overlay", flush=True)
+
+    if only_overlay:
+        if dry_run:
+            return
+        write_overlay(ovl_path, f"{name}.overlay", base_src, overlay_skip)
+        print(f"done in {(time.time() - t_start) / 60:.1f} min; launch with "
+              f"<base>.hgn {ovl_path} [<mtp>.hgn]")
+        return
 
     # ---- base file ----
     base_path = os.path.join(outdir, f"{name}.hgn")
@@ -585,31 +1025,110 @@ def convert(model_dir, outdir, name, skip_vision, skip_ple, skip_mtp_sidecar,
         print(f"  mtp sidecar: {n_q8} q8g64 tensors planned")
         print(f"  vision: {len(vis_src)} tensors (bf16)")
         return
+    pool = None
+    if hq and jobs > 1:
+        import multiprocessing as mp
+        pool = mp.Pool(jobs)
     w.begin()
     total_bytes = sum(e[3] for e in w.entries)
     done_bytes = 0
+    bad = []
+    n_layers = EXPECTED_CONFIG["num_hidden_layers"]
     for i, m in enumerate(order):
         st, sdt, shape, src = base_src[m]
         dt = base_dtype(m)
         t0 = time.time()
+        size = w.entries[i][3]
+        tag = f"dt{dt}"
+        mt = EXP_RE.match(m) if hq else None
         if dt == DT_BF16 or dt == DT_I64:
             want = "BF16" if dt == DT_BF16 else "I64"
             if sdt != want:
                 raise SystemExit(f"{m}: expected {want} source, got {sdt}")
-            blob = bytes(st.raw(src)[2])
+            w.write(bytes(st.raw(src)[2]))
+        elif mt:
+            # weighted q4cp, streamed. The classic codebook is still drawn
+            # (keeps the main rng stream, so dense codebooks match --classic),
+            # then replaced by a codebook trained on the same weighting.
+            if sdt != "BF16" or len(shape) != 3:
+                raise SystemExit(f"{m}: expected a BF16 [E, R, C] expert tensor")
+            E, R, C = shape
+            layer = n_layers if mt.group(1) else int(mt.group(2))
+            kind = "gate" if mt.group(3) == "gate_up_proj" else "down"
+            iv = imat.experts(layer, kind, E, C) if imat is not None else None
+            u16 = np.frombuffer(st.raw(src)[2], np.uint16).reshape(E * R, C)
+            cb_classic = q4cp_codebook(u16, rng).astype("<f4")
+            if expert_cb == "trained":
+                tc = time.time()
+                cb, ce0, ce1 = train_expert_codebook(u16, R, C, iv, cb_classic,
+                                                     seed=zlib.crc32(m.encode()))
+                print(f"    codebook {m}: sample w-err {ce0:.4e} -> {ce1:.4e} "
+                      f"(x{ce0 / max(ce1, 1e-30):.3f}, {time.time() - tc:.1f}s)", flush=True)
+            else:
+                cb = UNIVERSAL_EXPERT_CB
+            del u16
+            if not (np.diff(cb) >= 0).all():
+                raise SystemExit(f"{m}: codebook not sorted")
+            tl = [(st.path, src, e, min(E, e + per_job), R, C, cb,
+                   None if iv is None else iv[e:e + per_job])
+                  for e in range(0, E, per_job)]
+            it = pool.imap(_qjob, tl) if pool is not None else map(_qjob, tl)
+
+            def parts(it=it, cb=cb):
+                yield cb.tobytes()
+                sc = []
+                for c, s in it:
+                    yield c
+                    sc.append(s)
+                yield from sc
+
+            w.write_stream(parts())
+            w.drop_cache()
+            tag = "q4i+imat" if iv is not None else "q4i x^2"
+            if layer in (0, n_layers // 2, n_layers - 1, n_layers):
+                # pass/fail: the scale search must beat absmax with the same
+                # codebook (trained: the classic codebook it replaced). The
+                # universal codebook is tuned for real heavy-tailed experts, so
+                # vs-classic is informational only (weighted error misranks
+                # codebooks; see UNIVERSAL_EXPERT_CB).
+                ref = cb_classic if expert_cb == "trained" else None
+                eo, en = expert_spot_check(st, src, base_path, w.offs[i], E, R, C, iv,
+                                           ref_cb=ref)
+                extra = ""
+                if ref is None:
+                    ec, _ = expert_spot_check(st, src, base_path, w.offs[i], E, R, C, iv,
+                                              ref_cb=cb_classic)
+                    extra = f"; classic file {ec:.3e}"
+                print(f"    check {m}: weighted err absmax {eo:.3e} -> {en:.3e} "
+                      f"(x{eo / max(en, 1e-30):.2f}{extra})", flush=True)
+                if not en < eo:
+                    bad.append(m)
         else:
-            blob = quant_q4cp(st.f32(src).reshape(-1, shape[-1]), rng)
-        w.write(blob)
-        done_bytes += len(blob)
+            w.write(quant_q4cp(st.f32(src).reshape(-1, shape[-1]), rng))
+        if size > (256 << 20):
+            w.drop_cache()
+            drop_src(st, src)
+        done_bytes += size
         el = time.time() - t0
-        print(f"  base [{i + 1}/{len(order)}] {m} {shape} dt{dt} "
-              f"{human(len(blob))} in {el:.1f}s "
-              f"({100 * done_bytes / total_bytes:.0f}%)", flush=True)
-        del blob
+        if mt or size > (64 << 20) or i % 100 == 0 or not hq:
+            eta = (time.time() - t_start) / done_bytes * (total_bytes - done_bytes) / 60
+            print(f"  base [{i + 1}/{len(order)}] {m} {shape} {tag} "
+                  f"{human(size)} in {el:.1f}s "
+                  f"({100 * done_bytes / total_bytes:.0f}%, eta {eta:.0f} min)", flush=True)
+    if pool is not None:
+        pool.close()
+        pool.join()
     if ple_shards:
         write_ple(w, ple_shards)
+        w.drop_cache()
     w.finish()
+    if bad:
+        raise SystemExit(f"FAIL: weighted expert error did not improve on {bad}")
     print(f"wrote {base_path} ({human(os.path.getsize(base_path))})", flush=True)
+
+    # ---- 8-bit dense overlay ----
+    if overlay:
+        write_overlay(ovl_path, f"{name}.overlay", base_src, overlay_skip)
 
     # ---- MTP sidecar ----
     if mtp_src and not skip_mtp_sidecar:
@@ -677,7 +1196,8 @@ def convert(model_dir, outdir, name, skip_vision, skip_ple, skip_mtp_sidecar,
                                   os.pardir, "build")
     sp = write_start_script(outdir, name,
                             bool(mtp_src) and not skip_mtp_sidecar,
-                            bool(vis_src) and not skip_vision, engine_dir)
+                            bool(vis_src) and not skip_vision, engine_dir,
+                            has_overlay=overlay)
     print(f"\ndone in {el / 60:.1f} min. Start the service with:")
     print(f"  bash {sp}")
 
@@ -693,6 +1213,7 @@ def write_ple(w, ple_shards):
         x = st.f32(src)
         absmax = max(absmax, float(np.abs(x).max()))
         del x
+        drop_src(st, src)
         if (s + 1) % 16 == 0:
             print(f"    absmax {s + 1}/128 ({time.time() - t0:.0f}s)",
                   flush=True)
@@ -710,6 +1231,7 @@ def write_ple(w, ple_shards):
             x = st.f32(src)
             f.write(fp8_encode(x, scale).tobytes())
             del x
+            drop_src(st, src)
             if (s + 1) % 16 == 0:
                 print(f"    quantize {s + 1}/128 ({time.time() - t0:.0f}s)",
                       flush=True)
@@ -795,6 +1317,28 @@ def main():
     ap.add_argument("--start-script-only", action="store_true",
                     help="only (re)write OUTDIR/start.sh for an existing "
                          "conversion; no model work")
+    ap.add_argument("--imatrix", metavar="FILE",
+                    help="llama.cpp imatrix (GGUF, e.g. imatrix_unsloth.gguf_file, "
+                         "or legacy imatrix.dat) to weight the routed-expert "
+                         "quantization; without it x^2 weighting is used")
+    ap.add_argument("--classic", action="store_true",
+                    help="original data-free converter, bit-identical output "
+                         "(absmax q4cp experts, no 8-bit overlay)")
+    ap.add_argument("--expert-codebook", choices=("universal", "trained"), default="universal",
+                    help="routed-expert q4cp codebook: universal (default, best KLD) or "
+                         "trained per tensor on the weighted error")
+    ap.add_argument("--skip-overlay", action="store_true",
+                    help="do not write <name>.overlay.hgn (8-bit dense weights)")
+    ap.add_argument("--only-overlay", action="store_true",
+                    help="only write <name>.overlay.hgn (~1 min; pairs with an "
+                         "existing base)")
+    ap.add_argument("--overlay-skip", default="", metavar="SUB1,SUB2",
+                    help="leave overlay tensors whose name contains one of these "
+                         "out (they stay 4-bit from the base), e.g. lm_head")
+    ap.add_argument("--jobs", type=int,
+                    default=max(1, min(32, (os.cpu_count() or 4) - 4)),
+                    help="worker processes for the expert quantization "
+                         "(default: min(32, cores-4); ~0.7 GiB RAM each)")
     a = ap.parse_args()
     if a.quant_selftest:
         quant_selftest()
@@ -809,13 +1353,20 @@ def main():
             a.out, name,
             os.path.exists(os.path.join(a.out, f"{name}-mtp.hgn")),
             os.path.exists(os.path.join(a.out, f"{name}-vision.hgn")),
-            engine_dir)
+            engine_dir,
+            has_overlay=os.path.exists(os.path.join(a.out, f"{name}.overlay.hgn")))
         print(f"wrote {sp} — run: bash {sp}")
         return
+    if a.imatrix and not os.path.isfile(a.imatrix):
+        ap.error(f"--imatrix {a.imatrix}: no such file")
     if not a.dry_run:
         os.makedirs(a.out, exist_ok=True)
     convert(a.model_dir, a.out, name, a.skip_vision, a.skip_ple,
-            a.skip_mtp_sidecar, a.dry_run, a.engine_bin)
+            a.skip_mtp_sidecar, a.dry_run, a.engine_bin,
+            classic=a.classic, imatrix=a.imatrix, jobs=a.jobs,
+            overlay=not a.skip_overlay, only_overlay=a.only_overlay,
+            overlay_skip=tuple(s for s in a.overlay_skip.split(",") if s),
+            expert_cb=a.expert_codebook)
 
 
 if __name__ == "__main__":

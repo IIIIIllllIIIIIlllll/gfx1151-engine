@@ -36,18 +36,11 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from flashnext2hgn import (  # noqa: E402
-    DT_BF16, HDR, REC, HgnWriter, check_config, human, map_lm_name, scan_model_dir)
+    DT_BF16, DT_Q8G32, HDR, REC, HgnWriter, check_config, dequant_q8g32, human,
+    map_lm_name, quant_q8g32, scan_model_dir)
+from flashnext2hgn import OVL_BF16 as BF16_SMALL  # noqa: E402
 
 import json  # noqa: E402
-
-DT_Q8G32 = 8
-BF16_SMALL = (
-    "linear_attn.in_proj_a.weight",
-    "linear_attn.in_proj_b.weight",
-    "mlp.shared_expert_gate.weight",
-    "block_inject_weight.weight",
-    "indexer.index_qk_proj.weight",
-)
 
 
 def read_hgn(path):
@@ -69,34 +62,6 @@ def read_hgn(path):
             off, size, _x = struct.unpack_from("<QQQ", r, 136)
             out[name] = (dt, tuple(dims), off, size)
     return out
-
-
-def quant_q8g32(w):
-    """w float32 [R, C], C%32==0 -> planar blob (codes, then fp16 scales)."""
-    R, C = w.shape
-    assert C % 32 == 0
-    codes = np.empty((R, C), np.int8)
-    scales = np.empty((R, C // 32), np.float16)
-    rows_chunk = max(1, (1 << 24) // C)
-    for r0 in range(0, R, rows_chunk):
-        r1 = min(R, r0 + rows_chunk)
-        g = w[r0:r1].reshape(-1, 32)
-        d = np.abs(g).max(axis=1) / 127.0
-        idv = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0).astype(np.float32)
-        q = np.rint(g * idv[:, None])  # roundf: ties away from zero
-        # np.rint rounds half to even; match roundf for exact .5 ties
-        frac = g * idv[:, None]
-        tie = np.abs(frac - np.trunc(frac)) == 0.5
-        q = np.where(tie, np.trunc(frac) + np.sign(frac), q)
-        codes[r0:r1] = np.clip(q, -127, 127).astype(np.int8).reshape(r1 - r0, C)
-        scales[r0:r1] = d.astype(np.float16).reshape(r1 - r0, C // 32)
-    return codes.tobytes() + scales.tobytes()
-
-
-def dequant_q8g32(blob, R, C):
-    q = np.frombuffer(blob, np.int8, R * C).reshape(R, C // 32, 32).astype(np.float32)
-    s = np.frombuffer(blob, np.float16, R * C // 32, R * C).astype(np.float32)
-    return (q * s.reshape(R, C // 32, 1)).reshape(R, C)
 
 
 def dequant_q4cp(blob, R, C):

@@ -10,6 +10,7 @@
 #     SPEC=N [GAMMA=3]        改用 MTP 投机生成 --spec-gen N（看 MTP 接受率）
 #     OVERLAY=<file>|none     替换/去掉生产 overlay（第 2 个权重参数）
 #     MODEL=<file>            替换主模型（第 1 个权重参数）
+#     MTP=<file>              替换 MTP 草稿 overlay（最后一个权重参数，需 ≥3 个）
 # 长度简写从 data/ppbench/tok<N>.txt 或 ~/ppbench/tok<N>.txt 找。
 # 输出：logs/<标签>.log；打印 phase / prefill / prof 行与总耗时。
 set -uo pipefail
@@ -44,6 +45,8 @@ if [[ -n "${OVERLAY:-}" && ${#WARGS[@]} -ge 2 ]]; then
   else WARGS[1]=$OVERLAY; fi
 fi
 [[ -n "${MODEL:-}" ]] && WARGS[0]=$MODEL
+# MTP=<file> 替换最后一个权重参数（8-bit MTP 草稿 overlay）
+[[ -n "${MTP:-}" && ${#WARGS[@]} -ge 3 ]] && WARGS[-1]=$MTP
 
 for e in $(compgen -e | grep '^GDEC_'); do unset "$e"; done
 for e in "${PENV[@]}" GDEC_PROF=1 GDEC_PHASE=1 "$@"; do export "$e"; done
