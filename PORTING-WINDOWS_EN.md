@@ -41,7 +41,23 @@ Verification matrix (all PASS):
 > KLD and decode are unchanged (see the "hgn 路由专家也走 WMMA" section in [GGUF.md](GGUF.md)). With it on,
 > `GDEC_MOE_LT=1` has no effect and its dequant/gather buffers (~0.4 GiB at chunk 8192, ~0.8 GiB at 16384)
 > are not allocated; the arena estimate shrinks accordingly. So Windows stays on hgn (~11 GiB less memory
-> than GGUF). Not yet measured on Windows.
+> than GGUF).
+>
+> **Measured on Windows (2026-09-26, heretic.hgn, same env as the start_win.sh production
+> config)**: the kernel works but the gain is markedly smaller than on Linux. 32K @ chunk 16384
+> (maxctx 40960) A/B: warm chunk 1068.3 tok/s vs 1002.8 tok/s with `GDEC_MOE_Q4W=0` (layer time
+> 13.42 s vs 14.60 s, ple phase unchanged) — only **+6.5%** overall, ~1.2 s saved per 16K chunk,
+> about 60% of the Linux absolute gain (~1.7 s per 16K chunk). Presumably WDDM kernel-launch
+> overhead eats part of it (the LUT path launches many small per-expert-group kernels); not yet
+> confirmed with a kernel-level trace. 128K @ chunk 8192 (maxctx 139264): 16 chunks declining
+> gently from 1015.8 to 938.4 tok/s, **~1000 tok/s average**, no cliff; the per-chunk decline
+> comes from PLE on-demand reads growing with prefix length (ple_wait rises chunk over chunk
+> in prof), which is expected.
+>
+> **Update 2026-09-26 (high-quality hgn)**: the new 8-bit dense overlay + imatrix routed-expert
+> base (same hgn format, see [HGN-HQ.md](HGN-HQ.md)) brings KLD down from 0.163 to GGUF levels;
+> weight arena +2.2 GiB, estimated ~93.2 GiB at 256K / chunk 8192 (cap 95). Only the files need
+> swapping (`MODEL_FILE` / `OVERLAY_FILE`). Not yet measured on Windows.
 
 Key implementation points (differences relative to the Linux version):
 

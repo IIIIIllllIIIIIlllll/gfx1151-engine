@@ -35,7 +35,20 @@ OpenAI 接口）。Git Bash 下 `start_win.sh` 与 Linux `start.sh` 并列。
 > pp8K @ chunk 2048 816 → 1215 tok/s、pp32K @ chunk 16384 1237 → 1422，KLD 不变、decode 不变
 > （详见 [GGUF.md](GGUF.md) "hgn 路由专家也走 WMMA"）。开启后 `GDEC_MOE_LT=1` 不再生效，
 > 它的 dequant/gather 缓冲（chunk 8192 约 0.4 GiB，16384 约 0.8 GiB）不再分配，arena 估算同步变小。
-> 因此 Windows 继续用 hgn（显存比 GGUF 少约 11 GiB），不需要换 GGUF。Windows 上尚未实测。
+> 因此 Windows 继续用 hgn（显存比 GGUF 少约 11 GiB），不需要换 GGUF。
+>
+> **Windows 实测（2026-09-26，heretic.hgn，env 与 start_win.sh 生产配置一致）**：kernel 生效但
+> 收益明显小于 Linux。32K @ chunk 16384（maxctx 40960）A/B：暖 chunk 1068.3 tok/s vs
+> `GDEC_MOE_Q4W=0` 的 1002.8 tok/s（层时间 13.42 s vs 14.60 s，ple 阶段持平），整机仅
+> **+6.5%**，绝对收益 ~1.2 s/16K chunk，约为 Linux（~1.7 s/16K chunk）的六成。疑似 WDDM
+> kernel launch 开销吃掉了部分收益（LUT 路径按专家组发射大量小 kernel），未做 kernel 级
+> trace 实锤。128K @ chunk 8192（maxctx 139264）：16 个 chunk 从 1015.8 缓降到 938.4 tok/s、
+> 全程平均 **~1000 tok/s**，无衰减断崖；逐 chunk 缓降来自 PLE 按需读随前缀变长
+> （prof 的 ple_wait 逐 chunk 增长），属预期。
+
+> **2026-09-26 更新（高质量 hgn）**：新的 8-bit dense overlay + imatrix 路由专家基座（同一 hgn 格式，
+> 见 [HGN-HQ.md](HGN-HQ.md)）把 KLD 从 0.163 降到 GGUF 量级；weight arena +2.2 GiB，
+> 256K / chunk 8192 估算 ~93.2 GiB（上限 95）。只需换文件（`MODEL_FILE` / `OVERLAY_FILE`），Windows 上尚未实测。
 
 关键实现（相对 Linux 版的差异点）：
 
