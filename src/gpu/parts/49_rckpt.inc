@@ -112,9 +112,11 @@ void prune(const std::vector<int64_t>& chist) {
 }
 
 // `mtp`: the caller ingested the MTP layer in lockstep with this prefix.
-void save(GpuModel& m, const std::vector<int>& toks, bool mtp = false) {
+// Returns true when a checkpoint for exactly these tokens is cached after
+// the call (stored now, or already present).
+bool save(GpuModel& m, const std::vector<int>& toks, bool mtp = false) {
   if (!g_on || toks.size() < g_min_tokens || toks.size() != (size_t)m.pos)
-    return;
+    return false;
   if (!g_m) {
     g_m = &m;
     g_pin = m.kv_paged;
@@ -130,7 +132,7 @@ void save(GpuModel& m, const std::vector<int>& toks, bool mtp = false) {
         Ck mv = std::move(*it);
         g_list.erase(it);
         g_list.push_back(std::move(mv));
-        return;
+        return true;
       }
       // The cached copy lacks MTP state and its pinned pages hold stale MTP
       // rows: replace it with a fresh checkpoint.
@@ -155,7 +157,7 @@ void save(GpuModel& m, const std::vector<int>& toks, bool mtp = false) {
                 hipMemcpyDeviceToHost) == hipSuccess &&
       hipMemcpy(ck.iraw.data(), m.d_iraw, ck.iraw.size() * 4,
                 hipMemcpyDeviceToHost) == hipSuccess;
-  if (!ok) return;
+  if (!ok) return false;
   if (mtp_ok) {
     ck.mR.resize((size_t)g_cfg.branches * g_cfg.d);
     ck.mtp_ok =
@@ -178,6 +180,7 @@ void save(GpuModel& m, const std::vector<int>& toks, bool mtp = false) {
   if (g_pin) ck.pages = m.kv_pin(m.pos);
   g_list.push_back(std::move(ck));
   while (g_list.size() > g_cap) drop_front();
+  return true;
 }
 
 // Longest checkpoint whose tokens are a strict prefix of `prompt` (strictly

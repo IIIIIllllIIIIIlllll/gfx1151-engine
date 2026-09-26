@@ -44,6 +44,7 @@ struct GenParams {
     long long snap = -1;                 // -1 = omit
     long long snap2 = -1;
     std::vector<long long> snaps;        // SNAPS <n> c1..cn, empty = omit
+    std::vector<int> ckpt;               // CKPT <n> ids: rckpt after these commit
 };
 
 struct GenResult {

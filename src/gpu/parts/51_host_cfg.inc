@@ -1253,6 +1253,12 @@ struct GenReq {
   // same order; stage 4). Frame: u32 magic 0x56494D31, u32 P, u64 nbytes,
   // then P*1536 fp32 LE patches in block-major (C,T,ph,pw) order.
   int vimg = 0;
+  // CKPT <n> <ids...>: generated tokens worth a mid-decode RAM checkpoint
+  // (rckpt), e.g. <tool_call> / </think>. The API's token cache can only
+  // splice right after such added tokens; without a checkpoint there a
+  // retokenization mismatch inside a tool call forces a re-prefill back to
+  // the previous prompt-end cut.
+  std::vector<int> ckpt;
 };
 
 
@@ -1513,6 +1519,14 @@ static GenReq parse_gen(std::istringstream& ss) {
         long long v;
         if (!(ss >> v) || v < 0) { g.reject = true; return g; }
         g.snaps.push_back((size_t)v);
+      }
+    } else if (tok == "CKPT") {
+      int n;
+      if (!(ss >> n) || n < 0 || n > 64) { g.reject = true; return g; }
+      for (int i = 0; i < n; i++) {
+        int v;
+        if (!(ss >> v) || v < 0) { g.reject = true; return g; }
+        g.ckpt.push_back(v);
       }
     } else if (isdigit(tok[0]) || tok[0] == '-') {
       int v = atoi(tok.c_str());
@@ -1992,6 +2006,18 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       m.clear_mrope();
     }
     std::unordered_set<int> eos(g.eos.begin(), g.eos.end());
+    // CKPT tokens (e.g. <tool_call>, </think>): pause mid-decode right before
+    // one commits and checkpoint that position (rckpt), so the next turn --
+    // whose token-cache splice can only cut right after such an added token --
+    // falls back a few tokens instead of to the previous prompt-end cut.
+    // GDEC_CKPT_TOKENS=0 disables; eos membership wins over a ckpt request.
+    std::unordered_set<int> ckpt_toks(g.ckpt.begin(), g.ckpt.end());
+    for (int e : g.eos) ckpt_toks.erase(e);
+    if (!rckpt::enabled()) ckpt_toks.clear();
+    {
+      const char* e = getenv("GDEC_CKPT_TOKENS");
+      if (e && !atoi(e)) ckpt_toks.clear();
+    }
     HostSampler smp;
     std::vector<float> lbuf;
     if (g.sample) {
@@ -2171,6 +2197,50 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       ngen++;
       return true;
     };
+    // CKPT pause/resume. The emit lambdas below return false on a ckpt token
+    // BEFORE sending it; the spec loops roll the round back to exclude it
+    // (their eos semantics), leaving the trunk/MTP state exactly at that
+    // token's position. ckpt_pause checkpoints that position (the next turn's
+    // token-cache splice can only cut right after such an added token, so
+    // without this a retokenization mismatch inside a tool call re-prefills
+    // from the previous prompt-end cut), then ingests the token serially --
+    // MTP boundary pairing first, while d_R is still h_{pos-1} -- and the
+    // caller re-enters the loop. The loops reset their spec counters at
+    // entry, so they are accumulated across pauses and written back.
+    int pause_tok = -1;
+    float pause_lp = 0.0f;
+    int spec_r = 0, spec_c = 0, spec_p = 0;
+    auto ckpt_pause = [&](bool mtp_ok) -> bool {
+      hist.assign(m.chist.begin(), m.chist.end());
+      if (rckpt::save(m, hist, mtp_ok && mtp_live))
+        fprintf(stderr, "%s ckpt: saved %zu tokens (before token %d, req %lld)\n",
+                log_ts(), hist.size(), pause_tok, (long long)g.req);
+      if (!send_tok(pause_tok, g.sample && g.logprobs, pause_lp)) return false;
+      if (g.sample) smp.remember(pause_tok);  // the loop's sampler view is gone
+      dl_tick();
+      if (mtp_ok && mtp_live) {
+        std::vector<int> bt{pause_tok};
+        m.mtp_ingest_b(m.d_R, bt, 1, (int)hist.size() - 1);
+      }
+      cur = m.forward(pause_tok);
+      hist.push_back(pause_tok);
+      if (g.sample) {
+        m.get_logits(lbuf);
+        cur = smp.sample(lbuf, &cur_lp);
+      }
+      m.yield_point();
+      if (eos.count(cur)) {
+        reason = "done";
+        return false;
+      }
+      if (ngen >= g.max_tokens) {  // pause_tok hit the budget: cur unsent
+        reason = "length";
+        return false;
+      }
+      // spec-loop entry invariant: cur is already streamed, not yet ingested.
+      if (!send_tok(cur, g.sample && g.logprobs, cur_lp)) return false;
+      return true;
+    };
     if (use_ngram || use_chain) {
       // chain with a live MTP keeps it live (the loop patches its KV
       // every ngram round); pure/degraded ngram is trunk-only decode and
@@ -2186,6 +2256,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       auto emit_ng = [&](int tok) -> bool {
         if (ngen >= g.max_tokens) return false;
         if (eos.count(tok)) { reason = "done"; return false; }
+        if (ckpt_toks.count(tok)) { pause_tok = tok; pause_lp = 0.0f; return false; }
         if (!send_tok(tok, false, 0.0f)) return false;
         dl_tick();
         return !cancel;
@@ -2193,16 +2264,28 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       auto emit_ng_smp = [&](int tok, float lp) -> bool {
         if (ngen >= g.max_tokens) return false;
         if (eos.count(tok)) { reason = "done"; return false; }
+        if (ckpt_toks.count(tok)) { pause_tok = tok; pause_lp = lp; return false; }
         if (!send_tok(tok, g.logprobs, lp)) return false;
         dl_tick();
         return !cancel;
       };
       if (!dead && !eos.count(cur)) {
-        if (g.sample)
-          m.spec_loop_chain_sample(cur, g.max_tokens - 1, spec_gamma, smp,
-                                   chain_mtp, emit_ng_smp);
-        else if (chain) m.spec_loop_chain(cur, g.max_tokens - 1, spec_gamma, emit_ng);
-        else m.spec_loop_ngram(cur, g.max_tokens - 1, m.ngram.n_max, emit_ng);
+        for (;;) {
+          pause_tok = -1;
+          if (g.sample)
+            m.spec_loop_chain_sample(cur, g.max_tokens - 1, spec_gamma, smp,
+                                     chain_mtp, emit_ng_smp);
+          else if (chain) m.spec_loop_chain(cur, g.max_tokens - 1, spec_gamma, emit_ng);
+          else m.spec_loop_ngram(cur, g.max_tokens - 1, m.ngram.n_max, emit_ng);
+          spec_r += m.last_spec_rounds;
+          spec_c += m.last_spec_commit;
+          spec_p += m.last_spec_proposed;
+          if (pause_tok < 0 || dead || cancel || reason == "done") break;
+          if (!ckpt_pause(chain)) break;
+        }
+        m.last_spec_rounds = spec_r;
+        m.last_spec_commit = spec_c;
+        m.last_spec_proposed = spec_p;
       }
       hist.assign(m.chist.begin(), m.chist.end());
     } else if (use_spec) {
@@ -2212,31 +2295,44 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       if (eos.count(cur)) {
         reason = "done";
       } else if (send_tok(cur, g.sample && g.logprobs, cur_lp)) {
-        if (g.sample) {
-          auto emit = [&](int tok, float lp) -> bool {
-            if (ngen >= g.max_tokens) return false;
-            if (eos.count(tok)) {
-              reason = "done";
-              return false;
-            }
-            if (!send_tok(tok, g.logprobs, lp)) return false;
-            dl_tick();
-            return !cancel;
-          };
-          m.spec_loop_sample(cur, g.max_tokens - 1, spec_gamma, smp, emit);
-        } else {
-          auto emit = [&](int tok) -> bool {
-            if (ngen >= g.max_tokens) return false;
-            if (eos.count(tok)) {
-              reason = "done";
-              return false;
-            }
-            if (!send_tok(tok, false, 0.0f)) return false;
-            dl_tick();
-            return !cancel;
-          };
-          m.spec_loop(cur, g.max_tokens - 1, spec_gamma, emit);
+        for (;;) {
+          pause_tok = -1;
+          if (g.sample) {
+            auto emit = [&](int tok, float lp) -> bool {
+              if (ngen >= g.max_tokens) return false;
+              if (eos.count(tok)) {
+                reason = "done";
+                return false;
+              }
+              if (ckpt_toks.count(tok)) { pause_tok = tok; pause_lp = lp; return false; }
+              if (!send_tok(tok, g.logprobs, lp)) return false;
+              dl_tick();
+              return !cancel;
+            };
+            m.spec_loop_sample(cur, g.max_tokens - 1, spec_gamma, smp, emit);
+          } else {
+            auto emit = [&](int tok) -> bool {
+              if (ngen >= g.max_tokens) return false;
+              if (eos.count(tok)) {
+                reason = "done";
+                return false;
+              }
+              if (ckpt_toks.count(tok)) { pause_tok = tok; pause_lp = 0.0f; return false; }
+              if (!send_tok(tok, false, 0.0f)) return false;
+              dl_tick();
+              return !cancel;
+            };
+            m.spec_loop(cur, g.max_tokens - 1, spec_gamma, emit);
+          }
+          spec_r += m.last_spec_rounds;
+          spec_c += m.last_spec_commit;
+          spec_p += m.last_spec_proposed;
+          if (pause_tok < 0 || dead || cancel || reason == "done") break;
+          if (!ckpt_pause(true)) break;
         }
+        m.last_spec_rounds = spec_r;
+        m.last_spec_commit = spec_c;
+        m.last_spec_proposed = spec_p;
         // Trunk ingested exactly chist tokens; hist must match for the
         // next turn's KV-reuse prefix check.
         hist.assign(m.chist.begin(), m.chist.end());
@@ -2255,6 +2351,12 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
           int fed = cur;  // the token forward() ingests (pre-sampling)
           cur = m.forward(fed);
           hist.push_back(fed);
+          // Serial decode advances one token at a time: checkpoint right
+          // after a ckpt token (mtp is stale on this path).
+          if (!ckpt_toks.empty() && ckpt_toks.count(fed) &&
+              rckpt::save(m, hist, false))
+            fprintf(stderr, "%s ckpt: saved %zu tokens (after token %d, req %lld)\n",
+                    log_ts(), hist.size(), fed, (long long)g.req);
           if (g.sample) {
             m.get_logits(lbuf);
             cur = smp.sample(lbuf, &cur_lp);

@@ -284,47 +284,90 @@ class TokenCache {
     // Remember what the engine saw for one request (prompt + generated ids).
     void record(std::vector<int> ids) {
         if (!enabled() || ids.empty() || ids.size() > cap_tokens_) return;
-        auto t = std::make_shared<Entry>();
-        t->off.reserve(ids.size() + 1);
-        const int vstart = g_tok.added_token_id("<|vision_start|>");
-        for (size_t i = 0; i < ids.size(); ++i) {
-            t->off.push_back(static_cast<uint32_t>(t->bytes.size()));
-            // The prompt text holds one <|image_pad|> per image; the ids hold
-            // pad_tokens() copies. Only the first copy of a run has bytes.
-            const bool run_cont = i > 0 && is_pad_id(ids[i]) && is_pad_id(ids[i - 1]);
-            if (is_pad_id(ids[i]) && !run_cont) {
-                t->runs.push_back({static_cast<uint32_t>(i), 0});
-            }
-            if (is_pad_id(ids[i])) {
-                t->runs.back().second++;
-                if (run_cont) continue;
-            }
-            t->bytes += g_tok.decode_bytes(std::vector<int>{ids[i]}, /*skip_special=*/false);
+        auto t = build_entry(std::move(ids));
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            insert(std::move(t));
         }
-        t->off.push_back(static_cast<uint32_t>(t->bytes.size()));
-        t->vstart = vstart;
-        t->ids = std::move(ids);
-        std::lock_guard<std::mutex> lk(mtx_);
-        t->used = ++clock_;
-        // A multi-turn conversation re-sends its own history: the new
-        // transcript supersedes every entry that is a prefix of it.
-        for (auto it = entries_.begin(); it != entries_.end();) {
-            const auto& e = (*it)->ids;
-            if (e.size() <= t->ids.size() && std::equal(e.begin(), e.end(), t->ids.begin())) {
-                total_ -= e.size();
-                it = entries_.erase(it);
-            } else {
-                ++it;
-            }
+        autosave();
+    }
+
+    // Persistence (GDEC_API_TOKCACHE_FILE, default data/tcache.bin, "" = off).
+    // Layout, little-endian: magic "GDTC1\0\0\0" | u32 version(1) | u32 vocab
+    // | u64 count | per entry u64 n_ids + n_ids*i32. Byte offsets and pad runs
+    // are rebuilt from the ids at load, so the only compatibility guard is the
+    // vocab size. Written tmp+rename; a torn file just means an empty cache.
+    void set_file(std::string f) { file_ = std::move(f); }
+    void set_save_interval(int s) { save_s_ = s; }
+
+    void save_file() const {
+        if (file_.empty()) return;
+        std::vector<std::vector<int>> snap;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            snap.reserve(entries_.size());
+            for (const auto& e : entries_) snap.push_back(e->ids);
         }
-        total_ += t->ids.size();
-        entries_.push_back(std::move(t));
-        while (entries_.size() > kMaxEntries || total_ > cap_tokens_) {
-            auto lru = std::min_element(entries_.begin(), entries_.end(),
-                                        [](const auto& a, const auto& b) { return a->used < b->used; });
-            total_ -= (*lru)->ids.size();
-            entries_.erase(lru);
+        const std::string tmp = file_ + ".tmp";
+        FILE* f = fopen(tmp.c_str(), "wb");
+        if (!f) return;
+        const char magic[8] = "GDTC1";
+        const uint32_t ver = 1, vocab = (uint32_t)g_tok.vocab_size();
+        const uint64_t count = snap.size();
+        bool ok = fwrite(magic, 1, 8, f) == 8 && fwrite(&ver, 4, 1, f) == 1 &&
+                  fwrite(&vocab, 4, 1, f) == 1 && fwrite(&count, 8, 1, f) == 1;
+        for (const auto& ids : snap) {
+            const uint64_t n = ids.size();
+            if (ok) ok = fwrite(&n, 8, 1, f) == 1;
+            if (ok) ok = fwrite(ids.data(), 4, n, f) == n;
         }
+        ok = fclose(f) == 0 && ok;
+        if (!ok) {
+            fprintf(stderr, "gdec-api: tcache: save %s failed: %s\n", tmp.c_str(),
+                    strerror(errno));
+            remove(tmp.c_str());
+            return;
+        }
+        remove(file_.c_str());  // Windows rename(2) fails when the target exists
+        rename(tmp.c_str(), file_.c_str());
+    }
+
+    void load_file() {
+        if (file_.empty() || !enabled()) return;
+        FILE* f = fopen(file_.c_str(), "rb");
+        if (!f) return;  // first boot: no cache yet
+        char magic[8];
+        uint32_t ver = 0, vocab = 0;
+        uint64_t count = 0;
+        bool ok = fread(magic, 1, 8, f) == 8 && !memcmp(magic, "GDTC1\0\0\0", 8) &&
+                  fread(&ver, 4, 1, f) == 1 && ver == 1 &&
+                  fread(&vocab, 4, 1, f) == 1 && (int)vocab == g_tok.vocab_size() &&
+                  fread(&count, 8, 1, f) == 1 && count <= kMaxEntries * 4;
+        size_t entries = 0, tokens = 0;
+        std::vector<std::shared_ptr<Entry>> loaded;
+        for (uint64_t i = 0; ok && i < count; i++) {
+            uint64_t n = 0;
+            std::vector<int> ids;
+            ok = fread(&n, 8, 1, f) == 1 && n > 0 && n <= cap_tokens_;
+            if (!ok) break;
+            ids.resize(n);
+            ok = fread(ids.data(), 4, n, f) == n;
+            if (!ok) break;
+            loaded.push_back(build_entry(std::move(ids)));
+            tokens += n;
+        }
+        fclose(f);
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            for (auto& t : loaded) insert(std::move(t));
+            entries = entries_.size();
+        }
+        if (!ok)
+            fprintf(stderr, "gdec-api: tcache: %s truncated/mismatched, loaded what parsed\n",
+                    file_.c_str());
+        if (entries)
+            fprintf(stderr, "gdec-api: tcache: loaded %zu entries (%zu tokens) from %s\n",
+                    entries, tokens, file_.c_str());
     }
 
     struct Hit {
@@ -417,15 +460,105 @@ class TokenCache {
         }
     }
 
+    // Decode + offset bookkeeping of one recorded transcript.
+    static std::shared_ptr<Entry> build_entry(std::vector<int> ids) {
+        auto t = std::make_shared<Entry>();
+        t->off.reserve(ids.size() + 1);
+        const int vstart = g_tok.added_token_id("<|vision_start|>");
+        for (size_t i = 0; i < ids.size(); ++i) {
+            t->off.push_back(static_cast<uint32_t>(t->bytes.size()));
+            // The prompt text holds one <|image_pad|> per image; the ids hold
+            // pad_tokens() copies. Only the first copy of a run has bytes.
+            const bool run_cont = i > 0 && is_pad_id(ids[i]) && is_pad_id(ids[i - 1]);
+            if (is_pad_id(ids[i]) && !run_cont) {
+                t->runs.push_back({static_cast<uint32_t>(i), 0});
+            }
+            if (is_pad_id(ids[i])) {
+                t->runs.back().second++;
+                if (run_cont) continue;
+            }
+            t->bytes += g_tok.decode_bytes(std::vector<int>{ids[i]}, /*skip_special=*/false);
+        }
+        t->off.push_back(static_cast<uint32_t>(t->bytes.size()));
+        t->vstart = vstart;
+        t->ids = std::move(ids);
+        return t;
+    }
+
+    // Caller holds mtx_.
+    void insert(std::shared_ptr<Entry> t) {
+        t->used = ++clock_;
+        // A multi-turn conversation re-sends its own history: the new
+        // transcript supersedes every entry that is a prefix of it.
+        for (auto it = entries_.begin(); it != entries_.end();) {
+            const auto& e = (*it)->ids;
+            if (e.size() <= t->ids.size() && std::equal(e.begin(), e.end(), t->ids.begin())) {
+                total_ -= e.size();
+                it = entries_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        total_ += t->ids.size();
+        entries_.push_back(std::move(t));
+        while (entries_.size() > kMaxEntries || total_ > cap_tokens_) {
+            auto lru = std::min_element(entries_.begin(), entries_.end(),
+                                        [](const auto& a, const auto& b) { return a->used < b->used; });
+            total_ -= (*lru)->ids.size();
+            entries_.erase(lru);
+        }
+    }
+
+    // Throttled persist after record(); 0 interval = save on every record.
+    void autosave() {
+        if (file_.empty()) return;
+        const auto now = std::chrono::steady_clock::now();
+        auto last = last_save_.load(std::memory_order_relaxed);
+        if (save_s_ > 0 && now - last < std::chrono::seconds(save_s_)) return;
+        if (!last_save_.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+        save_file();
+    }
+
     static constexpr size_t kMaxEntries = 64;
-    std::mutex mtx_;
+    mutable std::mutex mtx_;  // mutable: save_file() is const
     std::vector<std::shared_ptr<Entry>> entries_;
     size_t total_ = 0;
     size_t cap_tokens_ = 4u << 20;
     uint64_t clock_ = 0;
+    std::string file_;
+    int save_s_ = 10;
+    std::atomic<std::chrono::steady_clock::time_point> last_save_{
+        std::chrono::steady_clock::time_point{}};
 };
 
 TokenCache g_tcache;
+
+// Token ids the engine checkpoints its RAM state at mid-generation (CKPT
+// hints on GEN). Mid-reply cuts happen right after these added tokens
+// (<tool_call>, </think>): the TokenCache slices a next-turn prefix there, so
+// a checkpoint at the same spot turns a template-roundtrip mismatch from a
+// full reply re-prefill into re-decoding only the tool call + tool result.
+// GDEC_CKPT_TOKENS=0 disables; the engine ignores unknown/empty hints.
+std::vector<int> g_ckpt_ids;
+
+std::vector<int> default_ckpt_tokens() {
+    if (const char* e = std::getenv("GDEC_CKPT_TOKENS"))
+        if (!strcmp(e, "0")) return {};
+    std::vector<int> ids;
+    for (const char* s : {"<tool_call>", "</think>"}) {
+        const int id = g_tok.added_token_id(s);
+        if (id >= 0) ids.push_back(id);
+    }
+    if (!ids.empty()) {
+        std::string names;
+        for (int id : ids) {
+            if (!names.empty()) names += ",";
+            names += std::to_string(id);
+        }
+        fprintf(stderr, "gdec-api: ckpt tokens: %s\n", names.c_str());
+    }
+    return ids;
+}
 
 // Encode a rendered prompt, reusing the transcript cache for its prefix.
 // frames == nullptr: raw text (no image expansion, like encode()). starts
@@ -562,6 +695,7 @@ GenOutcome run_generation(GenSpec& spec,
     p.mrope_grids = spec.mrope_grids;
     p.patches = std::move(spec.patches);
     p.snaps = spec.snaps;
+    p.ckpt = g_ckpt_ids;
 
     out.served_max_tokens = p.max_tokens;
     if (spec.max_tokens > p.max_tokens) out.clamped_from = spec.max_tokens;
@@ -2354,6 +2488,13 @@ int main(int argc, char** argv) {
     if (const char* k = std::getenv("GDEC_API_ADMIN_KEY")) g_cfg.admin_key = k;
     if (const char* t = std::getenv("GDEC_API_TOKCACHE"))
         g_tcache.set_capacity(std::strtoull(t, nullptr, 10));
+    {
+        // "" disables persistence; default keeps the cache across restarts.
+        const char* f = std::getenv("GDEC_API_TOKCACHE_FILE");
+        g_tcache.set_file(f ? f : "data/tcache.bin");
+        if (const char* s = std::getenv("GDEC_API_TOKCACHE_SAVE_S"))
+            g_tcache.set_save_interval(std::atoi(s));
+    }
     load_overrides();
 
     std::string err;
@@ -2361,6 +2502,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "gdec-api: tokenizer: %s\n", err.c_str());
         return 1;
     }
+    g_tcache.load_file();
+    g_ckpt_ids = default_ckpt_tokens();
     probe_engine();
 
     http::Server srv;

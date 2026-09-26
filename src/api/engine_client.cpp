@@ -301,6 +301,10 @@ std::string build_gen_request(const GenParams& p) {
         s += " SNAPS " + std::to_string(p.snaps.size());
         for (long long c : p.snaps) s += " " + std::to_string(c);
     }
+    if (!p.ckpt.empty()) {
+        s += " CKPT " + std::to_string(p.ckpt.size());
+        for (int c : p.ckpt) s += " " + std::to_string(c);
+    }
     s += "\n";
     return s;
 }

@@ -10,6 +10,16 @@ text   : a long sampled reply, then a follow-up that replays it (with
 vision : a text turn, then an image follow-up (the text prefix must be
          reused), then a second image added (prefix incl. image 1 reused),
          then image 1 swapped for other pixels (must NOT reuse past it).
+toolcall: the model emits a <tool_call> with float arguments; the follow-up
+         re-renders it through the chat template (floats re-serialize, e.g.
+         3.50 -> 3.5), so the byte prefix breaks inside the call. The token
+         cache cuts right after the <tool_call> token and the engine's
+         mid-decode checkpoint (CKPT hint) must serve it: cached must reach
+         past the thinking, not fall back to the turn-1 prompt end.
+persist1/persist2: token-cache persistence across an API restart. persist1
+         runs one turn and saves the transcript to --state; the .sh then
+         restarts the ON API (same GDEC_API_TOKCACHE_FILE) and persist2 sends
+         the follow-up: reuse must be exactly as without a restart.
 Prints PASS/FAIL per check; exit code 0 only if all pass.
 """
 import argparse
@@ -45,6 +55,8 @@ def assistant_msg(out):
     msg = {"role": "assistant", "content": m.get("content") or ""}
     if m.get("reasoning_content"):
         msg["reasoning_content"] = m["reasoning_content"]
+    if m.get("tool_calls"):
+        msg["tool_calls"] = m["tool_calls"]
     return msg
 
 
@@ -151,18 +163,121 @@ def run_vision(a):
     return ok
 
 
+def run_toolcall(a):
+    ok = True
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "log_temperatures",
+            "description": "把一组温度读数写入监控系统",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "readings": {"type": "array",
+                                 "items": {"type": "number"},
+                                 "description": "温度读数列表"},
+                    "unit": {"type": "string", "description": "单位，如 celsius"},
+                },
+                "required": ["readings", "unit"],
+            },
+        },
+    }]
+    # A long thinking prefix makes the cut position measurable: without the
+    # mid-decode <tool_call> checkpoint the follow-up falls back to the turn-1
+    # prompt end (cached ~ p1); with it, cached reaches past the thinking.
+    system = ("你是严谨的运维数据助手，调用工具前必须逐步分析读数的合理性。" * 20)
+    user1 = ("上午的温度读数是 3.50、2.800、11.0 摄氏度。请先详细分析这组读数"
+             "（逐项说明是否合理、波动意味着什么），然后用 log_temperatures "
+             "工具把原始数值原样记录进去。")
+    msgs = [{"role": "system", "content": system}, {"role": "user", "content": user1}]
+    print("[toolcall] 第 1 轮：诱导长 thinking + 带 float 参数的 <tool_call> ...", flush=True)
+    o1 = post(a.on, {"messages": msgs, "tools": tools,
+                     "max_tokens": a.max_tokens, "temperature": 0})
+    p1, c1, _ = usage(o1)
+    m1 = o1["choices"][0]["message"]
+    tcs = m1.get("tool_calls") or []
+    print(f"[toolcall]   prompt {p1}，生成 {c1} token，tool_calls={len(tcs)}，"
+          f"{o1['_secs']:.0f}s", flush=True)
+    if not tcs:
+        print("INFO 模型这次没有发起工具调用，toolcall 场景跳过（不算失败）")
+        return ok
+    args = json.loads(tcs[0]["function"]["arguments"])
+    print(f"[toolcall]   参数 readings={args.get('readings')} unit={args.get('unit')}",
+          flush=True)
+
+    msgs2 = msgs + [assistant_msg(o1),
+                    {"role": "tool", "tool_call_id": tcs[0]["id"],
+                     "content": "{\"ok\": true}"},
+                    {"role": "user", "content": "记好了吗？一句话回答。"}]
+    o2 = post(a.on, {"messages": msgs2, "tools": tools,
+                     "max_tokens": 16, "temperature": 0})
+    p2, _, k2 = usage(o2)
+    print(f"[toolcall] 第 2 轮（工具结果回填）：prompt {p2}，cached {k2}，"
+          f"{o2['_secs']:.1f}s", flush=True)
+    # Without the ckpt: the re-rendered arguments rarely match byte-for-byte
+    # (floats re-serialize), so reuse falls back to the turn-1 prompt end.
+    if k2 >= p1 + 100:
+        ok &= check(True, "toolcall-ckpt-reuse",
+                    f"cached {k2} >= 第 1 轮 prompt {p1}+100（越过 thinking，"
+                    "命中 <tool_call> 处检查点或整段复用）")
+    else:
+        # The mismatch is model-dependent: clean round-trip also passes above,
+        # so landing here means the fix did not engage on a real mismatch.
+        ok &= check(False, "toolcall-ckpt-reuse",
+                    f"cached {k2} 只到第 1 轮 prompt 附近（{p1}），"
+                    "<tool_call> 检查点没生效")
+    return ok
+
+
+def run_persist_seed(a):
+    system = ("你是资深 Linux 运维工程师。" * 30)
+    user1 = "详细解释 ext4 的日志模式（ordered/writeback/journal），各给一个适用场景。"
+    msgs = [{"role": "system", "content": system}, {"role": "user", "content": user1}]
+    print("[persist] 种子轮：生成中等长度回复 ...", flush=True)
+    o1 = post(a.on, {"messages": msgs, "max_tokens": 800, "temperature": 1.0})
+    p1, c1, _ = usage(o1)
+    print(f"[persist]   prompt {p1}，生成 {c1} token，{o1['_secs']:.0f}s", flush=True)
+    state = {"messages": msgs + [assistant_msg(o1)], "p1": p1, "c1": c1}
+    with open(a.state, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    print(f"[persist]   现场已存 {a.state}（等 .sh 重启 API）", flush=True)
+    return True
+
+
+def run_persist_check(a):
+    with open(a.state, encoding="utf-8") as f:
+        state = json.load(f)
+    p1, c1 = state["p1"], state["c1"]
+    msgs = state["messages"] + [{"role": "user", "content": "再补一句：生产环境推荐哪个？"}]
+    print("[persist] 重启后追问 ...", flush=True)
+    o2 = post(a.on, {"messages": msgs, "max_tokens": 16, "temperature": 0})
+    p2, _, k2 = usage(o2)
+    print(f"[persist]   prompt {p2}，cached {k2}，{o2['_secs']:.1f}s", flush=True)
+    want = p1 + c1 - 32
+    return check(k2 >= want, "persist-restart-reuse",
+                 f"API 重启后 cached {k2} >= 种子轮 {p1}+{c1}-32 = {want}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--on", type=int, required=True, help="token-cache API port")
     ap.add_argument("--off", type=int, required=True, help="GDEC_API_TOKCACHE=0 API port")
     ap.add_argument("--max-tokens", type=int, default=6000)
-    ap.add_argument("--only", choices=["text", "vision"])
+    ap.add_argument("--state", default=None, help="persist scenario transcript file")
+    ap.add_argument("--only",
+                    choices=["text", "vision", "toolcall", "persist1", "persist2"])
     a = ap.parse_args()
     ok = True
     if a.only in (None, "text"):
         ok &= run_text(a)
     if a.only in (None, "vision"):
         ok &= run_vision(a)
+    if a.only in (None, "toolcall"):
+        ok &= run_toolcall(a)
+    if a.only == "persist1":
+        ok &= run_persist_seed(a)
+    if a.only == "persist2":
+        ok &= run_persist_check(a)
     sys.exit(0 if ok else 1)
 
 
