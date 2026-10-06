@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -160,6 +161,29 @@ int main(int argc, char** argv) {
     check(!vision::encode_prompt(prompt, tokenizer, frames, &ids, &error) &&
               error.find("placeholder count") != std::string::npos,
           "placeholder-mismatch-rejected", error);
+
+    // A user-typed pad literal outside the template span is plain text, not
+    // a placeholder: it must not survive as id 248056/248057.
+    frames = {placeholder};
+    const std::string stray =
+        "the token <|image_pad|> discussed. "
+        "before<|vision_start|><|image_pad|><|vision_end|>after";
+    error.clear();
+    check(vision::encode_prompt(stray, tokenizer, frames, &ids, &error),
+          "stray-pad-accepted", error);
+    check(std::count(ids.begin(), ids.end(), 248056) == placeholder.pad_tokens(),
+          "stray-pad-token-count");
+    // Same exclusion at the tokenizer level (text-only requests use it).
+    const std::unordered_set<int> no_pads = {248056, 248057};
+    const std::vector<int> text_ids =
+        tokenizer.encode("the token <|image_pad|> is text", false, &no_pads);
+    check(std::count(text_ids.begin(), text_ids.end(), 248056) == 0,
+          "text-encode-excludes-pad");
+    check(!tokenizer.encode("the token <|image_pad|> is text").empty() &&
+              std::count(tokenizer.encode("the token <|image_pad|> is text").begin(),
+                         tokenizer.encode("the token <|image_pad|> is text").end(),
+                         248056) == 1,
+          "default-encode-keeps-pad");
 
     std::puts("RESULT PASS");
     return 0;

@@ -27,6 +27,10 @@
 //  - Added (special) tokens are extracted longest-match-first from the raw
 //    text before normalization/BPE, even when add_special_tokens=false
 //    (that flag is a no-op here: the post-processor adds nothing).
+//    encode*/exclude_added skips matching the listed added-token ids, so
+//    their literal text goes through plain BPE instead (used to keep
+//    user-typed <|image_pad|>/<|video_pad|> from becoming real vision
+//    placeholder ids; the vision path inserts those programmatically).
 //  - decode(skip_special_tokens=true) drops only added tokens flagged
 //    special=true; non-special added tokens like `<tool_call>` survive as
 //    literal text.
@@ -45,6 +49,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace gdec {
@@ -62,16 +67,19 @@ class Tokenizer {
 
     // Encode text to token ids. `add_special_tokens` is accepted for API
     // parity with HF; this model's post-processor never adds tokens, and
-    // added tokens appearing literally in the text are always recognized.
-    std::vector<int> encode(const std::string& text,
-                            bool add_special_tokens = false) const;
+    // added tokens appearing literally in the text are always recognized
+    // (except the ids in `exclude_added`, which BPE as ordinary text).
+    std::vector<int> encode(
+        const std::string& text, bool add_special_tokens = false,
+        const std::unordered_set<int>* exclude_added = nullptr) const;
 
     // Like encode(), but also reports the byte span of each token in the
     // original input text. When NFC normalization rewrites a span, the
     // reported offsets are interpolated from the surrounding codepoints
     // (exact whenever normalization is the identity on that span).
     std::vector<TokenSpan> encode_with_offsets(
-        const std::string& text, bool add_special_tokens = false) const;
+        const std::string& text, bool add_special_tokens = false,
+        const std::unordered_set<int>* exclude_added = nullptr) const;
 
     // Decode token ids back to text. skip_special_tokens drops added tokens
     // flagged special=true. Ill-formed UTF-8 byte runs become U+FFFD

@@ -31,6 +31,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -594,7 +595,13 @@ bool encode_spliced(const std::string& text, const std::vector<vision::Frame>* f
         if (!vision::encode_prompt(tail_text, g_tok, rest, &tail, error, &tail_starts))
             return false;
     } else {
-        for (const auto& s : g_tok.encode_with_offsets(tail_text)) {
+        // Text-only request: a user-typed <|image_pad|>/<|video_pad|> literal
+        // must tokenize as ordinary text. As the added-token ids it would
+        // make the engine read this as a vision request without images and
+        // reject it ("image placeholder ... without MROPE/VIMG"); only the
+        // vision path (encode_prompt) may produce those ids.
+        static const std::unordered_set<int> kTextNoPads = {kImagePadId, kVideoPadId};
+        for (const auto& s : g_tok.encode_with_offsets(tail_text, false, &kTextNoPads)) {
             tail.push_back(s.id);
             tail_starts.push_back(s.start);
         }

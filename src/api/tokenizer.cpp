@@ -507,14 +507,16 @@ void Tokenizer::bpe(const std::string& alphabet_str, std::vector<int>* out,
     *token_char_lens = std::move(lens);
 }
 
-std::vector<TokenSpan> Tokenizer::encode_with_offsets(const std::string& text,
-                                                      bool /*add_special_tokens*/) const {
+std::vector<TokenSpan> Tokenizer::encode_with_offsets(
+    const std::string& text, bool /*add_special_tokens*/,
+    const std::unordered_set<int>* exclude_added) const {
     std::vector<TokenSpan> result;
     const size_t n = text.size();
     auto match_added = [&](size_t pos) -> const AddedToken* {
         for (const AddedToken& at : added_)  // sorted longest-first
             if (pos + at.content.size() <= n &&
-                text.compare(pos, at.content.size(), at.content) == 0)
+                text.compare(pos, at.content.size(), at.content) == 0 &&
+                !(exclude_added && exclude_added->count(at.id)))
                 return &at;
         return nullptr;
     };
@@ -594,8 +596,10 @@ std::vector<TokenSpan> Tokenizer::encode_with_offsets(const std::string& text,
     return result;
 }
 
-std::vector<int> Tokenizer::encode(const std::string& text, bool add_special_tokens) const {
-    std::vector<TokenSpan> spans = encode_with_offsets(text, add_special_tokens);
+std::vector<int> Tokenizer::encode(const std::string& text, bool add_special_tokens,
+                                   const std::unordered_set<int>* exclude_added) const {
+    std::vector<TokenSpan> spans = encode_with_offsets(text, add_special_tokens,
+                                                       exclude_added);
     std::vector<int> ids;
     ids.reserve(spans.size());
     for (const TokenSpan& t : spans) ids.push_back(t.id);

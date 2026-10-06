@@ -2125,8 +2125,9 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
         break;
       }
     if (bad < g.ids.size()) {
-      fprintf(stderr, "vision: req %lld rejected: image placeholder at "
-              "prompt pos %zu without MROPE/VIMG\n", (long long)g.req, bad);
+      fprintf(stderr, "vision: req %lld rejected: image placeholder id %d at "
+              "prompt pos %zu without MROPE/VIMG\n", (long long)g.req,
+              g.ids[bad], bad);
       finish(err_line());
       return;
     }

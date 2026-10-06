@@ -9,6 +9,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <unordered_set>
 
 #ifdef _WIN32
 // Windows 构建不链 libpng/libjpeg：改用 stb_image（public domain 单头文件，
@@ -45,6 +46,7 @@ constexpr int kFactor = kPatch * kMerge;
 constexpr int kMinPixels = 256 * 256;
 constexpr int kMaxPixels = 2560 * 1440;
 constexpr int kImageToken = 248056;
+constexpr int kVideoToken = 248057;
 constexpr const char* kPadSpan =
     "<|vision_start|><|image_pad|><|vision_end|>";
 
@@ -573,6 +575,19 @@ bool encode_prompt(const std::string& prompt, const gdec::Tokenizer& tokenizer,
             ids->insert(ids->end(), static_cast<size_t>(count), kImageToken);
             if (starts) starts->insert(starts->end(), static_cast<size_t>(count), token.start);
             ++image_index;
+        } else if (token.id == kImageToken || token.id == kVideoToken) {
+            // A pad token the chat template did not place: the user typed the
+            // literal string. Re-encode it as ordinary text — the engine
+            // walks image-token runs against this request's grids (set_mrope)
+            // and would reject (or misplace) a placeholder it has no image
+            // for.
+            static const std::unordered_set<int> kNoPads = {kImageToken, kVideoToken};
+            const std::string piece =
+                prompt.substr(token.start, token.end - token.start);
+            for (const auto& t : tokenizer.encode_with_offsets(piece, false, &kNoPads)) {
+                ids->push_back(t.id);
+                if (starts) starts->push_back(token.start + t.start);
+            }
         } else {
             ids->push_back(token.id);
             if (starts) starts->push_back(token.start);
