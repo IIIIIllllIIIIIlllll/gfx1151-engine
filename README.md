@@ -18,16 +18,18 @@
 
 | 指标 | 数值 |
 | --- | --- |
-| Prefill(128K 上下文) | 约 1400–1470 tok/s(09-28 实测) |
-| Decode(投机,greedy,γ=4) | 8K 约 45、64K 约 46 tok/s(09-29 真实文本) |
-| Decode(投机,采样,自适应 γ) | 8K 约 40、64K 约 45 tok/s(09-29 真实文本) |
-| Decode(不投机) | 约 25–30 tok/s(09-28 实测,视权重格式) |
+| Prefill(8K,chunk 16384) | 约 1730–1750 tok/s(10-07 实测) |
+| Prefill(128K 上下文) | 约 1650 tok/s(10-07 实测) |
+| Prefill(256K 上下文) | 原生约 1590、YaRN factor 2 约 1580 tok/s,开销约 0.5%(10-07 实测) |
+| Decode(投机,greedy,γ=4) | 8K 约 51、64K 约 50 tok/s(10-07 真实文本) |
+| Decode(不投机) | 8K 约 34 tok/s(10-07 实测,hgn 标准权重;HQ/GGUF 每 token 读量大,约低 16%) |
 | 平均功耗 | 约 120 W |
 | 瞬时最大功耗 | 约 130 W(爆发持续几秒后回落至 120 W 左右) |
 
-投机 decode 随文本重复度变化很大:上面两行用真实文本 prompt 测得;高重复内容(代码、
-模板文本)chain 起草命中率高,同配置实测可达 60 tok/s 以上。权重格式(GGUF / hgn)不同
-数字会有出入;表中 09-28/09-29 均为 2026 年。
+投机 decode 随文本重复度变化很大:上面用真实文本 prompt 测得;高重复内容(代码、
+模板文本)chain 起草命中率高,同配置实测可达 60 tok/s 以上;采样(自适应 γ)比
+greedy 略低。权重格式(GGUF / hgn)不同数字会有出入;ROCm 7.14 与 10.1 实测无差异。
+表中日期均为 2026 年,测试环境 ROCm 10.1、生产配置(PREFILL_CHUNK=16384)。
 
 ## 权重格式与质量
 
@@ -35,14 +37,14 @@
 
 | | hgn 标准 | hgn 高质量(HQ) | GGUF UD-Q4_K_XL |
 | --- | --- | --- | --- |
-| 文件 | 当前默认(`qwen38-flash-next-w4b.hgn` + overlay) | 从原始权重转换,见 [HGN-HQ.md](HGN-HQ.md) | Unsloth 发布,与 llama.cpp 同一份文件 |
+| 文件 | 当前默认(`qwen38-flash-next-v2.hgn` + ngram/MTP) | 从原始权重转换,见 [HGN-HQ.md](HGN-HQ.md) | Unsloth 发布,与 llama.cpp 同一份文件 |
 | 路由专家 | 4-bit(q4cp) | 4-bit(q4cp,imatrix 加权) | Q4_K / Q5_1 为主 |
 | dense(注意力、GDN、shared expert、embed、lm_head) | 4-bit | 8-bit(q8g32 overlay) | 8-bit(Q8_0) |
 | KLD vs BF16(越低越好) | 0.163 | **0.0558** | 0.0511 |
 | top1 与 BF16 一致 | 86.8% | 92.4% | 92.6% |
 | 常驻权重 bpw / 大小 | 4.55 / 66.6 GiB | 4.70 / 68.8 GiB | 5.25 / 76.9 GiB |
-| Prefill(8K prompt,chunk 2048) | 约 1200 tok/s | 约 1200 tok/s | 约 1200 tok/s |
-| Decode(不投机) | 约 30 tok/s | 约 25 tok/s | 约 25 tok/s |
+| Prefill(8K prompt,chunk 16384) | 约 1730–1750 tok/s | 约相同 | 约相同 |
+| Decode(不投机) | 约 34 tok/s | 约 29 tok/s | 约 29 tok/s |
 | 启动 | `start_hgn.sh` | `start_hgn.sh`(改 `MODEL_FILE` / `OVERLAY_FILE`) | `start_gguf.sh` |
 | Windows | 支持 | 支持(尚未实测) | 不支持 |
 
@@ -50,6 +52,8 @@
   llama.cpp 跑同一份 GGUF 为 0.049。
 - 质量差距几乎全部来自 dense 的位宽:dense 改成 8-bit 后 KLD 0.163 → 0.063,imatrix 专家再降到
   0.0558。代价是 decode 每 token 读量增加,慢约 16%(与 GGUF 相同);prefill 不受影响。
+- 表中性能两行是 2026-10-07 在 hgn 标准(v2 权重)上的实测;HQ / GGUF 列按上述规律推算
+  (prefill 对位宽不敏感,decode 慢约 16%)。
 - 常驻权重不含 PLE n-gram 表(hgn fp8 47.7 GiB,GGUF IQ4_NL 26.8 GiB),该表留在磁盘按需读。
   `python3 tools/bpw.py` 按类别复核各文件的 bpw(只读文件头,几秒)。
 - 默认配置仍是 hgn 标准。HQ 文件已通过 `tools/hq_verify.sh`;部署方法见
@@ -269,7 +273,8 @@ GPU 在安全调度点轮转,并发数翻倍不意味着吞吐翻倍,请求延�
   错用旧 KV;无需为正确性删除快照,但旧文件仍可能占磁盘配额并被 LRU 逐出。
 - 2026-09-30 Linux/gfx1151 实测覆盖 500K prefill/needle、精确 512K 边界、
   factor 2 双槽并发、reset/COW/SSD 恢复、超预约 decode 及取消。256K prefill
-  原生 1374.4 vs YaRN 1370.3 tok/s,约 0.3% 差异,不表示任意负载都无开销。
+  原生 1589.4 vs YaRN 1582.1 tok/s(2026-10-07 复测,约 0.5% 差异),不表示
+  任意负载都无开销。
   短文本探针 factor 2 与原生 mean KLD 0.0234、same-top 93.5%,因此不承诺两者
   输出一致。详细实现/限制见 [YARN-512K.md](YARN-512K.md),实测见
   [YARN-512K-RESULTS.md](YARN-512K-RESULTS.md)。

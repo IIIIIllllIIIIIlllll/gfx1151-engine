@@ -21,18 +21,21 @@ gfx1151)**, 122 GiB RAM:
 
 | Metric | Value |
 | --- | --- |
-| Prefill (128K context) | ~1400–1470 tok/s (measured 09-28) |
-| Decode (speculative, greedy, γ=4) | ~45 tok/s at 8K, ~46 at 64K (real text, 09-29) |
-| Decode (speculative, sampling, adaptive γ) | ~40 tok/s at 8K, ~45 at 64K (real text, 09-29) |
-| Decode (no speculation) | ~25–30 tok/s (measured 09-28, depends on weight format) |
+| Prefill (8K, chunk 16384) | ~1730–1750 tok/s (measured 10-07) |
+| Prefill (128K context) | ~1650 tok/s (measured 10-07) |
+| Prefill (256K context) | ~1590 native, ~1580 with YaRN factor 2 (~0.5% overhead, measured 10-07) |
+| Decode (speculative, greedy, γ=4) | ~51 tok/s at 8K, ~50 at 64K (real text, 10-07) |
+| Decode (no speculation) | ~34 tok/s at 8K (measured 10-07, hgn standard weights; HQ/GGUF read more per token, ~16% slower) |
 | Average power draw | ~120 W |
 | Peak (instantaneous) power draw | ~130 W (bursts for a few seconds, then settles back to ~120 W) |
 
-Speculative decode varies strongly with text repetitiveness: the two rows
-above were measured on real-text prompts; highly repetitive content (code,
-template text) hits the chain drafter well and exceeds 60 tok/s in the same
-configuration. Numbers vary with the weight format (GGUF / hgn); all dates
-are in 2026.
+Speculative decode varies strongly with text repetitiveness: the row above was
+measured on real-text prompts; highly repetitive content (code, template text)
+hits the chain drafter well and exceeds 60 tok/s in the same configuration;
+sampling (adaptive γ) is slightly lower than greedy. Numbers vary with the
+weight format (GGUF / hgn); ROCm 7.14 and 10.1 measured identical. All dates
+are in 2026; test environment ROCm 10.1, production config
+(PREFILL_CHUNK=16384).
 
 ## Weight Formats and Quality
 
@@ -41,14 +44,14 @@ decoding are identical; switch by using the other launcher:
 
 | | hgn standard | hgn high quality (HQ) | GGUF UD-Q4_K_XL |
 | --- | --- | --- | --- |
-| Files | current default (`qwen38-flash-next-w4b.hgn` + overlay) | converted from the original weights, see [HGN-HQ.md](HGN-HQ.md) (Chinese) | released by Unsloth, the same files llama.cpp uses |
+| Files | current default (`qwen38-flash-next-v2.hgn` + ngram/MTP) | converted from the original weights, see [HGN-HQ.md](HGN-HQ.md) (Chinese) | released by Unsloth, the same files llama.cpp uses |
 | Routed experts | 4-bit (q4cp) | 4-bit (q4cp, imatrix-weighted) | mostly Q4_K / Q5_1 |
 | Dense (attention, GDN, shared expert, embed, lm_head) | 4-bit | 8-bit (q8g32 overlay) | 8-bit (Q8_0) |
 | KLD vs BF16 (lower is better) | 0.163 | **0.0558** | 0.0511 |
 | top1 agreement with BF16 | 86.8% | 92.4% | 92.6% |
 | Resident weights bpw / size | 4.55 / 66.6 GiB | 4.70 / 68.8 GiB | 5.25 / 76.9 GiB |
-| Prefill (8K prompt, chunk 2048) | ~1200 tok/s | ~1200 tok/s | ~1200 tok/s |
-| Decode (no speculation) | ~30 tok/s | ~25 tok/s | ~25 tok/s |
+| Prefill (8K prompt, chunk 16384) | ~1730–1750 tok/s | about the same | about the same |
+| Decode (no speculation) | ~34 tok/s | ~29 tok/s | ~29 tok/s |
 | Launch | `start_hgn.sh` | `start_hgn.sh` (set `MODEL_FILE` / `OVERLAY_FILE`) | `start_gguf.sh` |
 | Windows | yes | yes (not yet measured) | no |
 
@@ -59,6 +62,9 @@ decoding are identical; switch by using the other launcher:
   takes KLD from 0.163 to 0.063, imatrix-weighted experts bring it to 0.0558.
   The cost is more bytes read per decode token, ~16% slower decode (same as
   GGUF); prefill is unaffected.
+- The two performance rows were measured 2026-10-07 on hgn standard (v2
+  weights); the HQ / GGUF columns follow from the rule above (prefill is
+  insensitive to bit width, decode is ~16% slower).
 - Resident weights exclude the PLE n-gram table (hgn fp8 47.7 GiB, GGUF
   IQ4_NL 26.8 GiB), which stays on disk and is read on demand.
   `python3 tools/bpw.py` reports bpw per category for each file (reads headers
@@ -333,8 +339,9 @@ Equal pool sizes do not imply identical total memory with different
 - The 2026-09-30 Linux/gfx1151 results cover 500K prefill/needles, exact 512K
   boundaries, factor-2 two-slot concurrency, reset/COW/SSD restore, decode
   beyond reservations, and cancellation. At 256K, native prefill measured
-  1374.4 versus 1370.3 tok/s with YaRN (about 0.3% difference), not a promise
-  of zero overhead for every workload. A short probe had factor-2 versus
+  1589.4 versus 1582.1 tok/s with YaRN (re-measured 2026-10-07, about 0.5%
+  difference), not a promise of zero overhead for every workload. A short
+  probe had factor-2 versus
   native mean KLD 0.0234 and same-top 93.5%; outputs need not be identical.
   See [YARN-512K.md](YARN-512K.md) for implementation/limits and
   [YARN-512K-RESULTS.md](YARN-512K-RESULTS.md) for the hardware report.
