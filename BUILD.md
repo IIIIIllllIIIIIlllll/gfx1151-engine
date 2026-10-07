@@ -177,6 +177,20 @@ Git Bash / PowerShell / 任何脚本宿主。拉起引擎 + API 双进程；默�
 两个子进程在一个 Job 里，启动器被任务管理器结束时它们也随之结束。
 `start_win.exe --console` 是旧的控制台模式（输出实时显示，Ctrl+C 或关窗停止），
 排查问题用。
+**首次双击会弹出启动配置面板**（原生 Win32 窗口，4 个分页）：第 1 页权重——
+V1（w4b 单文件）/ V2（主体 + 独立 n-gram 文件）/ GGUF 版本选择，各版本只显示
+自己相关的文件行（可浏览选择、可选文件可勾选"不使用"）；GGUF 仅保存配置，
+Windows 启动器只支持 hgn（Linux 用 `start_gguf.sh` 启动）。第 2 页上下文窗口 /
+并发槽数 / 并发总池 / prefill 分段，另有 YaRN 勾选框：单请求上限超过原生
+262144 时开启，扩展倍数按上限自动推导（ROPE_FACTOR 无需手填）。
+第 3 页监听地址与端口（ENGINE_HOST、API_HOST 与两个端口，含 IPv4 与占用校验）。
+第 4 页显存环境检查——可用显存、权重文件合计、并发总池 / prefill 工作区 / 并发
+估算与结论，底部汇总其它页的失败项。每页有独立的检查报错区（存在性与格式嗅探、
+tokenizer、数值合法性含 MAX_CONTEXT ≤ factor × original_ctx、端口占用等），
+任何页有失败项时不能启动。点"启动服务"会把配置写回
+`service.conf`（bash 兼容写法，写前备份 `service.conf.bak`）再继续启动；服务首次
+就绪后写入 `# start_win: configured` 标记，之后双击不再弹面板。想改配置：托盘右键
+"设置…"，或 `start_win.exe --setup` 强制打开（运行中保存的配置下次启动生效）。
 **配置改根目录 `service.conf`**（与 Linux 启动器同一个文件；Windows 目前只支持 hgn，
 读其中"hgn 权重"一段，GGUF 一段不生效）：换模型
 文件名、调上下文窗口、改端口都编辑它；优先级为 环境变量 > service.conf

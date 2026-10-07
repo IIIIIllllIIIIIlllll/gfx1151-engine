@@ -391,10 +391,31 @@ without a console window: it only puts a tray icon in the notification area
 (right-click: open dashboard / copy API URL / view logs / quit; double-click:
 open dashboard), and output goes to `logs\`. For troubleshooting,
 `start_win.exe --console` restores the console mode (Ctrl+C or closing the
-window stops it). Configuration is **shared with Linux via
-`service.conf`** (edit it to change the model file name or context
-window); environment variables can temporarily override it. Clients
-connect to `http://<host>:8731/v1`.
+window stops it). On the first double-click a native setup panel appears with
+four pages: page 1 Weights — V1 (single-file w4b) / V2 (main + separate
+n-gram file) / GGUF selection, each version showing only its own file rows
+(browseable, optional files can be disabled); GGUF is save-only because the
+Windows launcher supports hgn only (use `start_gguf.sh` on Linux). Page 2
+holds context window / parallel slots / shared KV pool / prefill chunk, plus
+a YaRN checkbox — enable it when the per-request limit exceeds the native
+262144 and the rope factor is derived automatically (no ROPE_FACTOR field);
+page 3 holds listen hosts and ports
+(ENGINE_HOST, API_HOST and both ports, with IPv4 and occupancy validation);
+page 4 is the VRAM environment report — free VRAM, total weight size, KV
+pool / workspace / parallelism estimates with a verdict, plus a summary of
+failures from the other pages. Each page has its own check output area
+(weight existence and format sniffing, tokenizer, numeric validity including
+MAX_CONTEXT ≤ factor × original_ctx, port availability); starting is blocked
+while any page reports a failure. "Start
+service" writes the settings back to `service.conf` (bash-compatible
+syntax, backed up to `service.conf.bak` first) and continues booting; once
+the service is ready a `# start_win: configured` marker is written so the
+panel no longer shows on double-click. To change settings later, use the
+tray right-click "Settings…" item or `start_win.exe --setup` (settings
+saved while running take effect on the next start). Configuration is
+**shared with Linux via `service.conf`** (edit it to change the model file
+name or context window); environment variables can temporarily override
+it. Clients connect to `http://<host>:8731/v1`.
 
 Distribution: copy `build/` + `start_win.exe` + `models/` to any gfx1151
 Windows machine and it just works — **no ROCm/TheRock installation

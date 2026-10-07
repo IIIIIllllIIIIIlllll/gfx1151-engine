@@ -1,0 +1,1377 @@
+// launch_panel.inc — start_win.exe 的启动配置面板（由 launch_win.cpp include，单 TU）。
+// Win32 原生窗口，零新运行时依赖；不用 .rc/对话框模板（llvm-rc 不可用），
+// CreateWindowExW 自建窗口 + 子控件，代码内布局。
+//
+// 面板分 4 页，顶部 4 个 BS_PUSHLIKE|BS_AUTORADIOBUTTON 切换（不引入 comctl32）：
+//   第 1 页 权重：V1（w4b 单文件）/ V2（主体+独立 n-gram）/ GGUF 版本选择，
+//          各版本只显示自己相关的文件行；GGUF 仅保存（Windows 启动器只支持 hgn）。
+//   第 2 页 上下文与并发：MAX_CONTEXT / PARALLEL / 并发总池（KV_POOL_TOKENS）/
+//          KV_PAGED / PREFILL_CHUNK / YaRN 勾选（ROPE_FACTOR 按上限自动推导）。
+//          ROPE_ORIGINAL_CTX 不做 UI 行（用户不该改）：校验仍从 g_conf/环境读，
+//          也不在 kManagedKeys 里，save_conf 永远不会改写 conf 中的该行。
+//   第 3 页 端口与监听：ENGINE_HOST / ENGINE_PORT / API_HOST / API_PORT。
+//   第 4 页 显存检查：HIP 可用显存、权重合计、并发总池/工作区/并发估算、
+//          合计对照结论，以及其它页的失败汇总；"重新检查"按钮在本页。
+// 每页底部有独立的多行只读检查区（[通过]/[失败]/[警告]/[提示] 前缀）。
+// 底部按钮行（启动服务 / 仅保存 / 取消）在所有页之外，恒可见。
+// "启动服务" 仅在所有页无 [失败] 且所选权重为 V1/V2 时可用。
+//
+// 依赖 launch_win.cpp 中已定义的：g_root、g_conf、load_conf()、cfg()、
+// cfg_optional()、to_w()、msgbox()、file_exists()、dir_exists()、same_file()、
+// port_free()、engine_net::address()（launch_win.cpp 已 include engine_net.h）。
+//
+// 入口：panel_run(allow_start)
+//   allow_start=true  ：首次启动 / --setup，按钮为 启动服务 / 仅保存 / 取消
+//   allow_start=false ：服务运行中从托盘"设置…"打开，启动按钮禁用（重启生效）
+// 返回 kPanelStart（已保存，继续启动）/ kPanelSave（仅保存）/ kPanelCancel。
+//
+// 单次显示标记：service.conf 里的一行 "# start_win: configured"。首次服务就绪
+// （report(kReady)）时由 conf_write_marker() 写入；存在则双击不再弹面板。
+// 权重版本选择持久化为另一行注释 "# start_win: weights=v1|v2|gguf"（存在则改写、
+// 不存在则追加）；无标记时按 NGRAM_FILE 是否与 MODEL_FILE 同文件推断 V1/V2。
+
+#include <commdlg.h>
+#include <set>
+
+namespace {
+
+// ---- service.conf 读写 -------------------------------------------------------
+
+const char* kPanelMarker = "# start_win: configured";
+const char* kWeightsMarker = "# start_win: weights=";
+
+std::string conf_path() { return g_root + "\\service.conf"; }
+
+bool read_text_file(const std::string& path, std::string* out) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out->append(buf, n);
+    fclose(f);
+    return true;
+}
+
+bool conf_has_marker() {
+    std::string text;
+    return read_text_file(conf_path(), &text) && text.find(kPanelMarker) != std::string::npos;
+}
+
+// 首次服务就绪后调用：写入"面板已配置"标记（幂等）。
+void conf_write_marker() {
+    if (conf_has_marker()) return;
+    FILE* f = fopen(conf_path().c_str(), "ab");
+    if (!f) return;  // conf 缺失时面板必然会出现，不用补标记
+    const std::string marker_line = std::string("\n") + kPanelMarker + "\n";
+    fwrite(marker_line.data(), 1, marker_line.size(), f);
+    fclose(f);
+}
+
+// 读 "# start_win: weights=v1|v2|gguf" 标记；没有返回空串。
+std::string conf_weights_marker() {
+    std::string text;
+    if (!read_text_file(conf_path(), &text)) return "";
+    const size_t p = text.find(kWeightsMarker);
+    if (p == std::string::npos) return "";
+    size_t b = p + strlen(kWeightsMarker);
+    size_t e = text.find_first_of("\r\n", b);
+    std::string v = text.substr(b, e == std::string::npos ? std::string::npos : e - b);
+    const size_t a = v.find_first_not_of(" \t");
+    const size_t z = v.find_last_not_of(" \t");
+    return a == std::string::npos ? "" : v.substr(a, z - a + 1);
+}
+
+// 写权重版本标记：已有该行则改写，否则追加到文件末尾。
+void conf_write_weights(const char* ver) {
+    const std::string path = conf_path();
+    std::string text;
+    read_text_file(path, &text);
+    const std::string prefix = kWeightsMarker;
+    std::string out;
+    bool written = false;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t eol = text.find('\n', pos);
+        const bool last = eol == std::string::npos;
+        std::string line = text.substr(pos, last ? std::string::npos : eol - pos);
+        pos = last ? text.size() + 1 : eol + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!written && line.compare(0, prefix.size(), prefix) == 0) {
+            out += prefix + ver;
+            written = true;
+        } else {
+            out += line;
+        }
+        if (!last) out += '\n';
+    }
+    if (!written) {
+        if (!out.empty() && out.back() != '\n') out += '\n';
+        out += prefix + ver + "\n";
+    }
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return;
+    fwrite(out.data(), 1, out.size(), f);
+    fclose(f);
+}
+
+// 面板管理的 conf 键（也是环境变量覆盖提示的范围）。
+// ROPE_ORIGINAL_CTX 刻意不在其中：面板不做它的 UI 行，save_conf 也不改写它。
+const char* kManagedKeys[] = {
+    "MODEL_FILE", "NGRAM_FILE", "OVERLAY_FILE", "MTP_FILE", "VISION_FILE",
+    "GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE",
+    "TOKENIZER_DIR", "MAX_CONTEXT", "PARALLEL", "KV_POOL_TOKENS", "KV_PAGED",
+    "PREFILL_CHUNK", "ROPE_FACTOR",
+    "ENGINE_HOST", "ENGINE_PORT", "API_HOST", "API_PORT",
+};
+// 可选文件键：写回时用 ${KEY-值}（无冒号，允许显式置空禁用），与 service.conf 现状一致。
+const char* kOptionalFileKeys[] = {"OVERLAY_FILE", "MTP_FILE", "VISION_FILE",
+                                   "GGUF_MTP_FILE", "GGUF_VISION_FILE"};
+
+bool is_optional_file_key(const std::string& key) {
+    for (const char* k : kOptionalFileKeys)
+        if (key == k) return true;
+    return false;
+}
+
+// 环境变量覆盖提示归属的页：0 权重 / 1 上下文 / 2 端口。
+int page_of_key(const std::string& k) {
+    if (k == "MAX_CONTEXT" || k == "PARALLEL" || k == "KV_POOL_TOKENS" || k == "KV_PAGED" ||
+        k == "PREFILL_CHUNK" || k == "ROPE_FACTOR")
+        return 1;
+    if (k == "ENGINE_HOST" || k == "ENGINE_PORT" || k == "API_HOST" || k == "API_PORT")
+        return 2;
+    return 0;
+}
+
+// 写回 service.conf：注释/空行/未知键原样保留；已知键整行替换为
+// KEY="${KEY:-值}"（可选文件键为 KEY="${KEY-值}"），保持 bash 启动器兼容。
+// 键缺失时追加到文件末尾。写前备份为 service.conf.bak。
+bool save_conf(const std::map<std::string, std::string>& vals, std::string* error) {
+    const std::string path = conf_path();
+    std::string text;
+    read_text_file(path, &text);  // 缺失视为空文件，后面全量追加
+    std::map<std::string, bool> written;
+    std::string out;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t eol = text.find('\n', pos);
+        const bool last = eol == std::string::npos;
+        std::string line = text.substr(pos, last ? std::string::npos : eol - pos);
+        pos = last ? text.size() + 1 : eol + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        // 匹配 ^\s*KEY\s*=（KEY 为受管理键）
+        size_t i = line.find_first_not_of(" \t");
+        bool replaced = false;
+        if (i != std::string::npos && line[i] != '#') {
+            size_t eq = line.find('=', i);
+            if (eq != std::string::npos) {
+                std::string key = line.substr(i, eq - i);
+                while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+                auto it = vals.find(key);
+                if (it != vals.end() && !key.empty()) {
+                    const char* sep = is_optional_file_key(key) ? "-" : ":-";
+                    out += line.substr(0, i) + key + "=\"${" + key + sep + it->second + "}\"";
+                    replaced = true;
+                    written[key] = true;
+                }
+            }
+        }
+        if (!replaced) out += line;
+        if (!last) out += '\n';
+    }
+    for (const auto& kv : vals)
+        if (!written[kv.first]) {
+            const char* sep = is_optional_file_key(kv.first) ? "-" : ":-";
+            out += kv.first + "=\"${" + kv.first + sep + kv.second + "}\"\n";
+        }
+    CopyFileA(path.c_str(), (g_root + "\\service.conf.bak").c_str(), FALSE);
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) {
+        *error = "无法写入 " + path;
+        return false;
+    }
+    fwrite(out.data(), 1, out.size(), f);
+    fclose(f);
+    return true;
+}
+
+// ---- 小工具 -------------------------------------------------------------------
+
+std::string from_w(const std::wstring& w) {
+    if (w.empty()) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()),
+                                      nullptr, 0, nullptr, nullptr);
+    std::string s(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), &s[0], n,
+                        nullptr, nullptr);
+    return s;
+}
+
+std::string trim_copy(const std::string& s) {
+    const size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    const size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+// 不退出的数值解析（面板检查用；launch_win.cpp 的 cfg_int/parse_double 会 fail 退出）
+bool pn_int(const std::string& s, long* out) {
+    if (s.empty()) return false;
+    char* end = nullptr;
+    const long n = strtol(s.c_str(), &end, 10);
+    if (!end || *end) return false;
+    *out = n;
+    return true;
+}
+
+bool pn_double(const std::string& s, double* out) {
+    if (s.empty()) return false;
+    char* end = nullptr;
+    errno = 0;
+    const double n = strtod(s.c_str(), &end);
+    if (errno || !end || *end || end == s.c_str() || n != n) return false;
+    *out = n;
+    return true;
+}
+
+bool file_size_of(const std::string& path, unsigned long long* size) {
+    WIN32_FILE_ATTRIBUTE_DATA d{};
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &d)) return false;
+    *size = (static_cast<unsigned long long>(d.nFileSizeHigh) << 32) | d.nFileSizeLow;
+    return true;
+}
+
+std::string sniff_magic(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return "";
+    char b[4] = {};
+    const size_t n = fread(b, 1, 4, f);
+    fclose(f);
+    return n == 4 ? std::string(b, 4) : "";
+}
+
+std::string gib(double bytes) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.2f", bytes / 1073741824.0);
+    return buf;
+}
+
+// 绝对路径转项目相对（./...，正斜杠），bash 启动器兼容；不在项目下则原样返回。
+std::string make_relative(std::string path) {
+    for (auto& c : path)
+        if (c == '\\') c = '/';
+    std::string root = g_root;
+    for (auto& c : root)
+        if (c == '\\') c = '/';
+    if (path.size() > root.size() + 1 && _strnicmp(path.c_str(), root.c_str(), root.size()) == 0 &&
+        path[root.size()] == '/')
+        return "." + path.substr(root.size());
+    return path;
+}
+
+// ---- 面板取值 -----------------------------------------------------------------
+
+enum WeightsVer : int { kVerV1 = 0, kVerV2 = 1, kVerGguf = 2 };
+
+struct PanelVals {
+    int weights_ver = kVerV1;
+    std::string model, ngram, overlay, mtp, vision, tok;
+    bool no_overlay = false, no_mtp = false, no_vision = false;
+    std::string gguf, gguf_mtp, gguf_vision;
+    bool no_gguf_mtp = false, no_gguf_vision = false;
+    std::string max_context, parallel, kv_pool, prefill_chunk;
+    bool kv_paged = true;
+    std::string rope_factor, rope_original;  // rope_original 无 UI 行，从 conf/环境读
+    std::string engine_host, engine_port, api_host, api_port;
+};
+
+PanelVals panel_vals_from_conf() {
+    PanelVals v;
+    const std::string model_dir = cfg("MODEL_DIR", "models");
+    v.model = cfg("MODEL_FILE", model_dir + "\\heretic.hgn");
+    v.ngram = cfg("NGRAM_FILE", v.model);
+    const bool ngram_follows = v.ngram == v.model;
+    if (ngram_follows) v.ngram.clear();  // 空 = 跟随主模型
+    v.overlay = cfg_optional("OVERLAY_FILE", "");
+    v.no_overlay = v.overlay.empty();
+    v.mtp = cfg_optional("MTP_FILE", model_dir + "\\heretic-mtp.hgn");
+    v.no_mtp = v.mtp.empty();
+    v.vision = cfg_optional("VISION_FILE", model_dir + "\\heretic-vision.hgn");
+    v.no_vision = v.vision.empty();
+    v.gguf = cfg("GGUF_FILE",
+                 model_dir + "\\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf");
+    v.gguf_mtp =
+        cfg_optional("GGUF_MTP_FILE", model_dir + "\\mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf");
+    v.no_gguf_mtp = v.gguf_mtp.empty();
+    v.gguf_vision = cfg_optional("GGUF_VISION_FILE", model_dir + "\\mmproj-BF16.gguf");
+    v.no_gguf_vision = v.gguf_vision.empty();
+    v.tok = cfg("TOKENIZER_DIR", model_dir + "\\tokenizer");
+    v.max_context = cfg("MAX_CONTEXT", "262144");
+    v.parallel = cfg("PARALLEL", "1");
+    v.kv_pool = cfg("KV_POOL_TOKENS", "0");
+    v.kv_paged = cfg("KV_PAGED", "1") != "0";
+    v.prefill_chunk = cfg("PREFILL_CHUNK", "0");
+    v.rope_factor = cfg("ROPE_FACTOR", "1");
+    v.rope_original = cfg("ROPE_ORIGINAL_CTX", "262144");
+    v.engine_host = cfg("ENGINE_HOST", "127.0.0.1");
+    v.engine_port = cfg("ENGINE_PORT", "8730");
+    v.api_host = cfg("API_HOST", "0.0.0.0");
+    v.api_port = cfg("API_PORT", "8731");
+    // 版本：标记优先；无标记时 NGRAM_FILE 解析后与 MODEL_FILE 不同 → V2，否则 V1
+    const std::string marker = conf_weights_marker();
+    if (marker == "v1") v.weights_ver = kVerV1;
+    else if (marker == "v2") v.weights_ver = kVerV2;
+    else if (marker == "gguf") v.weights_ver = kVerGguf;
+    else v.weights_ver = ngram_follows ? kVerV1 : kVerV2;
+    return v;
+}
+
+// 面板值 → conf 键值。只写所选版本相关的权重键，其余保持 conf 原值不动。
+// V1：NGRAM_FILE 写字面量 $MODEL_FILE（bash 默认展开 = 与主模型同文件）。
+// V2：OVERLAY_FILE 写空（${KEY-} 无冒号风格，空=禁用）；NGRAM_FILE 为独立文件。
+// GGUF：hgn 各键不动，只写 GGUF_* 与公共键。
+std::map<std::string, std::string> panel_vals_to_conf(const PanelVals& v) {
+    std::map<std::string, std::string> m;
+    if (v.weights_ver == kVerGguf) {
+        m["GGUF_FILE"] = v.gguf;
+        m["GGUF_MTP_FILE"] = v.no_gguf_mtp ? "" : v.gguf_mtp;
+        m["GGUF_VISION_FILE"] = v.no_gguf_vision ? "" : v.gguf_vision;
+    } else {
+        m["MODEL_FILE"] = v.model;
+        if (v.weights_ver == kVerV2) {
+            m["NGRAM_FILE"] = v.ngram;
+            m["OVERLAY_FILE"] = "";
+        } else {
+            m["NGRAM_FILE"] = "$MODEL_FILE";
+            m["OVERLAY_FILE"] = v.no_overlay ? "" : v.overlay;
+        }
+        m["MTP_FILE"] = v.no_mtp ? "" : v.mtp;
+        m["VISION_FILE"] = v.no_vision ? "" : v.vision;
+    }
+    std::string tok = v.tok;
+    while (!tok.empty() && (tok.back() == '\\' || tok.back() == '/')) tok.pop_back();
+    m["TOKENIZER_DIR"] = tok;
+    m["MAX_CONTEXT"] = v.max_context;
+    m["PARALLEL"] = v.parallel;
+    m["KV_POOL_TOKENS"] = v.kv_pool;
+    m["KV_PAGED"] = v.kv_paged ? "1" : "0";
+    m["PREFILL_CHUNK"] = v.prefill_chunk;
+    m["ROPE_FACTOR"] = v.rope_factor;
+    m["ENGINE_HOST"] = v.engine_host;
+    m["ENGINE_PORT"] = v.engine_port;
+    m["API_HOST"] = v.api_host;
+    m["API_PORT"] = v.api_port;
+    return m;
+}
+
+// ---- 环境检查（按页拆分） -------------------------------------------------------
+
+struct CheckLines {
+    std::string text;  // \r\n 分隔，前缀 [通过]/[失败]/[警告]/[提示]
+    std::vector<std::string> fatals;  // 失败行正文（第 4 页汇总用）
+    bool fatal = false;
+};
+
+void check_line(CheckLines& c, const char* level, const std::string& msg) {
+    c.text += "[" + std::string(level) + "] " + msg + "\r\n";
+    if (!strcmp(level, "失败")) {
+        c.fatal = true;
+        c.fatals.push_back(msg);
+    }
+}
+
+void check_weight(CheckLines& c, const char* label, const std::string& path,
+                  bool required, bool warn_skip) {
+    if (!file_exists(path)) {
+        if (warn_skip)
+            check_line(c, "警告", std::string(label) + "：找不到 " + path + "，引擎将跳过");
+        else if (required)
+            check_line(c, "失败", std::string(label) + "：找不到 " + path);
+        return;
+    }
+    unsigned long long size = 0;
+    file_size_of(path, &size);
+    if (size < 100ull * 1024 * 1024) {
+        check_line(c, "失败",
+                   std::string(label) + "：文件异常小（" + std::to_string(size) + " B）" + path);
+        return;
+    }
+    // magic 嗅探：.hgn → HGN1（src/hgn.h），.gguf → GGUF；其它扩展名跳过
+    const size_t dot = path.find_last_of('.');
+    const std::string ext =
+        dot == std::string::npos ? "" : path.substr(dot + 1);
+    if (_stricmp(ext.c_str(), "hgn") == 0 || _stricmp(ext.c_str(), "gguf") == 0) {
+        const std::string want = _stricmp(ext.c_str(), "hgn") == 0 ? "HGN1" : "GGUF";
+        const std::string magic = sniff_magic(path);
+        if (magic != want) {
+            check_line(c, "失败",
+                       std::string(label) + "：不是有效的 ." + ext + " 文件（magic 非 " + want +
+                           "）" + path);
+            return;
+        }
+        check_line(c, "通过",
+                   std::string(label) + "：" + path + "（" + gib((double)size) + " GiB，" + want +
+                       "）");
+    } else {
+        check_line(c, "警告", std::string(label) + "：" + path + "（" + gib((double)size) +
+                                  " GiB，扩展名未知，未做格式嗅探）");
+    }
+}
+
+// 第 1 页：权重（按所选版本检查对应的文件集合 + tokenizer）。
+void check_weights_page(CheckLines& c, const PanelVals& v) {
+    if (v.weights_ver == kVerGguf) {
+        check_weight(c, "GGUF 主分片", v.gguf, true, false);
+        if (v.gguf.find("-00001-of-") != std::string::npos)
+            check_line(c, "通过", "GGUF 分片命名：填的是第 1 个分片，其余分片须在同一目录");
+        else
+            check_line(c, "警告",
+                       "GGUF_FILE 文件名不含 -00001-of-XXXXX 分片命名；多分片模型请填第 1 个分片");
+        if (v.no_gguf_mtp)
+            check_line(c, "通过", "GGUF MTP：不使用");
+        else
+            check_weight(c, "GGUF MTP", v.gguf_mtp, true, false);
+        if (v.no_gguf_vision)
+            check_line(c, "通过", "GGUF 视觉塔：不使用");
+        else
+            check_weight(c, "GGUF 视觉塔", v.gguf_vision, true, false);
+        check_line(c, "警告",
+                   "Windows 启动器只支持 hgn 权重；GGUF 配置仅保存（Linux 用 bash "
+                   "start_gguf.sh 启动）");
+    } else {
+        check_weight(c, "主模型", v.model, true, false);
+        if (v.weights_ver == kVerV2) {
+            if (v.ngram.empty())
+                check_line(c, "失败", "n-gram 表：V2 权重必须填独立文件");
+            else if (same_file(v.model, v.ngram))
+                check_line(c, "失败", "n-gram 表：V2 必须是与主模型不同的独立文件");
+            else
+                check_weight(c, "n-gram 表", v.ngram, true, false);
+            check_line(c, "通过", "overlay：V2 不使用（保存时置空，引擎本就会跳过）");
+        } else {
+            check_line(c, "通过", "n-gram 表：与主模型同文件（V1 内置）");
+            if (v.no_overlay)
+                check_line(c, "通过", "overlay：不使用");
+            else
+                check_weight(c, "overlay", v.overlay, false, true);
+        }
+        if (v.no_mtp)
+            check_line(c, "通过", "MTP 草稿：不使用");
+        else
+            check_weight(c, "MTP 草稿", v.mtp, true, false);
+        if (v.no_vision)
+            check_line(c, "通过", "视觉塔：不使用");
+        else
+            check_weight(c, "视觉塔", v.vision, true, false);
+    }
+    if (!dir_exists(v.tok))
+        check_line(c, "失败", "tokenizer：目录不存在 " + v.tok);
+    else if (!file_exists(v.tok + "\\tokenizer.json"))
+        check_line(c, "失败", "tokenizer：找不到 " + v.tok + "\\tokenizer.json");
+    else
+        check_line(c, "通过", "tokenizer：" + v.tok + "\\tokenizer.json");
+}
+
+// 第 2 页：上下文与并发、YaRN 的数值校验（与启动流程同一套规则）。
+void check_context_page(CheckLines& c, const PanelVals& v) {
+    // 说明行（不参与判定，恒在列表最上方）
+    c.text += "· 单请求上限：一条请求的输入+输出最大 token 数，模型原生 262144。\r\n";
+    c.text += "· 并发总池：所有并发共享的 KV 缓存总量（类似 vLLM 的 KV cache），单请求上限不能超过它；\r\n";
+    c.text += "· 并发合计占用超过总池时新请求会报错。默认跟随单请求上限；Windows 最大 512K。\r\n";
+    c.text += "· YaRN：单请求上限超过原生 262144 时开启，扩展倍数按上限自动推导。\r\n";
+    long maxctx = 0, parallel = 1, kv_pool = 0, prefill = 0, rope_orig = 0;
+    double factor = 1;
+    bool nums_ok = true;
+    auto need_int = [&](const char* name, const std::string& s, long lo, long hi, long* out) {
+        if (!pn_int(s, out) || *out < lo || *out > hi) {
+            check_line(c, "失败", std::string(name) + " 必须是 " + std::to_string(lo) + "-" +
+                                      std::to_string(hi) + " 的整数（当前为 \"" + s + "\"）");
+            nums_ok = false;
+            return false;
+        }
+        return true;
+    };
+    need_int("MAX_CONTEXT", v.max_context, 1024, 1 << 20, &maxctx);
+    need_int("PARALLEL", v.parallel, 1, 8, &parallel);
+    need_int("KV_POOL_TOKENS", v.kv_pool, 0, 1 << 24, &kv_pool);
+    need_int("PREFILL_CHUNK", v.prefill_chunk, 0, 1 << 20, &prefill);
+    // ROPE_ORIGINAL_CTX 无 UI 行，但校验照做（conf 里填坏时启动器同样会拒）
+    need_int("ROPE_ORIGINAL_CTX", v.rope_original, 1, 1 << 30, &rope_orig);
+    if (!pn_double(v.rope_factor, &factor) || factor < 1) {
+        check_line(c, "失败", "ROPE_FACTOR 必须 >=1（当前为 \"" + v.rope_factor + "\"）");
+        nums_ok = false;
+    }
+    if (!nums_ok) return;
+    if (parallel > 1 && !v.kv_paged)
+        check_line(c, "失败", "PARALLEL>1 需要 KV_PAGED=1");
+    if (factor > 1 && maxctx > factor * rope_orig)
+        // 勾选 YaRN 时 factor 按上限自动推导，理论上不会触发；留作兜底
+        check_line(c, "失败",
+                   "MAX_CONTEXT=" + std::to_string(maxctx) +
+                       " 超出 YaRN 上限 ROPE_FACTOR×ROPE_ORIGINAL_CTX=" +
+                       std::to_string((long)(factor * rope_orig)) +
+                       "；调小 MAX_CONTEXT 或开启 YaRN（并发容量用 KV_POOL_TOKENS 扩）");
+    if (factor <= 1 && maxctx > rope_orig)
+        check_line(c, "警告", "未开启 YaRN 且 MAX_CONTEXT=" + std::to_string(maxctx) +
+                                  " 超过原生 " + std::to_string(rope_orig) +
+                                  "，超出部分的位置编码未验证；建议开启 YaRN");
+    // 单请求不能超过 KV 缓存总量（vLLM 语义；kv_pool=0 = 跟随上限，不触发）
+    if (kv_pool > 0 && maxctx > kv_pool)
+        check_line(c, "失败", "单请求上限 MAX_CONTEXT=" + std::to_string(maxctx) +
+                                  " 不能大于并发总池 KV_POOL_TOKENS=" +
+                                  std::to_string(kv_pool) + "；调小上限或调大总池");
+    // Windows 设备内存是硬上限 95 GiB 的 arena：512K 池（45,696 B/token ≈ 22.3 GiB）
+    // 已是权重 62.1 GiB + prefill 工作区 6.9 GiB 之后放得下的上限。有效值 = max(池, 上限)
+    // （0 = 跟随，上限超 512K 时跟随逻辑同样会把池顶超）。
+    const long pool_eff = kv_pool > maxctx ? kv_pool : maxctx;
+    if (pool_eff > 524288)
+        check_line(c, "失败", "并发总池有效值 " + std::to_string(pool_eff) +
+                                  " 超过 512K（524288 token）：Windows 95 GiB 显存 arena"
+                                  " 放不下更大的池；调小 MAX_CONTEXT 或 KV_POOL_TOKENS");
+    if (!c.fatal) check_line(c, "通过", "数值校验：上下文/并发/YaRN 参数合法");
+}
+
+// 第 3 页：监听地址与端口。service_running 时占用检查降级为提示。
+void check_ports_page(CheckLines& c, const PanelVals& v, bool service_running) {
+    // 说明行（不参与判定，恒在列表最上方）
+    c.text += "· 引擎是内部行协议，由 API 自动桥接，无需直连；浏览器/客户端连 API 端口。\r\n";
+    c.text += "· 监听地址：127.0.0.1 = 仅本机（引擎推荐），0.0.0.0 = 对外开放。\r\n";
+    sockaddr_in tmp{};
+    if (v.engine_host.empty() || !engine_net::address(v.engine_host, 1, &tmp))
+        check_line(c, "失败", "ENGINE_HOST 必须是 IPv4 点分地址，不支持主机名（当前为 \"" +
+                                  v.engine_host + "\"）");
+    else if (v.engine_host != "127.0.0.1")
+        check_line(c, "警告", "ENGINE_HOST=" + v.engine_host +
+                                  " 会把引擎行协议暴露到网络，仅确需外部直连时这样设");
+    if (v.api_host.empty() || !engine_net::address(v.api_host, 1, &tmp))
+        check_line(c, "失败",
+                   "API_HOST 必须是 IPv4 点分地址（当前为 \"" + v.api_host + "\"）");
+    long eport = 0, aport = 0;
+    bool nums_ok = true;
+    auto need_int = [&](const char* name, const std::string& s, long* out) {
+        if (!pn_int(s, out) || *out < 1 || *out > 65535) {
+            check_line(c, "失败",
+                       std::string(name) + " 必须是 1-65535 的整数（当前为 \"" + s + "\"）");
+            nums_ok = false;
+        }
+    };
+    need_int("ENGINE_PORT", v.engine_port, &eport);
+    need_int("API_PORT", v.api_port, &aport);
+    if (nums_ok) {
+        if (eport == aport) {
+            check_line(c, "失败", "ENGINE_PORT 与 API_PORT 必须不同");
+        } else if (service_running) {
+            check_line(c, "提示", "端口 " + std::to_string(eport) + "/" +
+                                      std::to_string(aport) + "：由当前服务占用（正常）");
+        } else {
+            if (!port_free((int)eport))
+                check_line(c, "失败", "端口 " + std::to_string(eport) + " 已被占用");
+            if (!port_free((int)aport))
+                check_line(c, "失败", "端口 " + std::to_string(aport) + " 已被占用");
+            if (port_free((int)eport) && port_free((int)aport))
+                check_line(c, "通过", "端口 " + std::to_string(eport) + "/" +
+                                          std::to_string(aport) + " 空闲");
+        }
+    }
+    if (!c.fatal) check_line(c, "通过", "监听地址与端口合法");
+}
+
+// GGUF 分片（name-00001-of-00004.gguf …）合计大小；单文件/找不到时分片数为 0/1。
+unsigned long long gguf_shards_size(const std::string& first, int* count) {
+    *count = 0;
+    unsigned long long total = 0;
+    const size_t of = first.find("-of-");
+    size_t dash = std::string::npos;
+    if (of != std::string::npos && of > 0) dash = first.rfind('-', of - 1);
+    if (dash == std::string::npos) {
+        unsigned long long s = 0;
+        if (file_size_of(first, &s)) {
+            total = s;
+            *count = 1;
+        }
+        return total;
+    }
+    const std::string pattern = first.substr(0, dash) + "-*" + first.substr(of);
+    WIN32_FIND_DATAA fd{};
+    HANDLE hf = FindFirstFileA(pattern.c_str(), &fd);
+    if (hf == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            total += (static_cast<unsigned long long>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
+            ++*count;
+        }
+    } while (FindNextFileA(hf, &fd));
+    FindClose(hf);
+    return total;
+}
+
+// 第 4 页：显存环境检查完整报告。service_running 时余量结论降级为对照提示。
+void check_vram_page(CheckLines& c, const PanelVals& v, bool service_running) {
+    // 显存：动态加载 HIP（启动器不链 amdhip64，DLL 缺失只降级不阻塞）
+    size_t hip_free = 0, hip_total = 0;
+    bool hip_ok = false;
+    if (HMODULE hip = LoadLibraryA("build\\amdhip64_7.dll")) {
+        auto p_init = reinterpret_cast<int (*)(unsigned int)>(GetProcAddress(hip, "hipInit"));
+        auto p_info =
+            reinterpret_cast<int (*)(size_t*, size_t*)>(GetProcAddress(hip, "hipMemGetInfo"));
+        if (p_init && p_info && p_init(0) == 0 && p_info(&hip_free, &hip_total) == 0)
+            hip_ok = true;
+    }
+    if (hip_ok)
+        check_line(c, "提示", "HIP 显存：总量 " + gib((double)hip_total) + " GiB，当前可用 " +
+                                  gib((double)hip_free) + " GiB");
+    else
+        check_line(c, "警告", "无法查询显存（build\\amdhip64_7.dll 缺失或驱动异常），"
+                              "下面的估算请自行对照");
+
+    // 数值（第 2 页）解析失败时按默认粗估，不阻塞报告
+    long maxctx = 262144, parallel = 1, kv_pool = 0, prefill = 0;
+    pn_int(v.max_context, &maxctx);
+    pn_int(v.parallel, &parallel);
+    pn_int(v.kv_pool, &kv_pool);
+    pn_int(v.prefill_chunk, &prefill);
+    if (maxctx < 1) maxctx = 262144;
+    if (parallel < 1) parallel = 1;
+    if (kv_pool < 0) kv_pool = 0;
+    if (prefill < 0) prefill = 0;
+
+    // 权重文件总大小：按第 1 页所选版本的文件集合，去重
+    unsigned long long weights = 0;
+    if (v.weights_ver == kVerGguf) {
+        int shards = 0;
+        weights += gguf_shards_size(v.gguf, &shards);
+        if (shards > 0)
+            check_line(c, "提示", "GGUF 权重：" + std::to_string(shards) + " 个分片合计 " +
+                                      gib((double)weights) + " GiB");
+        else
+            check_line(c, "提示", "GGUF 主分片找不到，权重按 0 估算");
+        const std::string side[] = {v.no_gguf_mtp ? "" : v.gguf_mtp,
+                                    v.no_gguf_vision ? "" : v.gguf_vision};
+        unsigned long long extra = 0;
+        for (const std::string& f : side) {
+            unsigned long long s = 0;
+            if (!f.empty() && file_size_of(f, &s)) extra += s;
+        }
+        if (extra) {
+            weights += extra;
+            check_line(c, "提示", "GGUF sidecar（MTP/视觉塔）：" + gib((double)extra) + " GiB");
+        }
+        check_line(c, "提示", "GGUF 配置在 Windows 不启动，本页估算仅供 Linux 参考");
+    } else {
+        const std::string files[] = {v.model,
+                                     v.weights_ver == kVerV2 ? v.ngram
+                                                             : (v.no_overlay ? "" : v.overlay),
+                                     v.no_mtp ? "" : v.mtp, v.no_vision ? "" : v.vision};
+        std::vector<std::string> uniq;
+        for (const std::string& f : files) {
+            if (f.empty() || !file_exists(f)) continue;
+            bool dup = false;
+            for (const std::string& u : uniq)
+                if (same_file(f, u)) {
+                    dup = true;
+                    break;
+                }
+            if (!dup) uniq.push_back(f);
+        }
+        for (const std::string& u : uniq) {
+            unsigned long long s = 0;
+            if (file_size_of(u, &s)) weights += s;
+        }
+        check_line(c, "提示", "权重文件：" + std::to_string(uniq.size()) + " 个合计 " +
+                                  gib((double)weights) + " GiB");
+    }
+
+    // 显存估算（系数来自 src/gpu/parts/40_model.inc 分配代码核算，2026-10：
+    // 45,696 B/token = 12 QSA 层 + 1 MTP 层的 BF16 KV + BTV 转置 V +
+    // index f16 twin + d_iscores；512K 实机 ≈ 22.3 GiB 吻合）。
+    const double kKvBytesPerToken = 45696.0;
+    // 0 = 跟随 MAX_CONTEXT；std::max 与 windows.h 的 max 宏冲突，手写比较
+    const double pool_tokens = (double)(kv_pool > maxctx ? kv_pool : maxctx);
+    const double kv_bytes = pool_tokens * kKvBytesPerToken;
+    const double chunk = prefill > 0 ? (double)prefill : 8192.0;
+    const double ws_bytes = chunk / 8192.0 * 6.9 * 1073741824.0;  // 8192≈6.9 GiB 实测
+    const double gdn_bytes = parallel * 0.12 * 1073741824.0;      // 每路 GDN 状态
+    const double total = (double)weights + kv_bytes + ws_bytes + gdn_bytes;
+    check_line(c, "提示", "并发总池：" + std::to_string((long)pool_tokens) +
+                              " token × 44.6 KiB ≈ " + gib(kv_bytes) + " GiB");
+    check_line(c, "提示", "prefill 工作区：chunk " + std::to_string((long)chunk) + " ≈ " +
+                              gib(ws_bytes) + " GiB");
+    check_line(c, "提示", "并发 GDN 状态：" + std::to_string(parallel) + " 路 ≈ " +
+                              gib(gdn_bytes) + " GiB");
+    if (hip_ok && !service_running) {
+        if (total > (double)hip_free)
+            check_line(c, "失败", "预计占用 " + gib(total) + " GiB 超过当前可用 " +
+                                      gib((double)hip_free) + " GiB，启动会 OOM");
+        else if ((double)hip_free - total < 4.0 * 1073741824.0)
+            check_line(c, "警告", "预计占用 " + gib(total) + " GiB，余量不足 4 GiB");
+        else if (total > 95.0 * 1073741824.0)
+            check_line(c, "警告", "预计占用 " + gib(total) +
+                                      " GiB 超过引擎 arena 上限 95 GiB，超出部分回退 hipMalloc");
+        else
+            check_line(c, "通过", "显存估算 ≈ " + gib(total) + " / 可用 " +
+                                      gib((double)hip_free) + " GiB");
+    } else if (hip_ok) {
+        check_line(c, "提示", "服务运行中：估算 ≈ " + gib(total) + " GiB，仅对照总量 " +
+                                  gib((double)hip_total) + " GiB");
+    }
+}
+
+struct AllChecks {
+    CheckLines weights, context, ports, vram;
+    bool fatal() const { return weights.fatal || context.fatal || ports.fatal || vram.fatal; }
+};
+
+AllChecks panel_checks(const PanelVals& v, bool service_running) {
+    AllChecks a;
+    check_weights_page(a.weights, v);
+    check_context_page(a.context, v);
+    check_ports_page(a.ports, v, service_running);
+    check_vram_page(a.vram, v, service_running);
+    // 环境变量覆盖提示，归入对应页
+    for (const char* key : kManagedKeys) {
+        const char* e = getenv(key);
+        if (!e || !*e) continue;
+        CheckLines& dst = page_of_key(key) == 1   ? a.context
+                          : page_of_key(key) == 2 ? a.ports
+                                                  : a.weights;
+        check_line(dst, "警告",
+                   std::string(key) + " 正被环境变量覆盖（=\"" + e + "\"），面板改动不生效");
+    }
+    return a;
+}
+
+// ---- 面板窗口 -----------------------------------------------------------------
+
+// PanelResult（kPanelStart/kPanelSave/kPanelCancel）在 launch_win.cpp 前向声明
+// 段中完整定义（report()/on_menu() 在本文件之前就要用到枚举值）。
+
+enum PanelId : int {
+    kBtnStart = 100, kBtnSave, kBtnCancel, kBtnRecheck,
+    kTab1, kTab2, kTab3, kTab4,
+    kWVer1, kWVer2, kWVer3,
+    kEdModel, kEdNgram, kEdOverlay, kEdMtp, kEdVision, kEdTok,
+    kEdGguf, kEdGgufMtp, kEdGgufVision,
+    kBrModel, kBrNgram, kBrOverlay, kBrMtp, kBrVision,
+    kBrGguf, kBrGgufMtp, kBrGgufVision,
+    kOffOverlay, kOffMtp, kOffVision, kOffGgufMtp, kOffGgufVision,
+    kEdMaxctx, kCbParallel, kEdKvPool, kCkKvPaged, kEdPrefill,
+    kCkYarn,
+    kEdEHost, kEdEPort, kEdAHost, kEdAPort,
+    kEdOut1, kEdOut2, kEdOut3, kEdReport, kEdSummary,
+};
+
+struct FileRow {
+    HWND label = nullptr, off = nullptr, edit = nullptr, browse = nullptr;
+};
+
+struct PanelCtl {
+    HWND tabs[4] = {};
+    HWND wver[3] = {};
+    FileRow row_model, row_ngram, row_overlay, row_mtp, row_vision;
+    FileRow row_gguf, row_gguf_mtp, row_gguf_vision, row_tok;
+    HWND tok_hint = nullptr, ver_note = nullptr;
+    HWND maxctx = nullptr, parallel = nullptr, kv_pool = nullptr, kv_paged = nullptr,
+         prefill = nullptr;
+    HWND yarn = nullptr;  // "YaRN 长上下文扩展" 勾选框（ROPE_FACTOR 自动推导，无编辑行）
+    HWND ehost = nullptr, eport = nullptr, ahost = nullptr, aport = nullptr;
+    HWND out1 = nullptr, out2 = nullptr, out3 = nullptr, report = nullptr, summary = nullptr;
+    HWND start = nullptr;
+};
+PanelCtl g_pc;
+HWND g_panel = nullptr;
+PanelResult g_panel_result = kPanelCancel;
+bool g_panel_done = false;
+bool g_panel_running = false;       // 服务运行中打开（启动按钮禁用）
+bool g_panel_allow_start = true;    // panel_run 的 allow_start
+int g_weights_ver = kVerV1;         // 当前显示的权重版本（布局用）
+bool g_pool_touched = false;        // 用户手动改过并发总池框（false = 跟随单请求上限显示）
+bool g_pool_guard = false;          // 程序自己在写总池框（防 EN_CHANGE 误置 touched）
+AllChecks g_last_checks;
+std::vector<HWND> g_page_ctls[4];   // 每页的控件句柄（切页时整体 ShowWindow）
+
+// 布局常量：客户区 644×504，内容右缘 636。
+// label 列要装下 "单请求上限 (token)"（高 DPI 下约 185px），故 kLblW=190。
+const int kCliW = 644, kCliH = 504;
+const int kLblX = 12, kLblW = 190, kEdX = 202;
+const int kOffW = 88;                 // "不使用" checkbox（勾选框 + 3 个汉字）
+const int kEdPlainW = 354;            // 无 checkbox 文件行的 EDIT 宽（202..556）
+const int kBrX = 564, kBrW = 72;      // 浏览按钮
+const int kHintX = 328, kHintW = 308; // 第 2 页行尾提示（edit 202+120=322 右侧）
+const int kListBottom = 452;          // 各页检查区下缘（底部按钮行在其下）
+
+HWND add_ctrl(HWND parent, const wchar_t* cls, DWORD style, int x, int y, int w, int h,
+              const wchar_t* text, int id) {
+    HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, parent,
+                             reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                             GetModuleHandleW(nullptr), nullptr);
+    SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+    return c;
+}
+
+HWND add_label(HWND parent, int x, int y, const wchar_t* text, int w = kLblW) {
+    return add_ctrl(parent, L"Static", SS_LEFTNOWORDWRAP, x, y + 3, w, 18, text, 0);
+}
+
+// 建控件并登记进某页（page=-1 表示恒可见，不参与切页）
+HWND pctl(int page, HWND parent, const wchar_t* cls, DWORD style, int x, int y, int w, int h,
+          const wchar_t* text, int id) {
+    HWND c = add_ctrl(parent, cls, style, x, y, w, h, text, id);
+    if (page >= 0) g_page_ctls[page].push_back(c);
+    return c;
+}
+
+HWND plabel(int page, HWND parent, int x, int y, const wchar_t* text, int w = kLblW) {
+    return pctl(page, parent, L"Static", SS_LEFTNOWORDWRAP, x, y + 3, w, 18, text, 0);
+}
+
+void set_edit(HWND h, const std::string& s) { SetWindowTextW(h, to_w(s).c_str()); }
+
+std::string get_edit(HWND h) {
+    const int n = GetWindowTextLengthW(h);
+    std::wstring w(static_cast<size_t>(n) + 1, L'\0');
+    GetWindowTextW(h, &w[0], n + 1);
+    w.resize(static_cast<size_t>(n));
+    return trim_copy(from_w(w));
+}
+
+bool get_check(HWND h) { return SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED; }
+
+void set_optional_row_state(HWND off, HWND edit, HWND browse) {
+    const bool disabled = get_check(off);
+    EnableWindow(edit, !disabled);
+    if (browse) EnableWindow(browse, !disabled);
+}
+
+// YaRN 勾选 → ROPE_FACTOR = max(2, ceil(单请求上限 / ROPE_ORIGINAL_CTX))；
+// 不勾 → 1。上限/原生值解析失败时按默认粗估（校验页会单独报 [失败]）。
+std::string derive_rope_factor(bool yarn_on, const std::string& max_context,
+                               const std::string& rope_original) {
+    if (!yarn_on) return "1";
+    long mc = 262144, ro = 262144;
+    if (!pn_int(max_context, &mc) || mc < 1) mc = 262144;
+    if (!pn_int(rope_original, &ro) || ro < 1) ro = 262144;
+    long f = (mc + ro - 1) / ro;
+    if (f < 2) f = 2;
+    return std::to_string(f);
+}
+
+PanelVals panel_collect() {
+    PanelVals v;
+    v.weights_ver = get_check(g_pc.wver[2])   ? kVerGguf
+                    : get_check(g_pc.wver[1]) ? kVerV2
+                                              : kVerV1;
+    v.model = get_edit(g_pc.row_model.edit);
+    v.ngram = get_edit(g_pc.row_ngram.edit);
+    v.no_overlay = get_check(g_pc.row_overlay.off);
+    v.overlay = get_edit(g_pc.row_overlay.edit);
+    v.no_mtp = get_check(g_pc.row_mtp.off);
+    v.mtp = get_edit(g_pc.row_mtp.edit);
+    v.no_vision = get_check(g_pc.row_vision.off);
+    v.vision = get_edit(g_pc.row_vision.edit);
+    v.gguf = get_edit(g_pc.row_gguf.edit);
+    v.no_gguf_mtp = get_check(g_pc.row_gguf_mtp.off);
+    v.gguf_mtp = get_edit(g_pc.row_gguf_mtp.edit);
+    v.no_gguf_vision = get_check(g_pc.row_gguf_vision.off);
+    v.gguf_vision = get_edit(g_pc.row_gguf_vision.edit);
+    v.tok = get_edit(g_pc.row_tok.edit);
+    v.max_context = get_edit(g_pc.maxctx);
+    const int sel = static_cast<int>(SendMessageW(g_pc.parallel, CB_GETCURSEL, 0, 0));
+    v.parallel = std::to_string(sel >= 0 ? sel + 1 : 1);
+    v.kv_pool = get_edit(g_pc.kv_pool);
+    // 并发总池的跟随语义：框值 == 单请求上限（含程序跟随填充）或显式 0/跟随状态 → 存 0
+    if (v.kv_pool == v.max_context || v.kv_pool == "0" || !g_pool_touched) v.kv_pool = "0";
+    v.kv_paged = get_check(g_pc.kv_paged);
+    v.prefill_chunk = get_edit(g_pc.prefill);
+    v.rope_original = cfg("ROPE_ORIGINAL_CTX", "262144");  // 无 UI 行，conf/环境原样读
+    v.rope_factor = derive_rope_factor(get_check(g_pc.yarn), v.max_context, v.rope_original);
+    v.engine_host = get_edit(g_pc.ehost);
+    v.engine_port = get_edit(g_pc.eport);
+    v.api_host = get_edit(g_pc.ahost);
+    v.api_port = get_edit(g_pc.aport);
+    return v;
+}
+
+// 第 4 页底部：其它页的失败汇总（GGUF 选中时也在这里说明启动受限原因）。
+void refresh_outputs(const PanelVals& v, const AllChecks& c) {
+    set_edit(g_pc.out1, c.weights.text);
+    set_edit(g_pc.out2, c.context.text);
+    set_edit(g_pc.out3, c.ports.text);
+    set_edit(g_pc.report, c.vram.text);
+    const CheckLines* pages[3] = {&c.weights, &c.context, &c.ports};
+    const char* names[3] = {"第 1 页", "第 2 页", "第 3 页"};
+    size_t n = 0;
+    for (const CheckLines* p : pages) n += p->fatals.size();
+    std::string s;
+    if (n == 0) {
+        s = "其它页没有失败项。\r\n";
+    } else {
+        s = "其它页还有 " + std::to_string(n) + " 项失败：\r\n";
+        for (int i = 0; i < 3; ++i)
+            for (const std::string& f : pages[i]->fatals)
+                s += std::string(names[i]) + "：" + f + "\r\n";
+    }
+    if (v.weights_ver == kVerGguf)
+        s += "已选 GGUF 权重：Windows 启动器只支持 hgn，配置仅保存"
+             "（Linux 用 bash start_gguf.sh 启动）。\r\n";
+    set_edit(g_pc.summary, s);
+}
+
+void panel_recheck() {
+    const PanelVals v = panel_collect();
+    g_last_checks = panel_checks(v, g_panel_running);
+    refresh_outputs(v, g_last_checks);
+    // 启动门禁：所有页无 [失败] 且所选权重为 V1/V2
+    EnableWindow(g_pc.start,
+                 g_panel_allow_start && !g_last_checks.fatal() && v.weights_ver != kVerGguf);
+}
+
+bool panel_apply_and_save(std::string* error) {
+    const PanelVals v = panel_collect();
+    const auto conf_map = panel_vals_to_conf(v);
+    if (!save_conf(conf_map, error)) return false;
+    conf_write_weights(v.weights_ver == kVerV2    ? "v2"
+                       : v.weights_ver == kVerGguf ? "gguf"
+                                                   : "v1");
+    // 同步内存中的 g_conf，让接下来的启动流程读到新值
+    for (const auto& kv : conf_map) g_conf[kv.first] = kv.second;
+    if (v.weights_ver == kVerV1) g_conf["NGRAM_FILE"] = v.model;  // 空 = 跟随主模型
+    return true;
+}
+
+bool panel_browse(HWND edit) {
+    wchar_t buf[MAX_PATH] = L"";
+    const std::string cur = get_edit(edit);
+    if (!cur.empty()) wcsncpy_s(buf, to_w(cur).c_str(), MAX_PATH - 1);
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_panel;
+    ofn.lpstrFilter = L"hgn 权重 (*.hgn)\0*.hgn\0GGUF 权重 (*.gguf)\0*.gguf\0所有文件 (*.*)\0*.*\0";
+    ofn.lpstrFile = buf;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    ofn.lpstrTitle = L"选择权重文件";
+    if (!GetOpenFileNameW(&ofn)) return false;
+    set_edit(edit, make_relative(from_w(buf)));
+    return true;
+}
+
+// 把一个文件行排到指定 y（SWP_SHOWWINDOW），或整行隐藏
+void place_row(const FileRow& r, int y, bool visible) {
+    const UINT flags = SWP_NOZORDER | (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW);
+    const int ex = r.off ? kEdX + kOffW + 8 : kEdX;
+    const int ew = 556 - ex;
+    SetWindowPos(r.label, nullptr, kLblX, y + 3, kLblW, 18, flags);
+    if (r.off) SetWindowPos(r.off, nullptr, kEdX, y, kOffW, 20, flags);
+    SetWindowPos(r.edit, nullptr, ex, y, ew, 22, flags);
+    if (r.browse) SetWindowPos(r.browse, nullptr, kBrX, y - 1, kBrW, 24, flags);
+}
+
+// 第 1 页布局：按版本只显示相关文件行，顺序重排，隐藏其余
+void layout_page1(int ver) {
+    g_weights_ver = ver;
+    const FileRow* order[9];
+    int n = 0;
+    if (ver == kVerGguf) {
+        order[n++] = &g_pc.row_gguf;
+        order[n++] = &g_pc.row_gguf_mtp;
+        order[n++] = &g_pc.row_gguf_vision;
+        order[n++] = &g_pc.row_tok;
+    } else if (ver == kVerV2) {
+        order[n++] = &g_pc.row_model;
+        order[n++] = &g_pc.row_ngram;
+        order[n++] = &g_pc.row_mtp;
+        order[n++] = &g_pc.row_vision;
+        order[n++] = &g_pc.row_tok;
+    } else {
+        order[n++] = &g_pc.row_model;
+        order[n++] = &g_pc.row_overlay;
+        order[n++] = &g_pc.row_mtp;
+        order[n++] = &g_pc.row_vision;
+        order[n++] = &g_pc.row_tok;
+    }
+    const FileRow* all[9] = {&g_pc.row_model,  &g_pc.row_ngram,  &g_pc.row_overlay,
+                             &g_pc.row_mtp,    &g_pc.row_vision, &g_pc.row_gguf,
+                             &g_pc.row_gguf_mtp, &g_pc.row_gguf_vision, &g_pc.row_tok};
+    int y = 76;
+    for (int i = 0; i < n; ++i) {
+        place_row(*order[i], y, true);
+        y += 26;
+    }
+    for (const FileRow* r : all) {
+        bool shown = false;
+        for (int i = 0; i < n; ++i)
+            if (order[i] == r) shown = true;
+        if (!shown) place_row(*r, 0, false);
+    }
+    SetWindowPos(g_pc.tok_hint, nullptr, kEdX, y + 2, 434, 18, SWP_NOZORDER | SWP_SHOWWINDOW);
+    SetWindowPos(g_pc.ver_note, nullptr, kEdX, y + 24, 434, 18, SWP_NOZORDER | SWP_SHOWWINDOW);
+    SetWindowTextW(g_pc.ver_note,
+                   ver == kVerGguf ? L"GGUF：仅保存配置，启动需 Linux bash start_gguf.sh"
+                   : ver == kVerV2 ? L"V2：主体+独立 n-gram 文件；overlay 无效（保存置空）"
+                                   : L"V1：w4b 单文件，n-gram 内置；overlay/MTP/视觉塔可选");
+}
+
+void show_page(int idx) {
+    for (int i = 0; i < 4; ++i)
+        for (HWND c : g_page_ctls[i]) ShowWindow(c, i == idx ? SW_SHOW : SW_HIDE);
+    if (idx == 0) layout_page1(g_weights_ver);  // 重新隐藏非当前版本的文件行
+}
+
+LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_COMMAND) {
+        const UINT id = LOWORD(wp), code = HIWORD(wp);
+        // 编辑框输入 / 下拉选择变化 → 即时重检（各页列表独立刷新）
+        if (code == EN_CHANGE || code == CBN_SELCHANGE) {
+            // 并发总池跟随单请求上限：未手动改过总池框时，上限变了总池框跟着变；
+            // 总池框输入非空非 0 → 标记已手动改；输入 0 → 回到跟随并立即回填上限值。
+            // g_pool_guard：程序自己 SetWindowText 时不触发这些逻辑。
+            if (code == EN_CHANGE && !g_pool_guard) {
+                if (id == kEdKvPool) {
+                    const std::string s = get_edit(g_pc.kv_pool);
+                    if (s == "0") g_pool_touched = false;
+                    else if (!s.empty()) g_pool_touched = true;
+                }
+                if ((id == kEdMaxctx && !g_pool_touched) ||
+                    (id == kEdKvPool && get_edit(g_pc.kv_pool) == "0")) {
+                    g_pool_guard = true;
+                    SetWindowTextW(g_pc.kv_pool, to_w(get_edit(g_pc.maxctx)).c_str());
+                    g_pool_guard = false;
+                }
+            }
+            panel_recheck();
+            return 0;
+        }
+        switch (id) {
+            case kTab1: case kTab2: case kTab3: case kTab4:
+                show_page(static_cast<int>(id - kTab1));
+                return 0;
+            case kWVer1: case kWVer2: case kWVer3:
+                layout_page1(static_cast<int>(id - kWVer1));
+                panel_recheck();
+                return 0;
+            case kBtnStart: {
+                panel_recheck();
+                const PanelVals v = panel_collect();
+                if (v.weights_ver == kVerGguf) {
+                    msgbox("已选择 GGUF 权重：Windows 启动器只支持 hgn。\n"
+                           "GGUF 配置可以仅保存，Linux 下用 bash start_gguf.sh 启动。",
+                           MB_OK | MB_ICONWARNING);
+                    return 0;
+                }
+                if (g_last_checks.fatal()) {
+                    msgbox("环境检查未通过，请修正标[失败]的项后再启动。",
+                           MB_OK | MB_ICONWARNING);
+                    return 0;
+                }
+                std::string error;
+                if (!panel_apply_and_save(&error)) {
+                    msgbox("保存配置失败：" + error, MB_OK | MB_ICONERROR);
+                    return 0;
+                }
+                g_panel_result = kPanelStart;
+                g_panel_done = true;
+                return 0;
+            }
+            case kBtnSave: {
+                std::string error;
+                if (!panel_apply_and_save(&error)) {
+                    msgbox("保存配置失败：" + error, MB_OK | MB_ICONERROR);
+                    return 0;
+                }
+                g_panel_result = kPanelSave;
+                g_panel_done = true;
+                return 0;
+            }
+            case kBtnCancel:
+                g_panel_result = kPanelCancel;
+                g_panel_done = true;
+                return 0;
+            case kBtnRecheck: panel_recheck(); return 0;
+            case kBrModel:
+                if (panel_browse(g_pc.row_model.edit)) panel_recheck();
+                return 0;
+            case kBrNgram:
+                if (panel_browse(g_pc.row_ngram.edit)) panel_recheck();
+                return 0;
+            case kBrOverlay:
+                if (panel_browse(g_pc.row_overlay.edit)) panel_recheck();
+                return 0;
+            case kBrMtp:
+                if (panel_browse(g_pc.row_mtp.edit)) panel_recheck();
+                return 0;
+            case kBrVision:
+                if (panel_browse(g_pc.row_vision.edit)) panel_recheck();
+                return 0;
+            case kBrGguf:
+                if (panel_browse(g_pc.row_gguf.edit)) panel_recheck();
+                return 0;
+            case kBrGgufMtp:
+                if (panel_browse(g_pc.row_gguf_mtp.edit)) panel_recheck();
+                return 0;
+            case kBrGgufVision:
+                if (panel_browse(g_pc.row_gguf_vision.edit)) panel_recheck();
+                return 0;
+            case kOffOverlay:
+                set_optional_row_state(g_pc.row_overlay.off, g_pc.row_overlay.edit,
+                                       g_pc.row_overlay.browse);
+                panel_recheck();
+                return 0;
+            case kOffMtp:
+                set_optional_row_state(g_pc.row_mtp.off, g_pc.row_mtp.edit, g_pc.row_mtp.browse);
+                panel_recheck();
+                return 0;
+            case kOffVision:
+                set_optional_row_state(g_pc.row_vision.off, g_pc.row_vision.edit,
+                                       g_pc.row_vision.browse);
+                panel_recheck();
+                return 0;
+            case kOffGgufMtp:
+                set_optional_row_state(g_pc.row_gguf_mtp.off, g_pc.row_gguf_mtp.edit,
+                                       g_pc.row_gguf_mtp.browse);
+                panel_recheck();
+                return 0;
+            case kOffGgufVision:
+                set_optional_row_state(g_pc.row_gguf_vision.off, g_pc.row_gguf_vision.edit,
+                                       g_pc.row_gguf_vision.browse);
+                panel_recheck();
+                return 0;
+            case kCkKvPaged: panel_recheck(); return 0;
+            case kCkYarn: panel_recheck(); return 0;
+            default: break;
+        }
+    }
+    if (msg == WM_CLOSE) {
+        g_panel_result = kPanelCancel;
+        g_panel_done = true;
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+// 第 1 页文件行：[label][x不使用][EDIT][浏览…]（extra_style 给 label，如 WS_GROUP）
+FileRow page1_file_row(HWND parent, int y, const wchar_t* label, int id_edit, int id_browse,
+                       int id_off, const std::string& value, bool off,
+                       DWORD extra_style = 0) {
+    FileRow r;
+    r.label = pctl(0, parent, L"Static", SS_LEFTNOWORDWRAP | extra_style, kLblX, y + 3, kLblW,
+                   18, label, 0);
+    int ex = kEdX, ew = kEdPlainW;
+    if (id_off) {
+        r.off = pctl(0, parent, L"Button", BS_AUTOCHECKBOX, ex, y, kOffW, 20, L"不使用", id_off);
+        SendMessageW(r.off, BM_SETCHECK, off ? BST_CHECKED : BST_UNCHECKED, 0);
+        ex += kOffW + 8;
+        ew = 556 - ex;
+    }
+    r.edit = pctl(0, parent, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, ex, y, ew, 22,
+                  L"", id_edit);
+    set_edit(r.edit, value);
+    if (id_browse)
+        r.browse = pctl(0, parent, L"Button", BS_PUSHBUTTON, kBrX, y - 1, kBrW, 24, L"浏览…",
+                        id_browse);
+    if (id_off) set_optional_row_state(r.off, r.edit, r.browse);
+    return r;
+}
+
+PanelResult panel_run(bool allow_start) {
+    g_panel_running = !allow_start;
+    g_panel_allow_start = allow_start;
+    g_panel_done = false;
+    g_panel_result = kPanelCancel;
+    for (auto& v : g_page_ctls) v.clear();
+    HINSTANCE hi = GetModuleHandleW(nullptr);
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = panel_proc;
+        wc.hInstance = hi;
+        wc.lpszClassName = L"gfx1151_setup_panel";
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));  // IDC_ARROW
+        RegisterClassW(&wc);
+        registered = true;
+    }
+    RECT rc{0, 0, kCliW, kCliH};
+    AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
+    const int win_w = rc.right - rc.left, win_h = rc.bottom - rc.top;
+    RECT work{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    const int wx = work.left + (work.right - work.left - win_w) / 2;
+    const int wy = work.top + (work.bottom - work.top - win_h) / 2;
+    HWND h = CreateWindowExW(0, L"gfx1151_setup_panel", L"gfx1151-engine 启动设置",
+                             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, wx, wy, win_w, win_h,
+                             nullptr, nullptr, hi, nullptr);
+    if (!h) {
+        msgbox("无法创建设置窗口，错误码 " + std::to_string(GetLastError()), MB_OK | MB_ICONERROR);
+        return kPanelCancel;
+    }
+    g_panel = h;
+
+    const PanelVals init = panel_vals_from_conf();
+    g_weights_ver = init.weights_ver;
+
+    // ---- 分页切换（恒可见）：BS_PUSHLIKE 单选按钮，不引入 comctl32
+    const wchar_t* tab_names[4] = {L"1 权重", L"2 上下文与并发", L"3 端口与监听", L"4 显存检查"};
+    for (int i = 0; i < 4; ++i) {
+        g_pc.tabs[i] = add_ctrl(h, L"Button",
+                                BS_PUSHLIKE | BS_AUTORADIOBUTTON | WS_TABSTOP |
+                                    (i == 0 ? WS_GROUP : 0),
+                                12 + i * 158, 8, 150, 24, tab_names[i], kTab1 + i);
+    }
+    SendMessageW(g_pc.tabs[0], BM_SETCHECK, BST_CHECKED, 0);
+
+    // ---- 第 1 页：权重
+    plabel(0, h, kLblX, 44, L"权重版本");
+    const wchar_t* ver_names[3] = {L"V1 版本", L"V2 版本", L"GGUF 版本"};
+    for (int i = 0; i < 3; ++i) {
+        g_pc.wver[i] = pctl(0, h, L"Button",
+                            BS_AUTORADIOBUTTON | WS_TABSTOP | (i == 0 ? WS_GROUP : 0),
+                            kEdX + i * 92, 44, i == 2 ? 100 : 86, 20, ver_names[i], kWVer1 + i);
+    }
+    SendMessageW(g_pc.wver[g_weights_ver], BM_SETCHECK, BST_CHECKED, 0);
+    int ry = 76;
+    g_pc.row_model = page1_file_row(h, ry, L"主模型", kEdModel, kBrModel, 0, init.model,
+                                    false, WS_GROUP);  // WS_GROUP：关闭上面的单选组
+    ry += 26;
+    g_pc.row_ngram = page1_file_row(h, ry, L"n-gram 表", kEdNgram, kBrNgram, 0, init.ngram, false);
+    ry += 26;
+    g_pc.row_overlay = page1_file_row(h, ry, L"overlay", kEdOverlay, kBrOverlay, kOffOverlay,
+                                      init.overlay, init.no_overlay);
+    ry += 26;
+    g_pc.row_mtp = page1_file_row(h, ry, L"MTP 草稿", kEdMtp, kBrMtp, kOffMtp, init.mtp,
+                                  init.no_mtp);
+    ry += 26;
+    g_pc.row_vision = page1_file_row(h, ry, L"视觉塔", kEdVision, kBrVision, kOffVision,
+                                     init.vision, init.no_vision);
+    ry += 26;
+    g_pc.row_gguf = page1_file_row(h, ry, L"GGUF 主分片", kEdGguf, kBrGguf, 0, init.gguf, false);
+    ry += 26;
+    g_pc.row_gguf_mtp = page1_file_row(h, ry, L"GGUF MTP", kEdGgufMtp, kBrGgufMtp, kOffGgufMtp,
+                                       init.gguf_mtp, init.no_gguf_mtp);
+    ry += 26;
+    g_pc.row_gguf_vision = page1_file_row(h, ry, L"GGUF 视觉塔", kEdGgufVision, kBrGgufVision,
+                                          kOffGgufVision, init.gguf_vision, init.no_gguf_vision);
+    ry += 26;
+    g_pc.row_tok = page1_file_row(h, ry, L"tokenizer", kEdTok, 0, 0, init.tok, false);
+    g_pc.tok_hint = pctl(0, h, L"Static", SS_LEFTNOWORDWRAP, kEdX, 210, 434, 18,
+                         L"目录内需包含 tokenizer.json", 0);
+    g_pc.ver_note = pctl(0, h, L"Static", SS_LEFTNOWORDWRAP, kEdX, 232, 434, 18, L"", 0);
+    g_pc.out1 = pctl(0, h, L"Edit",
+                     WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
+                     12, 254, 624, kListBottom - 254, L"", kEdOut1);
+
+    // ---- 第 2 页：上下文与并发、YaRN（行尾无 hint，说明在第 2 页检查列表顶部）
+    int y2 = 46;
+    plabel(1, h, kLblX, y2, L"单请求上限 (token)");
+    g_pc.maxctx = pctl(1, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y2, 120,
+                       22, L"", kEdMaxctx);
+    set_edit(g_pc.maxctx, init.max_context);
+    y2 += 26;
+    plabel(1, h, kLblX, y2, L"并发路数");
+    g_pc.parallel = pctl(1, h, L"ComboBox", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kEdX,
+                         y2, 60, 200, L"", kCbParallel);
+    for (int i = 1; i <= 8; ++i)
+        SendMessageW(g_pc.parallel, CB_ADDSTRING, 0,
+                     reinterpret_cast<LPARAM>(std::to_wstring(i).c_str()));
+    long par_init = 1;
+    pn_int(init.parallel, &par_init);
+    SendMessageW(g_pc.parallel, CB_SETCURSEL, static_cast<WPARAM>(par_init - 1), 0);
+    y2 += 26;
+    plabel(1, h, kLblX, y2, L"并发总池 (token)");
+    g_pc.kv_pool = pctl(1, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y2, 120,
+                        22, L"", kEdKvPool);
+    // conf=0（跟随）时显示单请求上限的值，g_pool_touched=false；
+    // conf 有显式值则显示实值并视为已手动设定
+    long pool_init = 0;
+    pn_int(init.kv_pool, &pool_init);
+    g_pool_touched = pool_init != 0;
+    g_pool_guard = true;
+    set_edit(g_pc.kv_pool, g_pool_touched ? init.kv_pool : init.max_context);
+    g_pool_guard = false;
+    y2 += 26;
+    g_pc.kv_paged = pctl(1, h, L"Button", BS_AUTOCHECKBOX | WS_TABSTOP, kEdX, y2, 300, 20,
+                         L"分页 KV（并发必须开启）", kCkKvPaged);
+    SendMessageW(g_pc.kv_paged, BM_SETCHECK, init.kv_paged ? BST_CHECKED : BST_UNCHECKED, 0);
+    y2 += 26;
+    plabel(1, h, kLblX, y2, L"prefill 分段");
+    g_pc.prefill = pctl(1, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y2, 120,
+                        22, L"", kEdPrefill);
+    set_edit(g_pc.prefill, init.prefill_chunk);
+    plabel(1, h, kHintX, y2, L"0 = 默认 8192（≈6.9 GiB 工作区）", kHintW);
+    y2 += 26;
+    {
+        // YaRN 勾选框（ROPE_FACTOR 自动推导 = max(2, ceil(上限/原生))，无编辑行）
+        double rope_init = 1;
+        pn_double(init.rope_factor, &rope_init);
+        g_pc.yarn = pctl(1, h, L"Button", BS_AUTOCHECKBOX | WS_TABSTOP, kEdX, y2, 300, 20,
+                         L"YaRN 长上下文扩展", kCkYarn);
+        SendMessageW(g_pc.yarn, BM_SETCHECK, rope_init > 1 ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+    y2 += 26;
+    g_pc.out2 = pctl(1, h, L"Edit",
+                     WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
+                     12, y2 + 10, 624, kListBottom - y2 - 10, L"", kEdOut2);
+
+    // ---- 第 3 页：端口与监听（行尾无 hint，说明在第 3 页检查列表顶部）
+    int y3 = 46;
+    plabel(2, h, kLblX, y3, L"引擎监听地址");
+    g_pc.ehost = pctl(2, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y3, 140,
+                      22, L"", kEdEHost);
+    set_edit(g_pc.ehost, init.engine_host);
+    y3 += 26;
+    plabel(2, h, kLblX, y3, L"引擎端口");
+    g_pc.eport = pctl(2, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y3, 90, 22,
+                      L"", kEdEPort);
+    set_edit(g_pc.eport, init.engine_port);
+    y3 += 26;
+    plabel(2, h, kLblX, y3, L"API 监听地址");
+    g_pc.ahost = pctl(2, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y3, 140,
+                      22, L"", kEdAHost);
+    set_edit(g_pc.ahost, init.api_host);
+    y3 += 26;
+    plabel(2, h, kLblX, y3, L"API 端口");
+    g_pc.aport = pctl(2, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y3, 90, 22,
+                      L"", kEdAPort);
+    set_edit(g_pc.aport, init.api_port);
+    y3 += 26;
+    g_pc.out3 = pctl(2, h, L"Edit",
+                     WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
+                     12, y3 + 8, 624, kListBottom - y3 - 8, L"", kEdOut3);
+
+    // ---- 第 4 页：显存环境检查
+    pctl(3, h, L"Button", BS_PUSHBUTTON, 524, 42, 112, 24, L"重新检查", kBtnRecheck);
+    g_pc.report = pctl(3, h, L"Edit",
+                       WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
+                       12, 72, 624, 272, L"", kEdReport);
+    plabel(3, h, kLblX, 348, L"其它页的失败汇总", 200);
+    g_pc.summary = pctl(3, h, L"Edit",
+                        WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
+                        12, 372, 624, kListBottom - 372, L"", kEdSummary);
+
+    // ---- 底部按钮行（恒可见）
+    const int by = 462;
+    g_pc.start = add_ctrl(h, L"Button", BS_DEFPUSHBUTTON, 157, by, 130, 30,
+                          allow_start ? L"启动服务" : L"启动服务（运行中）", kBtnStart);
+    EnableWindow(g_pc.start, allow_start);
+    add_ctrl(h, L"Button", BS_PUSHBUTTON, 297, by, 90, 30, L"仅保存", kBtnSave);
+    add_ctrl(h, L"Button", BS_PUSHBUTTON, 397, by, 90, 30, L"取消", kBtnCancel);
+    if (!allow_start) add_label(h, 12, by + 8, L"运行中：重启生效", 140);
+
+    show_page(0);
+    panel_recheck();
+    ShowWindow(h, SW_SHOW);
+    UpdateWindow(h);
+    SetForegroundWindow(h);
+
+    // 模态循环：不用 PostQuitMessage（托盘打开时 WM_QUIT 会连带杀掉托盘循环）
+    MSG m;
+    while (!g_panel_done && GetMessageW(&m, nullptr, 0, 0) > 0) {
+        if (IsDialogMessageW(h, &m)) continue;
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
+    }
+    DestroyWindow(h);
+    g_panel = nullptr;
+    return g_panel_result;
+}
+
+}  // namespace

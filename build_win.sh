@@ -125,7 +125,7 @@ build_launcher() {
     fi
     echo "[编译] start_win.exe"
     LAUNCH_SRC=(-O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS src/launch_win.cpp
-                -lws2_32 -lshell32 -luser32 "${GUI_LDFLAGS[@]}" -o start_win.exe)
+                -lws2_32 -lshell32 -luser32 -lcomdlg32 -lgdi32 "${GUI_LDFLAGS[@]}" -o start_win.exe)
     if ! "$CXX" "${LAUNCH_SRC[@]}" ${RES[@]+"${RES[@]}"}; then
       [[ ${#RES[@]} -gt 0 ]] || exit 1
       echo "提示：带图标资源链接失败，改为不带文件图标重试" >&2

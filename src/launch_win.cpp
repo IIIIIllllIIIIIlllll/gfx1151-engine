@@ -39,6 +39,15 @@
 
 #include "launch_win_icon.inc"  // kIconIco：托盘图标（tools/win_icon.py 生成）
 
+// 配置面板在文件末尾以 launch_panel.inc 并入同一匿名命名空间；
+// report()/on_menu() 在其定义点之前使用这些入口，需要前向声明。
+// PanelResult 的完整定义放在这里（枚举值的可见性要求），.inc 直接使用。
+namespace {
+enum PanelResult : int { kPanelStart, kPanelSave, kPanelCancel };
+void conf_write_marker();
+PanelResult panel_run(bool allow_start);
+}
+
 namespace {
 
 std::string g_root;
@@ -606,6 +615,7 @@ int run_service(DWORD* code) {
            g_tray ? "" : "；Ctrl+C 同时停止 API 和引擎。");
     fflush(stdout);
     report(kReady);
+    conf_write_marker();  // 首次就绪：service.conf 写入"面板已配置"标记（幂等）
 
     HANDLE both[2] = {engine.proc, api.proc};
     const DWORD who = WaitForMultipleObjects(2, both, FALSE, INFINITE) - WAIT_OBJECT_0;
@@ -626,7 +636,7 @@ volatile LONG g_tray_added = 0;
 UINT g_wm_taskbar_created = 0;  // 资源管理器重启后广播，需重新加图标
 
 enum MenuId : UINT {
-    kIdDashboard = 1, kIdCopyUrl, kIdEngineLog, kIdApiLog, kIdLogDir, kIdQuit
+    kIdDashboard = 1, kIdCopyUrl, kIdEngineLog, kIdApiLog, kIdLogDir, kIdSetup, kIdQuit
 };
 
 std::wstring status_text() {
@@ -732,6 +742,11 @@ void on_menu(UINT id) {
         case kIdEngineLog: shell_open(g_root + "\\" + g_plan.engine_log); break;
         case kIdApiLog: shell_open(g_root + "\\" + g_plan.api_log); break;
         case kIdLogDir: shell_open(g_root + "\\logs"); break;
+        case kIdSetup:
+            // 服务运行中打开：面板里"启动服务"禁用，保存后重启生效。
+            if (panel_run(false) != kPanelCancel)
+                tray_balloon(L"配置已保存", L"新的启动参数将在下次启动服务时生效。");
+            break;
         case kIdQuit:
             if (msgbox("退出会同时停止引擎和 API，正在进行的生成会中断。\n确定退出？",
                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES)
@@ -755,6 +770,8 @@ void show_menu() {
     AppendMenuW(m, MF_STRING | (st >= kApiStarting ? 0 : MF_GRAYED), kIdApiLog,
                 L"查看 API 日志");
     AppendMenuW(m, MF_STRING, kIdLogDir, L"打开日志文件夹");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, kIdSetup, L"设置…");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, kIdQuit, L"退出（停止引擎和 API）");
     POINT pt;
@@ -843,11 +860,16 @@ int tray_main() {
 
 }  // namespace
 
+// 启动配置面板（含 save_conf / conf_write_marker / panel_run）。
+// 必须放在匿名命名空间之外：面板内部要 include <set> 等标准头。
+#include "launch_panel.inc"
+
 int main(int argc, char** argv) {
-    bool check_only = false, want_console = false;
+    bool check_only = false, want_console = false, want_setup = false;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--check") == 0) check_only = true;
         else if (strcmp(argv[i], "--console") == 0) want_console = true;
+        else if (strcmp(argv[i], "--setup") == 0) want_setup = true;
     }
     g_tray = !check_only && !want_console;
     // 高 DPI 屏上托盘图标取对应尺寸、弹框/菜单文字不发糊
@@ -887,6 +909,14 @@ int main(int argc, char** argv) {
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
     load_conf(g_root + "\\service.conf");
+
+    // 启动配置面板：--setup 强制显示；否则只在 service.conf 没有
+    // "# start_win: configured" 标记（首次启动）时显示。面板在"启动服务"时
+    // 已把新值写进 g_conf 和 service.conf，下面的 cfg() 会读到新配置。
+    // --check / --console 不显示面板，行为与之前完全一致。
+    if (!check_only && !want_console && (want_setup || !conf_has_marker())) {
+        if (panel_run(true) != kPanelStart) return 0;  // 取消 / 仅保存：直接退出
+    }
 
     const std::string model_dir = cfg("MODEL_DIR", "models");
     const std::string model_file = cfg("MODEL_FILE", model_dir + "\\heretic.hgn");
@@ -932,6 +962,15 @@ int main(int argc, char** argv) {
         fail("ENGINE_HOST 必须是 IPv4 地址");
     if (engine_port == api_port) fail("ENGINE_PORT 与 API_PORT 必须不同");
     if (parallel > 1 && !kv_paged) fail("PARALLEL>1 需要 KV_PAGED=1");
+    // Windows 设备内存是硬上限 95 GiB 的 arena：权重 62.1 GiB + prefill 工作区
+    // 6.9 GiB 之后，512K 池（45,696 B/token ≈ 22.3 GiB）刚好放下，更大的池任何
+    // 配置都放不下。有效池 = max(KV_POOL_TOKENS, MAX_CONTEXT)（0 = 跟随上限）。
+    const int kv_pool_effective =
+        kv_pool_tokens > max_context ? kv_pool_tokens : max_context;
+    if (kv_pool_effective > 524288)
+        fail("KV 页池有效值 " + std::to_string(kv_pool_effective) +
+             " token 超过 Windows 上限 512K（524288）：95 GiB 显存 arena 中 512K 池"
+             "已占约 22 GiB，更大的池放不下；调小 MAX_CONTEXT 或 KV_POOL_TOKENS");
     const double rope_factor = parse_double("ROPE_FACTOR", rope_factor_s);
     const double rope_beta_fast = parse_double("ROPE_BETA_FAST", rope_fast_s);
     const double rope_beta_slow = parse_double("ROPE_BETA_SLOW", rope_slow_s);

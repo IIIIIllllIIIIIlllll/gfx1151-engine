@@ -314,7 +314,12 @@ bash build_win.sh launcher  # 免脚本启动器 start_win.exe
 日常运行双击 `start_win.exe`(原生 Win32,不需要 Git/PowerShell):拉起引擎
 + API 双进程,不开控制台,只在任务栏右下角放托盘图标(右键:打开面板 / 复制
 API 地址 / 查看日志 / 退出;双击:打开面板),输出写入 `logs\`;排查问题可用
-`start_win.exe --console` 回到控制台模式(Ctrl+C 或关窗停止)。配置与 Linux
+`start_win.exe --console` 回到控制台模式(Ctrl+C 或关窗停止)。首次双击会弹出
+启动配置面板(4 个分页):第 1 页权重(V1/V2/GGUF 版本选择,GGUF 仅保存供
+Linux `start_gguf.sh` 用)、第 2 页上下文/并发/YaRN 勾选(扩展倍数按单请求
+上限自动推导)、第 3 页监听地址与端口、
+第 4 页显存环境检查,每页有独立的检查报错区,确认后写回 `service.conf` 并启动;之后双击不再弹出,
+改配置用托盘右键"设置…"或 `start_win.exe --setup`。配置与 Linux
 **共用 `service.conf`**(换模型文件名、改上下文窗口都编辑它),环境变量可
 临时覆盖。客户端连 `http://<主机>:8731/v1`。
 
