@@ -268,12 +268,11 @@ ROPE_BETA_SLOW=1 ROPE_ATTN_SCALE=0 bash start_hgn.sh --check
 
 Linux GGUF uses the same variables with `start_gguf.sh`. Hardware acceptance
 used Linux hgn + BF16 paged KV + WMMA + BTV; not every weight/kernel/platform
-combination has been verified. Windows `start_win.sh` forwards YaRN settings,
-but Windows 512K hardware acceptance remains pending. **The current native
-start_win.exe does not translate service.conf ROPE_* into GDEC_ROPE_*.**
-Do not assume editing the file enables YaRN when launching by double-click.
-Advanced manual invocation needs matching GDEC_ROPE_* for both engine and
-API, plus separate validation of Windows arena/device-memory limits.
+combination has been verified. Both Windows launchers, `start_win.sh` and the
+native `start_win.exe`, read the `service.conf` `ROPE_*` settings, apply the
+same validation, and forward them as `GDEC_ROPE_*` to engine and API; however,
+Windows 512K hardware acceptance remains pending, and the 512K pool must
+separately fit the Windows arena (95 GiB limit) and device memory.
 
 ### Two typical scenarios (reference)
 

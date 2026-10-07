@@ -219,10 +219,9 @@ ROPE_BETA_SLOW=1 ROPE_ATTN_SCALE=0 bash start_hgn.sh --check
 
 Linux GGUF 使用相同变量,换成 `start_gguf.sh`;已完成的 512K 实机验收使用 Linux
 hgn + BF16 分页 KV + WMMA + BTV,不代表所有权重/kernel/平台组合都已验证。
-Windows 的 `start_win.sh` 已传递这些 YaRN 参数,但 Windows 512K 尚未实测验收。
-**当前原生 `start_win.exe` 尚未将 `service.conf` 的 `ROPE_*` 转为
-`GDEC_ROPE_*`**,不要只改配置文件就认为双击启动器启用了 YaRN;高级手工启动需
-为引擎和 API 同时设置 `GDEC_ROPE_*`,并另行验证 Windows 的 arena/显存容量。
+Windows 的 `start_win.sh` 与原生 `start_win.exe` 都会读取 `service.conf` 的
+`ROPE_*`、做同样的校验并转为 `GDEC_ROPE_*` 传给引擎和 API,但 Windows 512K
+尚未实测验收,且需另行确认 arena(95 GiB 上限)/显存能否放下 512K 页池。
 
 ### 两个典型场景(参考)
 

@@ -29,6 +29,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -263,6 +264,16 @@ int cfg_int(const char* key, int fallback, int lo, int hi) {
         fail(std::string(key) + " 必须是 " + std::to_string(lo) + "-" +
              std::to_string(hi) + " 的整数（当前为 \"" + v + "\"）");
     return static_cast<int>(n);
+}
+
+// service.conf 的小数项（ROPE_*）：完整解析、有限、非负；范围约束由调用方检查。
+double parse_double(const char* key, const std::string& v) {
+    char* end = nullptr;
+    errno = 0;
+    const double n = strtod(v.c_str(), &end);
+    if (errno || end == v.c_str() || !end || *end || n != n || n < 0)
+        fail(std::string(key) + " 必须为非负小数（当前为 \"" + v + "\"）");
+    return n;
 }
 
 // 试探绑定：能 bind 说明端口空闲。
@@ -908,12 +919,35 @@ int main(int argc, char** argv) {
     // （8192≈6.9 GiB，4096≈3.5 GiB）。0 = 引擎内置默认（Windows 8192）。
     const int prefill_chunk = cfg_int("PREFILL_CHUNK", 0, 0, 1 << 20);
     const int start_timeout = env_int("START_TIMEOUT", 1800, 30, 86400);
+    // YaRN（见 service.conf）：默认关闭（ROPE_FACTOR=1 即原生 RoPE）。字符串原样
+    // 转发给引擎/API（GDEC_ROPE_*），这里只做与 start_win.sh 相同的校验。
+    const std::string rope_factor_s = cfg("ROPE_FACTOR", "1");
+    const std::string rope_fast_s = cfg("ROPE_BETA_FAST", "32");
+    const std::string rope_slow_s = cfg("ROPE_BETA_SLOW", "1");
+    const std::string rope_attn_s = cfg("ROPE_ATTN_SCALE", "0");
+    const int rope_original = cfg_int("ROPE_ORIGINAL_CTX", 262144, 1, 1 << 30);
 
     sockaddr_in engine_addr{};
     if (!engine_net::address(engine_host, engine_port, &engine_addr))
         fail("ENGINE_HOST 必须是 IPv4 地址");
     if (engine_port == api_port) fail("ENGINE_PORT 与 API_PORT 必须不同");
     if (parallel > 1 && !kv_paged) fail("PARALLEL>1 需要 KV_PAGED=1");
+    const double rope_factor = parse_double("ROPE_FACTOR", rope_factor_s);
+    const double rope_beta_fast = parse_double("ROPE_BETA_FAST", rope_fast_s);
+    const double rope_beta_slow = parse_double("ROPE_BETA_SLOW", rope_slow_s);
+    parse_double("ROPE_ATTN_SCALE", rope_attn_s);  // 只校验非负小数，值由引擎使用
+    if (rope_factor < 1 || rope_beta_fast < rope_beta_slow || rope_beta_slow <= 0)
+        fail("ROPE_FACTOR 必须 >=1，beta_fast >= beta_slow > 0");
+    // 与引擎 52_main.inc 一致：YaRN 开启时单条上限不得超过位置编码范围；
+    // 并发容量用 KV_POOL_TOKENS 扩，不要拉伸 MAX_CONTEXT。
+    if (rope_factor > 1 && max_context > rope_factor * rope_original)
+        fail("MAX_CONTEXT=" + std::to_string(max_context) +
+             " 超出 YaRN 上限 ROPE_FACTOR×ROPE_ORIGINAL_CTX；调小 MAX_CONTEXT 或调大"
+             " ROPE_FACTOR（并发容量用 KV_POOL_TOKENS 扩）");
+    if (rope_factor <= 1 && max_context > rope_original)
+        fprintf(stderr, "警告：ROPE_FACTOR=1 且 MAX_CONTEXT=%d 超过原生 %d，超出部分"
+                        "的位置编码未验证（需要时请设 ROPE_FACTOR）\n",
+                max_context, rope_original);
     if (!file_exists("build\\gdec-win.exe")) fail("缺少 build\\gdec-win.exe");
     if (!file_exists("build\\gdec-api-win.exe")) fail("缺少 build\\gdec-api-win.exe");
     if (!file_exists(model_file)) fail("找不到模型：" + model_file + "（修改 service.conf）");
@@ -943,6 +977,9 @@ int main(int argc, char** argv) {
     printf("配置：%d 上下文，prefill chunk %d，MTP gamma=%s，engine %s:%d，API %s:%d\n",
            max_context, prefill_chunk ? prefill_chunk : 8192, gamma_str.c_str(),
            engine_host.c_str(), engine_port, api_host.c_str(), api_port);
+    if (rope_factor > 1)
+        printf("YaRN：factor=%s，original_ctx=%d\n",
+               rope_factor_s.c_str(), rope_original);
     if (kv_paged) {
         printf("KV：分页，页池 %d token（%d 路并发共享），RAM 检查点 %d 个\n",
                kv_pool_tokens > max_context ? kv_pool_tokens : max_context, parallel,
@@ -991,6 +1028,12 @@ int main(int argc, char** argv) {
                                 : nullptr);
     SetEnvironmentVariableA("GDEC_PARALLEL", std::to_string(parallel).c_str());
     SetEnvironmentVariableA("GDEC_API_MAX_IMAGES", std::to_string(max_images).c_str());
+    SetEnvironmentVariableA("GDEC_ROPE_FACTOR", rope_factor_s.c_str());
+    SetEnvironmentVariableA("GDEC_ROPE_ORIGINAL_CTX",
+                            std::to_string(rope_original).c_str());
+    SetEnvironmentVariableA("GDEC_ROPE_BETA_FAST", rope_fast_s.c_str());
+    SetEnvironmentVariableA("GDEC_ROPE_BETA_SLOW", rope_slow_s.c_str());
+    SetEnvironmentVariableA("GDEC_ROPE_ATTN_SCALE", rope_attn_s.c_str());
     // PREFILL_CHUNK>0 才设置；0 = 不碰外部环境变量（用户可直接 set GDEC_PREFILL_CHUNK）。
     if (prefill_chunk)
         SetEnvironmentVariableA("GDEC_PREFILL_CHUNK",
