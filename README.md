@@ -139,6 +139,11 @@ python3 tools/flashnext2hgn.py /path/to/hf-model --out ./models --imatrix /path/
 只改 `MAX_CONTEXT` 不会自动开启 YaRN,只改 `ROPE_FACTOR` 也不会自动改上下文上限。
 只需要更多原生短/中上下文并发时,扩大共享池即可,不必开启 YaRN。
 
+单条上限不得超过位置编码能力:YaRN 开启时 `MAX_CONTEXT` 不能超过
+`ROPE_FACTOR × ROPE_ORIGINAL_CTX`,超过时启动器和引擎都拒绝启动;
+`ROPE_FACTOR=1` 时超过原生 256K 只告警(超出部分的位置编码未验证)。
+并发要更多 KV 容量时扩 `KV_POOL_TOKENS`,不要拉伸 `MAX_CONTEXT`。
+
 RoPE 配置是**实例级**的:factor 2 下所有请求都使用 YaRN,不是超过 256K 才临时
 切换;同一实例不能让一条请求用原生、另一条用 YaRN。每条序列仍有独立位置,
 两条 200K 请求不会拼成一条 400K 序列。短文本优先保持原生;需要同时提供两种
@@ -151,7 +156,7 @@ RoPE 配置是**实例级**的:factor 2 下所有请求都使用 YaRN,不是超�
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
-| `MAX_CONTEXT` | `262144` | 每条请求的输入 + 输出上限,不是所有并发请求的合计 |
+| `MAX_CONTEXT` | `262144` | 每条请求的输入 + 输出上限,不是所有并发请求的合计;不得超过 `ROPE_FACTOR × ROPE_ORIGINAL_CTX`(超过拒绝启动;factor 1 时超原生值只告警) |
 | `ROPE_FACTOR` | `1` | `1` 为原生;512K 配 `2`,必须同时改 `MAX_CONTEXT` |
 | `ROPE_ORIGINAL_CTX` | `262144` | 模型原生长度;开 YaRN 后仍保持此值,不要改成 `524288` |
 | `ROPE_BETA_FAST` / `ROPE_BETA_SLOW` | `32` / `1` | 频率混合边界,通常不改;引擎要求 `beta_fast >= beta_slow > 0` |
@@ -167,6 +172,9 @@ RoPE 配置是**实例级**的:factor 2 下所有请求都使用 YaRN,不是超�
 手工启动要确保两侧配置一致;只改 API 的 `/health` 元数据不会改变引擎的 RoPE。
 
 ### 两种 512K 配置
+
+`MAX_CONTEXT` 只表达单条上限,并发容量一律用 `KV_POOL_TOKENS` 表达;
+`MAX_CONTEXT` 超过 `ROPE_FACTOR × ROPE_ORIGINAL_CTX` 的配置会在启动时被拒绝。
 
 | 使用模式 | `MAX_CONTEXT` | `KV_POOL_TOKENS` | `ROPE_FACTOR` | `PARALLEL` 示例 |
 | --- | --- | --- | --- | --- |
@@ -215,6 +223,19 @@ Windows 的 `start_win.sh` 已传递这些 YaRN 参数,但 Windows 512K 尚未�
 **当前原生 `start_win.exe` 尚未将 `service.conf` 的 `ROPE_*` 转为
 `GDEC_ROPE_*`**,不要只改配置文件就认为双击启动器启用了 YaRN;高级手工启动需
 为引擎和 API 同时设置 `GDEC_ROPE_*`,并另行验证 Windows 的 arena/显存容量。
+
+### 两个典型场景(参考)
+
+**场景 1:不开 YaRN,2 路并发各自可用满原生 256K。** 对应上方模式 A:
+`MAX_CONTEXT=262144` + `KV_POOL_TOKENS=524288` + `PARALLEL=2` + `ROPE_FACTOR=1`。
+直觉上"设 512K 让两个并发各吃 256K"的正确表达是:单条上限保持原生 256K 不动,
+把 512K 给共享池。两条序列动态共享 512K,单条超过 256K 仍被拒绝。
+
+**场景 2:开 YaRN,2 路并发共享 512K 池。** 对应上方模式 B:
+`MAX_CONTEXT=524288` + `ROPE_FACTOR=2` + `KV_POOL_TOKENS=0` + `PARALLEL=2`。
+两条请求合计超过 512K 时,后来的请求在准入阶段被拒(API 返回错误,日志
+"rejected at admission"),先来的请求不受影响;想让 512K 长请求不被打扰,
+把 `PARALLEL` 改为 `1`。
 
 ### 并发怎样占用共享池
 

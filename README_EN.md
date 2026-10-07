@@ -178,6 +178,13 @@ alone does not enable YaRN; changing `ROPE_FACTOR` alone does not change the
 context limit. For more native short/medium-context sessions, enlarge the pool
 without enabling YaRN.
 
+The per-request limit must stay within the position-encoding range: with YaRN
+enabled, `MAX_CONTEXT` may not exceed `ROPE_FACTOR × ROPE_ORIGINAL_CTX` —
+the launchers and the engine refuse to start otherwise. With `ROPE_FACTOR=1`,
+exceeding the native 256K only warns (positions beyond it are unvalidated).
+For more concurrent KV capacity, enlarge `KV_POOL_TOKENS` instead of
+stretching `MAX_CONTEXT`.
+
 RoPE settings are **instance-wide**. Factor 2 applies to every request, not
 only after token 262144; one instance cannot serve one request with native
 RoPE and another with YaRN. Each sequence still has independent positions:
@@ -193,7 +200,7 @@ Restart both engine and API after changing the file.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `MAX_CONTEXT` | `262144` | Per-request input + output limit, not the sum of concurrent requests |
+| `MAX_CONTEXT` | `262144` | Per-request input + output limit, not the sum of concurrent requests; must not exceed `ROPE_FACTOR × ROPE_ORIGINAL_CTX` (startup is refused otherwise; factor 1 above the native length only warns) |
 | `ROPE_FACTOR` | `1` | Native at 1; use 2 for 512K and change MAX_CONTEXT separately |
 | `ROPE_ORIGINAL_CTX` | `262144` | Native model length; keep this value with YaRN, do not set it to 524288 |
 | `ROPE_BETA_FAST` / `ROPE_BETA_SLOW` | `32` / `1` | Frequency mixing boundaries; normally unchanged; engine requires beta_fast >= beta_slow > 0 |
@@ -210,6 +217,10 @@ the API uses `GDEC_ROPE_*` environment variables. Keep both sides consistent:
 changing only the API's health metadata does not alter engine RoPE.
 
 ### Two different 512K configurations
+
+`MAX_CONTEXT` expresses only the per-request limit; concurrent capacity is
+always expressed with `KV_POOL_TOKENS`. Configurations where `MAX_CONTEXT`
+exceeds `ROPE_FACTOR × ROPE_ORIGINAL_CTX` are refused at startup.
 
 | Mode | MAX_CONTEXT | KV_POOL_TOKENS | ROPE_FACTOR | Example PARALLEL |
 | --- | --- | --- | --- | --- |
@@ -263,6 +274,22 @@ start_win.exe does not translate service.conf ROPE_* into GDEC_ROPE_*.**
 Do not assume editing the file enables YaRN when launching by double-click.
 Advanced manual invocation needs matching GDEC_ROPE_* for both engine and
 API, plus separate validation of Windows arena/device-memory limits.
+
+### Two typical scenarios (reference)
+
+**Scenario 1: no YaRN, two concurrent slots each up to the native 256K.**
+This is mode A above: `MAX_CONTEXT=262144` + `KV_POOL_TOKENS=524288` +
+`PARALLEL=2` + `ROPE_FACTOR=1`. The intuitive "set 512K so two concurrent
+requests get 256K each" is expressed by keeping the per-request limit at the
+native 256K and giving 512K to the shared pool. The two sequences share 512K
+dynamically; a single request beyond 256K is still rejected.
+
+**Scenario 2: YaRN on, two concurrent slots sharing a 512K pool.** This is
+mode B above: `MAX_CONTEXT=524288` + `ROPE_FACTOR=2` + `KV_POOL_TOKENS=0` +
+`PARALLEL=2`. When two requests together exceed 512K, the later one is
+rejected at admission (the API returns an error, engine logs "rejected at
+admission") while the earlier one is unaffected. Set `PARALLEL=1` if 512K
+requests should never contend.
 
 ### How concurrency occupies the pool
 

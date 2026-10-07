@@ -88,6 +88,12 @@ if [[ "$engine_connect_host" == 0.0.0.0 ]]; then engine_connect_host=127.0.0.1; 
 [[ "$ROPE_ATTN_SCALE" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail 'ROPE_ATTN_SCALE 必须为非负小数'
 awk "BEGIN { exit !($ROPE_FACTOR >= 1 && $ROPE_BETA_FAST > 0 && $ROPE_BETA_SLOW > 0 && $ROPE_ATTN_SCALE >= 0) }" || \
   fail 'ROPE_FACTOR 必须 >=1，beta 必须 >0，ROPE_ATTN_SCALE 必须 >=0'
+# 与引擎 52_main.inc 一致：YaRN 开启时 MAX_CONTEXT 上限 = ROPE_FACTOR ×
+# ROPE_ORIGINAL_CTX；并发容量用 KV_POOL_TOKENS 扩，不要拉伸 MAX_CONTEXT。
+awk "BEGIN { exit !($ROPE_FACTOR <= 1 || $MAX_CONTEXT <= $ROPE_FACTOR * $ROPE_ORIGINAL_CTX) }" || \
+  fail "MAX_CONTEXT=$MAX_CONTEXT 超出 YaRN 上限 ROPE_FACTOR×ROPE_ORIGINAL_CTX；调小 MAX_CONTEXT 或调大 ROPE_FACTOR（并发容量用 KV_POOL_TOKENS 扩）"
+awk "BEGIN { exit !($ROPE_FACTOR > 1 || $MAX_CONTEXT <= $ROPE_ORIGINAL_CTX) }" || \
+  echo "警告：ROPE_FACTOR=1 且 MAX_CONTEXT=$MAX_CONTEXT 超过原生 $ROPE_ORIGINAL_CTX，超出部分的位置编码未验证（需要时请设 ROPE_FACTOR）" >&2
 (( PARALLEL == 1 || KV_PAGED )) || fail 'PARALLEL>1 需要 KV_PAGED=1'
 [[ -f build/gdec-win.exe ]] || fail '缺少 build/gdec-win.exe，请先运行 bash build_win.sh'
 [[ -f build/gdec-api-win.exe ]] || fail '缺少 build/gdec-api-win.exe，请先运行 bash build_win.sh api'

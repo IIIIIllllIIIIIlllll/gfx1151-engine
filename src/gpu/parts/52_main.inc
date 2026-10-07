@@ -213,6 +213,24 @@ int main(int argc, char** argv) {
                     "attention_scale>=0\n");
     return 2;
   }
+  // vLLM-style consistency check: per-sequence context must stay within the
+  // position-encoding range. factor>1: hard limit factor x original_ctx;
+  // factor==1 beyond native: warn only (works, but unvalidated positions).
+  const double rope_cap =
+      g_cfg.rope.factor * g_cfg.rope.original_max_position_embeddings;
+  if (g_cfg.rope.factor > 1.0 && maxctx > rope_cap) {
+    fprintf(stderr, "maxctx %d exceeds YaRN range factor %.6g x original_ctx %d "
+                    "= %.0f; lower --maxctx or raise --rope-factor\n",
+            maxctx, g_cfg.rope.factor, g_cfg.rope.original_max_position_embeddings,
+            rope_cap);
+    return 2;
+  }
+  if (g_cfg.rope.factor == 1.0 &&
+      maxctx > g_cfg.rope.original_max_position_embeddings)
+    fprintf(stderr, "warning: maxctx %d exceeds native context %d without YaRN; "
+                    "positions beyond it are unvalidated (set --rope-factor to "
+                    "extend)\n",
+            maxctx, g_cfg.rope.original_max_position_embeddings);
   if (g_cfg.rope.factor > 1.0)
     fprintf(stderr, "RoPE: YaRN factor=%.6g original_ctx=%d beta_fast=%.6g "
                     "beta_slow=%.6g attention_scale=%.6g\n",
