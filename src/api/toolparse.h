@@ -19,8 +19,8 @@ struct ToolChoice {
 
     bool tools_enabled() const { return mode != Mode::None; }
     bool forced() const { return mode == Mode::Required || mode == Mode::Named; }
-    std::string parser_prefix() const;
-    std::string prompt_suffix(bool thinking_enabled) const;
+    std::string parser_prefix(const std::string& format = "xml") const;
+    std::string prompt_suffix(bool thinking_enabled, const std::string& format = "xml") const;
 };
 
 // Convert Chat Completions or Responses tool definitions to the canonical
@@ -62,7 +62,8 @@ class StreamParser {
   public:
     using IdFactory = std::function<std::string()>;
 
-    StreamParser(json tools, IdFactory make_id, bool enabled = true);
+    StreamParser(json tools, IdFactory make_id, bool enabled = true,
+                 std::string format = "xml", std::string forced_name = {});
 
     std::vector<Event> feed(std::string_view piece);
     std::vector<Event> finish();
@@ -72,7 +73,7 @@ class StreamParser {
     bool has_partial_call() const { return partial_; }
 
   private:
-    enum class State { Text, Between, Parameter, ToolTail, Broken };
+    enum class State { Text, JsonCall, Between, Parameter, ToolTail, Broken };
 
     std::vector<Event> pump(bool final);
     void emit_content(std::string text, std::vector<Event>* events);
@@ -88,6 +89,8 @@ class StreamParser {
     json tools_;
     IdFactory make_id_;
     bool enabled_ = true;
+    std::string format_ = "xml";
+    std::string forced_name_;
     State state_ = State::Text;
     std::string buffer_;
     std::string content_;

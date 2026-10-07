@@ -218,6 +218,81 @@ int main() {
               choice.name == "read_file",
           "named choice");
 
+    // --- json tool_call_format ----------------------------------------------
+    toolparse::StreamParser jwhole(tools(), make_id, true, "json");
+    jwhole.feed("thinking aloud\n<tool_call>\n{\"name\": \"write_file\", \"arguments\": "
+                "{\"path\": \"/tmp/j\", \"flag\": true}}\n</tool_call>");
+    jwhole.finish();
+    check(jwhole.content() == "thinking aloud", "json content split");
+    check(jwhole.calls().size() == 1, "json one call");
+    check(json::parse(jwhole.calls()[0].arguments)["flag"] == true,
+          "json boolean argument stays JSON");
+
+    // named/required 前缀只预填块框；函数名由 forced_name 校验
+    toolparse::ToolChoice jnamed;
+    jnamed.mode = toolparse::ToolChoice::Mode::Named;
+    jnamed.name = "write_file";
+    check(jnamed.parser_prefix("json") == "<tool_call>\n",
+          "json named prefix is framing only");
+    toolparse::StreamParser jcont(tools(), make_id, true, "json", "write_file");
+    jcont.feed(jnamed.parser_prefix("json"));
+    jcont.feed("{\"name\": \"write_file\", \"arguments\": {\"path\": \"/tmp/f\", \"mode\": 2}}\n"
+               "</tool_call>");
+    jcont.finish();
+    check(jcont.calls().size() == 1 && jcont.calls()[0].name == "write_file",
+          "json named continuation");
+    check(json::parse(jcont.calls()[0].arguments)["mode"] == 2, "json named arguments");
+
+    // forced_name 不匹配的调用不成立
+    toolparse::StreamParser jwrong(tools(), make_id, true, "json", "write_file");
+    jwrong.feed("<tool_call>\n{\"name\": \"read_file\", \"arguments\": {}}\n</tool_call>");
+    jwrong.finish();
+    check(jwrong.calls().empty(), "json forced name rejects other functions");
+
+    // required 前缀同样是块框
+    toolparse::ToolChoice jreq;
+    jreq.mode = toolparse::ToolChoice::Mode::Required;
+    check(jreq.parser_prefix("json") == "<tool_call>\n",
+          "json required prefix is framing only");
+
+    // 模型无视前缀、从头重写整个对象：从最后一个 {"name" 重新锚定
+    toolparse::StreamParser jrestart(tools(), make_id, true, "json", "write_file");
+    jrestart.feed(jnamed.parser_prefix("json"));
+    jrestart.feed(
+        "garbage {\"name\": \"write_file\", \"arguments\": {\"path\": \"/tmp/r\"}}\n</tool_call>");
+    jrestart.finish();
+    check(jrestart.calls().size() == 1, "json restart recovered");
+    check(json::parse(jrestart.calls()[0].arguments)["path"] == "/tmp/r",
+          "json restart arguments");
+
+    // gufo b722a61：参数里的 Python 字面量（True/False/None）改写成 JSON
+    toolparse::StreamParser pylit(tools(), make_id, true, "json");
+    pylit.feed("<tool_call>\n{\"name\": \"write_file\", \"arguments\": "
+               "{\"flag\": True, \"items\": [False, \"None\", None], "
+               "\"content\": \"a \\\" True\"}}\n</tool_call>");
+    pylit.finish();
+    check(pylit.calls().size() == 1, "python literals call survives");
+    {
+        json a = json::parse(pylit.calls()[0].arguments);
+        check(a["flag"] == true, "python True -> true");
+        check(a["items"][0] == false && a["items"][1] == "None" && a["items"][2].is_null(),
+              "python literals inside arrays, strings untouched");
+        check(a["content"] == "a \" True", "quoted True untouched");
+    }
+
+    // xml 结构化参数同样容错
+    toolparse::StreamParser pyxml(tools(), make_id);
+    pyxml.feed("<tool_call>\n<function=write_file>\n"
+               "<parameter=items>\n[True, \"False\", None]\n</parameter>\n"
+               "</function>\n</tool_call>");
+    pyxml.finish();
+    check(pyxml.calls().size() == 1, "xml python literals call survives");
+    {
+        json a = json::parse(pyxml.calls()[0].arguments);
+        check(a["items"][0] == true && a["items"][1] == "False" && a["items"][2].is_null(),
+              "xml array python literals");
+    }
+
     std::puts("RESULT PASS");
     return 0;
 }

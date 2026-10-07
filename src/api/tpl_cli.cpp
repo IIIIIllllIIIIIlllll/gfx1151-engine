@@ -28,6 +28,11 @@ int main() {
             opts.reasoning_effort = pick("reasoning_effort");
             opts.enable_thinking = pick("enable_thinking");
             opts.preserve_thinking = pick("preserve_thinking");
+            opts.preserve_reasoning = pick("preserve_reasoning");
+            opts.auto_disable_thinking_with_tools = pick("auto_disable_thinking_with_tools");
+            opts.tool_call_format = pick("tool_call_format");
+            opts.max_tool_arg_chars = pick("max_tool_arg_chars");
+            opts.max_tool_response_chars = pick("max_tool_response_chars");
             opts.add_vision_id = pick("add_vision_id");
 
             auto result = chat_template::render_chat_template(pick("messages"), opts);
