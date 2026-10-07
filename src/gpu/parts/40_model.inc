@@ -336,6 +336,28 @@ struct GpuModel {
   int* p_vbase = nullptr;        // pinned staging for d_vbase
   int pad_id = 248044;
 
+  // PLE chunk-ahead prefetch: row addresses are pure functions of the last
+  // two token ids, so the next chunk's disk gather runs on host threads while
+  // this chunk's layers occupy the GPU (the gather otherwise leaves the GPU
+  // idle behind embed+L0). One inflight flight, double pinned staging.
+  float* ple_eb2 = nullptr;        // second pinned staging [maxbatch_cap, 2560]
+  uint8_t* ple_eb_dev2 = nullptr;  // its device alias
+  hipEvent_t ple_stg_ev[2] = {};   // recorded after each staging consume
+  bool ple_stg_ev_ok[2] = {};
+  int ple_par = 0;                 // staging buffer the next gather writes
+  struct PleFlight {
+    std::vector<std::thread> pool;
+    std::vector<uint64_t> addrs, keys;
+    std::vector<int> toks;       // the chunk's tokens (cat() window)
+    std::atomic<int> barrier{0};
+    std::atomic<int> workers{0};
+    int64_t pre0 = 0, pre1 = 0;  // tokens before the window (pad_id at start)
+    uint8_t* fp8 = nullptr;      // staging this flight fills
+    int base = -1, P = 0, buf = 0;
+    bool valid = false;
+    std::chrono::steady_clock::time_point start, done;
+  } ple_fl;
+
   // ---- MTP speculative draft head (Phase A) ----
   // Single QSA+MoE layer on top of the trunk's 48-layer stream; predicts
   // t_{p+2} from (trunk h_p, emb(t_{p+1})) (DeepSeek-style wiring). Owns its
@@ -567,6 +589,10 @@ struct GpuModel {
       DALLOC(&d_eb, BP * 2560 * 4);
       CK(hipHostMalloc((void**)&ple_eb, BP * 2560 * 4, hipHostMallocDefault));
       CK(hipHostGetDevicePointer((void**)&ple_eb_dev, ple_eb, 0));
+      CK(hipHostMalloc((void**)&ple_eb2, BP * 2560 * 4, hipHostMallocDefault));
+      CK(hipHostGetDevicePointer((void**)&ple_eb_dev2, ple_eb2, 0));
+      CK(hipEventCreateWithFlags(&ple_stg_ev[0], hipEventDisableTiming));
+      CK(hipEventCreateWithFlags(&ple_stg_ev[1], hipEventDisableTiming));
       DALLOC(&d_wbf16, (size_t)64 << 20);  // fits q_proj 12288x2560 bf16
       DALLOC(&d_xbf16, BP * 10240 * 2);
       DALLOC(&d_xbf16b, BP * 6144 * 2);  // largest non-cacheable K = 6144
@@ -4690,31 +4716,164 @@ struct GpuModel {
     }
   }
 
+  // ---- PLE gather flights ---------------------------------------------------
+  // cat() window for a flight: token at window position t-back, falling back
+  // to the two history tokens carried with the flight (pad_id at sequence
+  // start). Matches the chist[ple_base0 + t - back] reads of the old inline
+  // gather exactly.
+  static int64_t ple_cat(const PleFlight& fl, int t, int back) {
+    int j = t - back;
+    return j >= 0 ? fl.toks[j] : (j == -1 ? fl.pre0 : fl.pre1);
+  }
+  // per-token NOSORT fallback, window variant of ple_rows_fp8.
+  void ple_rows_fp8_win(const PleFlight& fl, int t, uint8_t* dst) {
+    const uint8_t* addrs[16];
+    for (int h = 0; h < 16; h++) {
+      int64_t mix = ple_cat(fl, t, 0) * ple_mult[0] ^ (ple_cat(fl, t, 1) * ple_mult[1]);
+      if (h >= 8) mix ^= ple_cat(fl, t, 2) * ple_mult[2];
+      uint64_t row = (uint64_t)(ple_voff[h] + (int64_t)(mix % ple_vsz[h]));
+      const uint8_t* p = ple_table->data + row * g_ple_rb;
+      addrs[h] = p;
+      madvise((void*)(uintptr_t)((uintptr_t)p & ~4095ull), 4096, MADV_WILLNEED);
+    }
+#ifdef _WIN32
+    if (g_ple_win.ok()) {
+      uint64_t a64[16];
+      for (int h = 0; h < 16; h++) a64[h] = (uint64_t)(uintptr_t)addrs[h];
+      g_ple_win.run(a64, dst, (uint64_t)(uintptr_t)ple_table->data, 16);
+      return;
+    }
+#endif
+    for (int h = 0; h < 16; h++) memcpy(dst + h * g_ple_rb, addrs[h], g_ple_rb);
+  }
+  // Spawn the disk gather for toks (global position base) into staging fp8.
+  // Same three pipelines as the old inline gather (IOCP/io_uring, madvise
+  // two-phase, NOSORT per-token); the flight owns all worker-visible state so
+  // it can be joined from a later prefill_chunk call.
+  void ple_spawn(std::vector<int>&& toks, int base, int64_t pre0, int64_t pre1,
+                 uint8_t* fp8, int buf) {
+    PleFlight& fl = ple_fl;
+    fl.toks = std::move(toks);
+    fl.base = base;
+    fl.P = (int)fl.toks.size();
+    fl.pre0 = pre0;
+    fl.pre1 = pre1;
+    fl.fp8 = fp8;
+    fl.buf = buf;
+    fl.start = std::chrono::steady_clock::now();
+    if (ple_stg_ev_ok[buf]) {
+      // Staging was last consumed by an earlier chunk's dequant; in steady
+      // state that kernel finished two chunks ago, so this never blocks.
+      CK(hipEventSynchronize(ple_stg_ev[buf]));
+    }
+    const int P = fl.P;
+    PleFlight* f = &fl;
+    constexpr int nt = 16;
+    fl.workers.store(nt);
+    fl.pool.clear();
+    fl.pool.reserve(nt);
+    if (!getenv("GDEC_PLE_NOSORT")) {
+      fl.barrier.store(0, std::memory_order_relaxed);
+      if (ple_uring_ready()) {
+        // IOCP/io_uring batch-pread gather: phase A is the same 16-thread row
+        // address computation; the pump threads then push all 16*P rows in
+        // token order through the deep rings straight into pinned staging
+        // (same multi-ring split as the inline gather; tiny P keeps one ring).
+        fl.addrs.resize((size_t)P * 16);
+        const int npump = P >= 64 ? std::min(nt, ple_pump_count()) : 1;
+        fl.workers.store(npump);  // only the pump threads account for fl.done
+        for (int w = 0; w < nt; w++)
+          fl.pool.emplace_back([this, f, w, npump] {
+            const int t0 = (int)((size_t)w * f->P / nt),
+                      t1 = (int)((size_t)(w + 1) * f->P / nt);
+            for (int t = t0; t < t1; t++)
+              for (int h = 0; h < 16; h++) {
+                int64_t mix = ple_cat(*f, t, 0) * ple_mult[0] ^
+                              (ple_cat(*f, t, 1) * ple_mult[1]);
+                if (h >= 8) mix ^= ple_cat(*f, t, 2) * ple_mult[2];
+                uint64_t row =
+                    (uint64_t)(ple_voff[h] + (int64_t)(mix % ple_vsz[h]));
+                f->addrs[(size_t)t * 16 + h] =
+                    (uint64_t)(uintptr_t)(ple_table->data + row * g_ple_rb);
+              }
+            f->barrier.fetch_add(1, std::memory_order_acq_rel);
+            if (w >= npump) return;
+            while (f->barrier.load(std::memory_order_acquire) < nt)
+              std::this_thread::yield();
+            const size_t nrow = (size_t)f->P * 16;
+            const size_t r0 = nrow * w / npump, r1 = nrow * (w + 1) / npump;
+            PLE_PUMP_I(w).run(f->addrs.data() + r0, f->fp8 + r0 * g_ple_rb,
+                              (uint64_t)(uintptr_t)ple_table->data, r1 - r0);
+            if (f->workers.fetch_sub(1) == 1)
+              f->done = std::chrono::steady_clock::now();
+          });
+      } else {
+        // Two-phase gather: phase A computes all 16*P row addresses, sorts
+        // each shard by page and issues madvise in ascending order; phase B
+        // copies rows in token order with pages already in flight. Output
+        // staging bytes are identical to the per-token pipeline.
+        fl.addrs.resize((size_t)P * 16);
+        fl.keys.resize((size_t)P * 16);
+        for (int w = 0; w < nt; w++)
+          fl.pool.emplace_back([this, f, w] {
+            const int t0 = (int)((size_t)w * f->P / nt),
+                      t1 = (int)((size_t)(w + 1) * f->P / nt);
+            for (int t = t0; t < t1; t++)
+              for (int h = 0; h < 16; h++) {
+                int64_t mix = ple_cat(*f, t, 0) * ple_mult[0] ^
+                              (ple_cat(*f, t, 1) * ple_mult[1]);
+                if (h >= 8) mix ^= ple_cat(*f, t, 2) * ple_mult[2];
+                uint64_t row =
+                    (uint64_t)(ple_voff[h] + (int64_t)(mix % ple_vsz[h]));
+                f->addrs[(size_t)t * 16 + h] =
+                    (uint64_t)(uintptr_t)(ple_table->data + row * g_ple_rb);
+              }
+            uint64_t* kb = f->keys.data() + (size_t)t0 * 16;
+            std::memcpy(kb, f->addrs.data() + (size_t)t0 * 16,
+                        (size_t)(t1 - t0) * 16 * 8);
+            std::sort(kb, kb + (size_t)(t1 - t0) * 16);
+            uint64_t prev = ~0ull;
+            for (int64_t i = 0; i < (int64_t)(t1 - t0) * 16; i++) {
+              uint64_t pg = kb[i] & ~4095ull;
+              if (pg != prev) {
+                madvise((void*)(uintptr_t)pg, 4096, MADV_WILLNEED);
+                prev = pg;
+              }
+            }
+            f->barrier.fetch_add(1, std::memory_order_acq_rel);
+            while (f->barrier.load(std::memory_order_acquire) < nt)
+              std::this_thread::yield();
+            for (int t = t0; t < t1; t++) {
+              uint8_t* dst = f->fp8 + (size_t)t * 16 * g_ple_rb;
+              const uint64_t* ap = f->addrs.data() + (size_t)t * 16;
+              for (int h = 0; h < 16; h++)
+                std::memcpy(dst + h * g_ple_rb, (const void*)(uintptr_t)ap[h],
+                            g_ple_rb);
+            }
+            if (f->workers.fetch_sub(1) == 1)
+              f->done = std::chrono::steady_clock::now();
+          });
+      }
+    } else {
+      for (int w = 0; w < nt; w++)
+        fl.pool.emplace_back([this, f, w] {
+          for (int t = w; t < f->P; t += nt)
+            ple_rows_fp8_win(*f, t, f->fp8 + (size_t)t * 16 * g_ple_rb);
+          if (f->workers.fetch_sub(1) == 1)
+            f->done = std::chrono::steady_clock::now();
+        });
+    }
+    fl.valid = true;
+  }
+  void ple_join() {
+    for (auto& th : ple_fl.pool) th.join();
+    ple_fl.pool.clear();
+  }
+
   int prefill_batch(const std::vector<int>& tokens, int base = 0, bool final = true,
                     bool quiet = false) {
     int N = (int)tokens.size();
     int id = -1;
-    PleWinPrefetch* chunk_prefetch = nullptr;
-#ifdef _WIN32
-    std::unique_ptr<PleWinPrefetch> prefetch;
-    if (ple_on && N > maxbatch_cap && base >= 0 && N <= maxctx - base &&
-        !env_zero("GDEC_PLE_PREFETCH") && !getenv("GDEC_PLE_NOSORT") &&
-        ple_uring_ready()) {
-      ple_prefetch::Hash hash;
-      std::copy_n(ple_mult, 3, hash.mult.begin());
-      std::copy_n(ple_vsz, 16, hash.sizes.begin());
-      std::copy_n(ple_voff, 16, hash.offsets.begin());
-      hash.pad = pad_id;
-      hash.table = (uint64_t)(uintptr_t)ple_table->data;
-      hash.row_bytes = g_ple_rb;
-      prefetch = std::make_unique<PleWinPrefetch>();
-      if (!prefetch->setup(maxbatch_cap, chist, tokens, hash)) {
-        fprintf(stderr, "ple_prefetch: IOCP setup failed; using chunk-local reads\n");
-        prefetch.reset();
-      }
-    }
-    chunk_prefetch = prefetch.get();
-#endif
     for (int off = 0; off < N;) {
       int rem = N - off;
       // Absorb a small tail into this chunk instead of running a tiny final
@@ -4725,14 +4884,17 @@ struct GpuModel {
       while (n > conc_rmax_ && borrow_skip_fn &&
              g_borrow_light.load(std::memory_order_acquire))
         borrow_skip_fn(*this);
-#ifdef _WIN32
-      if (prefetch)
-        prefetch->select(off, n, ple_prefetch::chunk_size(rem - n, maxbatch,
-                                                        maxbatch_cap));
-#endif
+      // Next chunk (same sizing rule) feeds the PLE prefetch flight: its
+      // gather runs on host threads under this chunk's layer compute.
+      std::vector<int> nxt;
+      if (off + n < N) {
+        int rem2 = N - (off + n);
+        int n2 = ple_prefetch::chunk_size(rem2, maxbatch, maxbatch_cap);
+        nxt.assign(tokens.begin() + off + n, tokens.begin() + off + n + n2);
+      }
       id = prefill_chunk(
           std::vector<int>(tokens.begin() + off, tokens.begin() + off + n),
-          base + off, final, quiet, chunk_prefetch);
+          base + off, final, quiet, nxt.empty() ? nullptr : &nxt);
       if (mtp_tap_capture) {
         // Ingest this chunk's taps (chunk-local rows in d_mtap) into the MTP
         // layer before the next chunk overwrites them. MTP position i takes
@@ -4765,7 +4927,7 @@ struct GpuModel {
   }
 
   int prefill_chunk(const std::vector<int>& tokens, int base = 0, bool final = true,
-                    bool quiet = false, PleWinPrefetch* prefetch = nullptr) {
+                    bool quiet = false, const std::vector<int>* nxt = nullptr) {
     int P = (int)tokens.size();
     if (P < 1 || base + P > maxctx || base < 0 || P > maxbatch_cap) {
       fprintf(stderr, "prefill_chunk: base=%d P=%d out of range "
@@ -4794,135 +4956,23 @@ struct GpuModel {
 #endif
     auto T0 = std::chrono::steady_clock::now();
     auto TP = T0;
-    // PLE rows depend only on token history, so start the existing page-fault
-    // pipeline before L0. Its GPU consumer remains ordered after L0 below.
-    std::vector<std::thread> ple_pool;
-    std::chrono::steady_clock::time_point ple_start, ple_done;
-    std::atomic<int> ple_workers{0};
-    int ple_base0 = 0;
-    uint8_t* ple_fp8 = nullptr;
-    uint8_t* ple_input_dev = ple_eb_dev;
-    // two-phase PLE gather state (must outlive the async workers — every
-    // variable the pool lambdas capture by reference lives at this scope;
-    // declaring aliases/sizes inside the gather block is
-    // stack-use-after-scope once the workers outlive that block. ASan-proven
-    // in plegs v1/v2; the pre-plegs code had the same latent bug via
-    // block-scope reference aliases — plfix removes them).
-    std::vector<uint64_t> ple_addrs, ple_keys;
-    std::atomic<int> ple_barrier{0};
+    // PLE rows depend only on token history. This chunk's gather may already
+    // be inflight — prefetched at the end of the previous chunk so the disk
+    // pump overlaps that chunk's layer compute; otherwise gather now (first
+    // chunk, quiet re-ingest, or a flight mismatch). Either way the gather
+    // fills staging buffer ple_par and its GPU consumer stays ordered after L0.
     if (ple_on) {
-      ple_start = std::chrono::steady_clock::now();
-      for (int t = 0; t < P; t++) chist.push_back(tokens[t]);
-      ple_base0 = (int)chist.size() - P;
-      ple_fp8 = (uint8_t*)ple_eb;
-      constexpr int nt = 16;
-      ple_workers.store(nt);
-      ple_pool.reserve(nt);
-#ifdef _WIN32
-      if (prefetch) {
-        prefetch->start_current();
-        ple_input_dev = prefetch->buffers[prefetch->slot].device;
-      } else
-#endif
-      if (!getenv("GDEC_PLE_NOSORT")) {
-        ple_barrier.store(0, std::memory_order_relaxed);
-        if (ple_uring_ready()) {
-          // io_uring batch-pread gather: phase A is the same 16-thread row
-          // address computation; worker 0 then pumps all 16*P rows in token
-          // order through the 256-deep ring straight into pinned staging.
-          ple_addrs.resize((size_t)P * 16);
-          // pump threads (one per ring) account for ple_done; tiny P (decode/
-          // verify, 16*P rows) keeps a single ring.
-          const int npump = P >= 64 ? std::min(nt, ple_pump_count()) : 1;
-          ple_workers.store(npump);
-          for (int w = 0; w < nt; w++)
-            ple_pool.emplace_back([&, w, npump] {  // npump by value: block-scoped
-              const int t0 = (int)((size_t)w * P / nt), t1 = (int)((size_t)(w + 1) * P / nt);
-              for (int t = t0; t < t1; t++) {
-                const int at = ple_base0 + t;
-                auto cat = [&](int back) -> int64_t {
-                  int j = at - back;
-                  return j < 0 ? pad_id : chist[j];
-                };
-                for (int h = 0; h < 16; h++) {
-                  int64_t mix = cat(0) * ple_mult[0] ^ (cat(1) * ple_mult[1]);
-                  if (h >= 8) mix ^= cat(2) * ple_mult[2];
-                  uint64_t row = (uint64_t)(ple_voff[h] + (int64_t)(mix % ple_vsz[h]));
-                  ple_addrs[(size_t)t * 16 + h] = (uint64_t)(uintptr_t)(ple_table->data + row * g_ple_rb);
-                }
-              }
-              ple_barrier.fetch_add(1, std::memory_order_acq_rel);
-              if (w >= npump) return;
-              while (ple_barrier.load(std::memory_order_acquire) < nt)
-                std::this_thread::yield();
-              const size_t nrow = (size_t)P * 16;
-              const size_t r0 = nrow * w / npump, r1 = nrow * (w + 1) / npump;
-              PLE_PUMP_I(w).run(ple_addrs.data() + r0, ple_fp8 + r0 * g_ple_rb,
-                                (uint64_t)(uintptr_t)ple_table->data, r1 - r0);
-              if (ple_workers.fetch_sub(1) == 1)
-                ple_done = std::chrono::steady_clock::now();
-            });
-        } else {
-        // Two-phase gather: phase A computes all 16*P row addresses, sorts
-        // each shard by page and issues madvise in ascending order (random
-        // 4K reads become quasi-sequential for the disk scheduler, adjacent
-        // pages dedup); phase B copies rows in token order with pages
-        // already in flight. Output staging bytes are identical to the
-        // per-token madvise+gather pipeline. The PLE table is mostly
-        // page-cache-cold in steady state (124GB file > RAM), so submission
-        // order is the cost driver (measured: 512K random madvise ~2.5s
-        // serial-equivalent, warm gather ~0.01s).
-        ple_addrs.resize((size_t)P * 16);
-        ple_keys.resize((size_t)P * 16);
-        for (int w = 0; w < nt; w++)
-          ple_pool.emplace_back([&, w] {
-            const int t0 = (int)((size_t)w * P / nt), t1 = (int)((size_t)(w + 1) * P / nt);
-            for (int t = t0; t < t1; t++) {
-              const int at = ple_base0 + t;
-              auto cat = [&](int back) -> int64_t {
-                int j = at - back;
-                return j < 0 ? pad_id : chist[j];
-              };
-              for (int h = 0; h < 16; h++) {
-                int64_t mix = cat(0) * ple_mult[0] ^ (cat(1) * ple_mult[1]);
-                if (h >= 8) mix ^= cat(2) * ple_mult[2];
-                uint64_t row = (uint64_t)(ple_voff[h] + (int64_t)(mix % ple_vsz[h]));
-                ple_addrs[(size_t)t * 16 + h] = (uint64_t)(uintptr_t)(ple_table->data + row * g_ple_rb);
-              }
-            }
-            uint64_t* kb = ple_keys.data() + (size_t)t0 * 16;
-            std::memcpy(kb, ple_addrs.data() + (size_t)t0 * 16, (size_t)(t1 - t0) * 16 * 8);
-            std::sort(kb, kb + (size_t)(t1 - t0) * 16);
-            uint64_t prev = ~0ull;
-            for (int64_t i = 0; i < (int64_t)(t1 - t0) * 16; i++) {
-              uint64_t pg = kb[i] & ~4095ull;
-              if (pg != prev) {
-                madvise((void*)(uintptr_t)pg, 4096, MADV_WILLNEED);
-                prev = pg;
-              }
-            }
-            ple_barrier.fetch_add(1, std::memory_order_acq_rel);
-            while (ple_barrier.load(std::memory_order_acquire) < nt)
-              std::this_thread::yield();
-            for (int t = t0; t < t1; t++) {
-              uint8_t* dst = ple_fp8 + (size_t)t * 16 * g_ple_rb;
-              const uint64_t* ap = ple_addrs.data() + (size_t)t * 16;
-              for (int h = 0; h < 16; h++)
-                std::memcpy(dst + h * g_ple_rb, (const void*)(uintptr_t)ap[h], g_ple_rb);
-            }
-            if (ple_workers.fetch_sub(1) == 1)
-              ple_done = std::chrono::steady_clock::now();
-          });
+      if (!(ple_fl.valid && ple_fl.base == base && ple_fl.P == P)) {
+        if (ple_fl.valid) {  // stale flight for another chunk: finish and drop
+          ple_join();
+          ple_fl.valid = false;
         }
-      } else {
-        for (int w = 0; w < nt; w++)
-          ple_pool.emplace_back([&, w] {
-            for (int t = w; t < P; t += nt)
-              ple_rows_fp8(ple_base0 + t, ple_fp8 + (size_t)t * 16 * g_ple_rb);
-            if (ple_workers.fetch_sub(1) == 1)
-              ple_done = std::chrono::steady_clock::now();
-          });
+        const int64_t pre0 = chist.empty() ? pad_id : chist.back();
+        const int64_t pre1 = chist.size() < 2 ? pad_id : chist[chist.size() - 2];
+        ple_spawn(std::vector<int>(tokens), base, pre0, pre1,
+                  (uint8_t*)(ple_par ? ple_eb2 : ple_eb), ple_par);
       }
+      for (int t = 0; t < P; t++) chist.push_back(tokens[t]);
     }
     KP("embed_ple");
     CK(hipMemcpyAsync(d_tokarr, tokens.data(), P * 4, hipMemcpyHostToDevice, g_str));
@@ -4960,34 +5010,31 @@ struct GpuModel {
     phase("embed+L0", TP);
     if (ple_on) {
       auto wait_start = std::chrono::steady_clock::now();
-#ifdef _WIN32
-      if (prefetch) {
-        auto timing = prefetch->wait();
-        ple_start = timing.start;
-        ple_done = timing.done;
-      } else
-#endif
-      for (auto& th : ple_pool) th.join();
+      ple_join();
       auto wait_done = std::chrono::steady_clock::now();
       if (prof) {
-        p_pleh +=
-            std::chrono::duration<double, std::milli>(ple_done - ple_start).count();
+        p_pleh += std::chrono::duration<double, std::milli>(ple_fl.done - ple_fl.start)
+                      .count();
         p_ple_wait +=
             std::chrono::duration<double, std::milli>(wait_done - wait_start).count();
       }
+      const int buf = ple_fl.buf;
+      uint8_t* stg_dev = buf ? ple_eb_dev2 : ple_eb_dev;
+      ple_fl.valid = false;
       // dequant staging -> f32 d_eb on GPU (zero-copy read of pinned staging)
       if (ple_iq4) {
         size_t nb = (size_t)P * 2560 / 32;
         k_ple_iq4nl_dequant<<<(unsigned)((nb + 255) / 256), 256, 0, g_str>>>(
-            ple_input_dev, d_eb, nb);
+            stg_dev, d_eb, nb);
       } else {
         size_t n16 = (size_t)P * 2560 / 16;
         k_ple_fp8_dequant<<<(unsigned)((n16 + 255) / 256), 256, 0, g_str>>>(
-            ple_input_dev, d_eb, ple_tscale, n16);
+            stg_dev, d_eb, ple_tscale, n16);
       }
-#ifdef _WIN32
-      if (prefetch) prefetch->mark_consumed(g_str);
-#endif
+      // staging is free once the dequant ran; gates the next gather into buf.
+      CK(hipEventRecord(ple_stg_ev[buf], g_str));
+      ple_stg_ev_ok[buf] = true;
+      ple_par = buf ^ 1;  // this buffer consumed; the next gather writes the other
       float* hc_storage = d_Rb;
       if (gr_bf16) {
         uint64_t n = (uint64_t)P * 10240;
@@ -5007,9 +5054,6 @@ struct GpuModel {
       }
     }
     phase("ple", TP);
-#ifdef _WIN32
-    if (prefetch) prefetch->start_next();
-#endif
     if (ws_ok_) CK(hipEventRecord(conc_ev_a_, g_str));  // D1b quantum clock
     for (int l = 1; l < g_cfg.layers; l++) {
       bool fuse_prev = gr_scatter_norm && l > 1;
@@ -5025,6 +5069,17 @@ struct GpuModel {
       }
     }
     phase("L25-47", TP);
+    // PLE chunk-ahead prefetch: gather the next chunk's rows on host threads
+    // while the GPU drains this chunk's layer queue below (row addresses are
+    // pure functions of token ids, all known now; staging is double-buffered).
+    // GDEC_PLE_NOPREFETCH disables for A/B.
+    static const bool ple_noprefetch = getenv("GDEC_PLE_NOPREFETCH") != nullptr;
+    if (ple_on && nxt && !nxt->empty() && !ple_fl.valid && !ple_noprefetch) {
+      const int64_t pre0 = chist.empty() ? pad_id : chist.back();
+      const int64_t pre1 = chist.size() < 2 ? pad_id : chist[chist.size() - 2];
+      ple_spawn(std::vector<int>(*nxt), base + P, pre0, pre1,
+                (uint8_t*)(ple_par ? ple_eb2 : ple_eb), ple_par);
+    }
     KP("tail");
     // MTP tap capture: d_Rb now holds the final 48-layer stream for every row.
     if (mtp_tap_capture) {
