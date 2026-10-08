@@ -43,7 +43,8 @@
 // report()/on_menu() 在其定义点之前使用这些入口，需要前向声明。
 // PanelResult 的完整定义放在这里（枚举值的可见性要求），.inc 直接使用。
 namespace {
-enum PanelResult : int { kPanelStart, kPanelSave, kPanelCancel };
+// kPanelRelang：面板内切换了界面语言（已写回 service.conf 标记），调用方重开面板。
+enum PanelResult : int { kPanelStart, kPanelSave, kPanelCancel, kPanelRelang };
 void conf_write_marker();
 PanelResult panel_run(bool allow_start);
 }
@@ -742,11 +743,14 @@ void on_menu(UINT id) {
         case kIdEngineLog: shell_open(g_root + "\\" + g_plan.engine_log); break;
         case kIdApiLog: shell_open(g_root + "\\" + g_plan.api_log); break;
         case kIdLogDir: shell_open(g_root + "\\logs"); break;
-        case kIdSetup:
+        case kIdSetup: {
             // 服务运行中打开：面板里"启动服务"禁用，保存后重启生效。
-            if (panel_run(false) != kPanelCancel)
+            PanelResult pr;
+            do pr = panel_run(false); while (pr == kPanelRelang);
+            if (pr != kPanelCancel)
                 tray_balloon(L"配置已保存", L"新的启动参数将在下次启动服务时生效。");
             break;
+        }
         case kIdQuit:
             if (msgbox("退出会同时停止引擎和 API，正在进行的生成会中断。\n确定退出？",
                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES)
@@ -915,7 +919,10 @@ int main(int argc, char** argv) {
     // 已把新值写进 g_conf 和 service.conf，下面的 cfg() 会读到新配置。
     // --check / --console 不显示面板，行为与之前完全一致。
     if (!check_only && !want_console && (want_setup || !conf_has_marker())) {
-        if (panel_run(true) != kPanelStart) return 0;  // 取消 / 仅保存：直接退出
+        // kPanelRelang：语言切换后重开面板（新语言在 panel_run 里重新解析）
+        PanelResult pr;
+        do pr = panel_run(true); while (pr == kPanelRelang);
+        if (pr != kPanelStart) return 0;  // 取消 / 仅保存：直接退出
     }
 
     const std::string model_dir = cfg("MODEL_DIR", "models");
