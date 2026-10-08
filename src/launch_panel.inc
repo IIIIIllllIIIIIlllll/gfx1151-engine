@@ -610,7 +610,13 @@ void check_vram_page(CheckLines& c, const PanelVals& v, bool service_running) {
     // 显存：动态加载 HIP（启动器不链 amdhip64，DLL 缺失只降级不阻塞）
     size_t hip_free = 0, hip_total = 0;
     bool hip_ok = false;
-    if (HMODULE hip = LoadLibraryA("build\\amdhip64_7.dll")) {
+    // 全路径 + LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR：相对路径 "build\..." 跟工作目录
+    // 走（快捷方式/其他 cwd 下加载失败），且 amdhip64_7.dll 的依赖 DLL 也在
+    // build\ 下，标准搜索顺序找不到——该 flag 把 DLL 自身目录纳入依赖搜索。
+    const std::string hip_dll = g_root + "\\build\\amdhip64_7.dll";
+    if (HMODULE hip = LoadLibraryExA(hip_dll.c_str(), nullptr,
+                                     LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+                                         LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)) {
         auto p_init = reinterpret_cast<int (*)(unsigned int)>(GetProcAddress(hip, "hipInit"));
         auto p_info =
             reinterpret_cast<int (*)(size_t*, size_t*)>(GetProcAddress(hip, "hipMemGetInfo"));
