@@ -90,12 +90,25 @@ build_bench() {
       && mv -f build/gdec-bench.exe.tmp build/gdec-bench.exe
 }
 
+# 静态页嵌入：编译生成器并重新生成 src/api/static_gen.inc（复用调用方设好的 CXX）。
+# 生成器输出是确定性的，内容未变不会重写文件；static_gen.inc 随仓库提交，
+# 此处仅保持与 static/ 目录同步。
+gen_static_inc() {
+    [[ -x build/gen_static_inc.exe && ! tools/gen_static_inc.cpp -nt build/gen_static_inc.exe ]] || {
+        echo "[编译] build/gen_static_inc.exe"
+        "$CXX" -O2 -std=c++17 tools/gen_static_inc.cpp -o build/gen_static_inc.exe || exit 1
+    }
+    echo "[生成] src/api/static_gen.inc"
+    ./build/gen_static_inc.exe src/api/static src/api/static_gen.inc || exit 1
+}
+
 build_api() {
     # OpenAI HTTP 前端：纯主机 C++，用 TheRock 自带 clang++（不拖 HIP 依赖）。
     # vision.cpp 的图片解码在 Windows 上走 stb_image（vendor 单头文件，
     # 编译进 exe，零新增 DLL），支持 PNG/JPEG；WebP 明确报错。
     CXX="$TR/lib/llvm/bin/clang++.exe"
     [[ -x "$CXX" ]] || { echo "找不到 TheRock clang++: $CXX" >&2; exit 1; }
+    gen_static_inc
     echo "[编译] build/gdec-api-win.exe"
     "$CXX" -O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS -Isrc/api -Ithird_party -I"$TR/include" \
       src/api/http.cpp src/api/engine_client.cpp src/api/tokenizer.cpp \

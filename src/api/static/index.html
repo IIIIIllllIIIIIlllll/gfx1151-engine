@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title data-i18n="app.title">Qwen-Flash-Server 控制台</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <div class="brand">
+    <span class="brand-dot" id="busy-dot" data-i18n-title="hint.busy" title="引擎忙闲"></span>
+    <span class="brand-name">Qwen-Flash-Server</span>
+  </div>
+  <nav class="nav" id="nav">
+    <button class="nav-btn" data-route="overview" data-i18n="nav.overview">总览</button>
+    <button class="nav-btn" data-route="usage" data-i18n="nav.usage">用量</button>
+    <button class="nav-btn" data-route="requests" data-i18n="nav.requests">请求</button>
+    <button class="nav-btn" data-route="sample" data-i18n="nav.sample">采样</button>
+  </nav>
+  <div class="sidebar-foot">
+    <button class="icon-btn" id="lang-btn">EN</button>
+    <button class="icon-btn" id="theme-btn" data-i18n-title="hint.theme" title="切换明暗主题">☀</button>
+  </div>
+</aside>
+
+<main class="main">
+  <!-- ======================= 总览 ======================= -->
+  <section class="page" id="page-overview">
+    <header class="page-head">
+      <h1 data-i18n="nav.overview">总览</h1>
+      <span class="muted" id="overview-stamp"></span>
+    </header>
+    <div class="grid">
+      <div class="card">
+        <h2 data-i18n="ov.status">服务状态</h2>
+        <dl class="kv" id="ov-status"><div class="kv-row muted" data-i18n="common.loading">加载中…</div></dl>
+      </div>
+      <div class="card">
+        <h2 data-i18n="ov.model">模型配置</h2>
+        <dl class="kv" id="ov-model"><div class="kv-row muted" data-i18n="common.loading">加载中…</div></dl>
+      </div>
+      <div class="card">
+        <h2><span data-i18n="ov.mem">显存与内存</span> <span class="muted small" id="mem-stamp"></span></h2>
+        <div id="mem-bars" class="bars"><span class="muted" data-i18n="common.loading">加载中…</span></div>
+        <dl class="kv" id="ov-memory"></dl>
+      </div>
+      <div class="card">
+        <h2 data-i18n="ov.overrides">采样与服务端覆盖</h2>
+        <dl class="kv" id="ov-overrides"><div class="kv-row muted" data-i18n="common.loading">加载中…</div></dl>
+      </div>
+      <div class="card">
+        <h2><span data-i18n="ov.sys">系统信息</span> <span class="badge-soon" data-i18n="ov.sys_soon">后端待建</span></h2>
+        <dl class="kv placeholder">
+          <div class="kv-row"><dt data-i18n="ov.sys_cpu">CPU</dt><dd class="muted" data-i18n="common.pending">待接入</dd></div>
+          <div class="kv-row"><dt data-i18n="ov.sys_hostmem">主机内存</dt><dd class="muted" data-i18n="common.pending">待接入</dd></div>
+          <div class="kv-row"><dt data-i18n="ov.sys_disk">磁盘</dt><dd class="muted" data-i18n="common.pending">待接入</dd></div>
+          <div class="kv-row"><dt data-i18n="ov.sys_uptime">进程运行时长</dt><dd class="muted" data-i18n="common.pending">待接入</dd></div>
+        </dl>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= 用量 ======================= -->
+  <section class="page hidden" id="page-usage">
+    <header class="page-head">
+      <h1 data-i18n="nav.usage">用量</h1>
+      <div class="head-tools">
+        <label class="muted"><span data-i18n="usage.range">范围</span>
+          <select id="usage-range">
+            <option value="7" selected data-i18n="usage.d7">近 7 天</option>
+            <option value="14" data-i18n="usage.d14">近 14 天</option>
+            <option value="30" data-i18n="usage.d30">近 30 天</option>
+          </select>
+        </label>
+        <button class="btn" id="usage-refresh" data-i18n="common.refresh">刷新</button>
+        <span class="muted" id="usage-stamp"></span>
+      </div>
+    </header>
+    <div class="card">
+      <div class="totals" id="usage-totals"></div>
+      <canvas id="usage-chart" height="260"></canvas>
+      <div class="legend"><span class="lg lg-prompt"></span>prompt
+        <span class="lg lg-gen"></span>output</div>
+    </div>
+    <div class="card">
+      <h2 data-i18n="usage.daily">按天明细</h2>
+      <table class="table" id="usage-table">
+        <thead><tr><th data-i18n="usage.day">日期</th><th class="r" data-i18n="common.requests">请求数</th>
+          <th class="r">prompt</th>
+          <th class="r" data-i18n="usage.cached">缓存命中</th><th class="r">output</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="note muted" id="usage-note"></p>
+  </section>
+
+  <!-- ======================= 请求 ======================= -->
+  <section class="page hidden" id="page-requests">
+    <header class="page-head">
+      <h1 data-i18n="nav.requests">请求</h1>
+      <div class="head-tools">
+        <button class="btn" id="req-refresh" data-i18n="common.refresh">刷新</button>
+        <span class="muted" id="req-stamp"></span>
+      </div>
+    </header>
+    <div class="card">
+      <div class="filters">
+        <label><span data-i18n="req.from">起</span> <input type="date" id="req-from"></label>
+        <label><span data-i18n="req.to">止</span> <input type="date" id="req-to"></label>
+        <label>finish <select id="req-finish"><option value="" data-i18n="common.all">全部</option>
+          <option>stop</option><option>length</option><option>cancel</option>
+          <option>error</option><option>other</option></select></label>
+        <label>drafter <select id="req-drafter"><option value="" data-i18n="common.all">全部</option>
+          <option>serial</option><option>mtp</option><option>dflash2</option>
+          <option>ngram</option><option>chain</option><option>other</option></select></label>
+        <label><span data-i18n="req.size">每页</span> <select id="req-size">
+          <option>25</option><option selected>50</option><option>100</option>
+        </select></label>
+        <button class="btn" id="req-clear" data-i18n="req.clear">清除筛选</button>
+      </div>
+      <div class="table-wrap">
+      <table class="table" id="req-table">
+        <thead><tr>
+          <th data-i18n="req.time">时间</th><th class="r" data-i18n="req.seq">序号</th><th class="r">prompt</th>
+          <th class="r" data-i18n="req.cache">缓存</th>
+          <th class="r">output</th><th class="r">TTFT</th><th class="r">prefill</th>
+          <th class="r">decode</th><th class="r">prefill tok/s</th><th class="r">decode tok/s</th>
+          <th>drafter</th><th>finish</th><th class="r" data-i18n="req.accept">接受率</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+      </div>
+      <div class="pager">
+        <button class="btn" id="req-prev" data-i18n="req.prev_page">上一页</button>
+        <span id="req-pageinfo" class="muted"></span>
+        <button class="btn" id="req-next" data-i18n="req.next_page">下一页</button>
+      </div>
+    </div>
+    <p class="note muted" id="req-note"></p>
+  </section>
+
+  <!-- ======================= 采样 ======================= -->
+  <section class="page hidden" id="page-sample">
+    <header class="page-head">
+      <h1 data-i18n="nav.sample">采样</h1>
+      <span class="muted small" id="ovr-meta"></span>
+    </header>
+    <div class="card">
+      <h2 data-i18n="ovr.title">采样 / 思考参数（服务端覆盖）</h2>
+      <p class="note muted ovr-hint" data-i18n="ovr.hint"></p>
+      <div class="table-wrap">
+      <table class="table" id="ovr-table">
+        <thead><tr>
+          <th data-i18n="ovr.th_param">参数</th><th data-i18n="ovr.th_mode">模式</th>
+          <th data-i18n="ovr.th_value">值</th><th data-i18n="ovr.th_note">说明</th>
+        </tr></thead>
+        <tbody id="ovr-body"></tbody>
+      </table>
+      </div>
+      <div class="head-tools" style="margin-top:14px">
+        <input id="ovr-key" type="password" class="hidden" style="width:240px"
+               placeholder="管理密钥 (GDEC_API_ADMIN_KEY)" data-i18n-placeholder="ovr.key_ph">
+        <button class="btn primary" id="ovr-save" data-i18n="ovr.save">保存并生效</button>
+        <button class="btn" id="ovr-reload" data-i18n="ovr.reload">从服务端重新读取</button>
+        <button class="btn" id="ovr-clear" data-i18n="ovr.clear">全部改为跟随客户端</button>
+        <span class="muted small" id="ovr-status"></span>
+      </div>
+      <p class="note form-err hidden" id="ovr-err"></p>
+    </div>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

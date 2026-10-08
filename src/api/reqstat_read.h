@@ -56,4 +56,17 @@ bool scan(uint64_t t0, uint64_t t1,
 bool tail(uint32_t n, std::vector<QEntry>* out, ScanInfo* info,
           std::string* err);
 
+// One page of the chain, paging back from the newest end: offset=0, limit=n
+// equals tail(n). Records are addressed by physical slot position in the
+// chain (rotated files by seq, then the live file); the page covers slots
+// [total-offset-limit, total-offset) clipped to [0, total), returned
+// oldest-first. Only files overlapping the window are opened and only the
+// overlapping records are read. A CRC-bad slot inside the window is skipped
+// (counted in info->bad_crc), so a page can hold fewer than limit records;
+// slots past the last complete record are never counted. Concurrent appends
+// grow total, which shifts the window toward older records. total_out
+// receives the physical record count of the whole chain.
+bool page(uint64_t offset, uint32_t limit, std::vector<QEntry>* out,
+          uint64_t* total_out, ScanInfo* info, std::string* err);
+
 }  // namespace reqstat

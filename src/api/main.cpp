@@ -1588,7 +1588,10 @@ void handle_memory(const http::Request&, http::Response* r, http::Stream*) {
 // GET /reqstat/summary?from=YYYY-MM-DD&to=YYYY-MM-DD — aggregates over the
 // reqstat file chain (UTC dates, same semantics as tools/reqstat_dump.py;
 // no params = all history). GET /reqstat/tail?n=N — last N records,
-// oldest-first. Both are read-only and served without touching the engine.
+// oldest-first. GET /reqstat/page?offset=K&limit=M — paged slice counting
+// back from the newest record (offset=0&limit=n equals tail(n)), plus
+// "total" so a client can compute the page count. All read-only, served
+// without touching the engine.
 
 std::string url_decode(const std::string& s) {
     std::string out;
@@ -1773,6 +1776,31 @@ void handle_reqstat_summary(const http::Request& q, http::Response* r,
     r->body = json_py::dumps(j, /*spaced=*/false);
 }
 
+// One record as JSON — shared by /reqstat/tail and /reqstat/page.
+json reqstat_record_json(const reqstat::QEntry& e) {
+    json o;
+    o["ts_ms"] = e.ts_ms;
+    o["req_seq"] = e.req_seq;
+    o["finish"] = finish_name(e.flags & 0xF);
+    o["drafter"] = drafter_name((e.flags >> 4) & 0xF);
+    o["vision"] = (e.flags & 0x100) != 0;
+    o["prompt_tokens"] = e.n_prompt;
+    o["cached_tokens"] = e.n_cached;
+    o["output_tokens"] = e.n_gen;
+    o["ttft_ms"] = e.ttft_us / 1000.0;
+    o["prefill_ms"] = e.prefill_us / 1000.0;
+    o["decode_ms"] = e.decode_us / 1000.0;
+    o["proposed"] = e.proposed;
+    o["commit"] = e.commit;
+    o["rounds"] = e.rounds;
+    o["acceptance"] =
+        e.proposed
+            ? json((e.commit >= e.rounds ? e.commit - e.rounds : 0) * 1.0 /
+                   e.proposed)
+            : json(nullptr);
+    return o;
+}
+
 void handle_reqstat_tail(const http::Request& q, http::Response* r,
                          http::Stream*) {
     const auto qp = parse_query(q.query);
@@ -1793,29 +1821,7 @@ void handle_reqstat_tail(const http::Request& q, http::Response* r,
         return;
     }
     json arr = json::array();
-    for (const auto& e : recs) {
-        json o;
-        o["ts_ms"] = e.ts_ms;
-        o["req_seq"] = e.req_seq;
-        o["finish"] = finish_name(e.flags & 0xF);
-        o["drafter"] = drafter_name((e.flags >> 4) & 0xF);
-        o["vision"] = (e.flags & 0x100) != 0;
-        o["prompt_tokens"] = e.n_prompt;
-        o["cached_tokens"] = e.n_cached;
-        o["output_tokens"] = e.n_gen;
-        o["ttft_ms"] = e.ttft_us / 1000.0;
-        o["prefill_ms"] = e.prefill_us / 1000.0;
-        o["decode_ms"] = e.decode_us / 1000.0;
-        o["proposed"] = e.proposed;
-        o["commit"] = e.commit;
-        o["rounds"] = e.rounds;
-        o["acceptance"] =
-            e.proposed
-                ? json((e.commit >= e.rounds ? e.commit - e.rounds : 0) * 1.0 /
-                       e.proposed)
-                : json(nullptr);
-        arr.push_back(o);
-    }
+    for (const auto& e : recs) arr.push_back(reqstat_record_json(e));
     json j;
     j["records"] = arr;
     j["files_total"] = info.files_total;
@@ -1825,14 +1831,60 @@ void handle_reqstat_tail(const http::Request& q, http::Response* r,
     r->body = json_py::dumps(j, /*spaced=*/false);
 }
 
-// GET / 和 GET /dashboard — static monitoring page (see dashboard_html.inc).
-// 页面加载后用同源 fetch 轮询 /health 与 /memory，这里只负责回 HTML。
-#include "dashboard_html.inc"
-
-void handle_dashboard(const http::Request&, http::Response* r, http::Stream*) {
-    r->content_type = "text/html; charset=utf-8";
+void handle_reqstat_page(const http::Request& q, http::Response* r,
+                         http::Stream*) {
+    const auto qp = parse_query(q.query);
+    long long offset = 0;
+    if (auto it = qp.find("offset"); it != qp.end() && !it->second.empty()) {
+        char* end = nullptr;
+        offset = strtoll(it->second.c_str(), &end, 10);
+        if (!end || *end || offset < 0)
+            http::fail(400, "offset must be a non-negative integer");
+    }
+    long limit = 20;
+    if (auto it = qp.find("limit"); it != qp.end() && !it->second.empty()) {
+        char* end = nullptr;
+        limit = strtol(it->second.c_str(), &end, 10);
+        if (!end || *end || limit < 1)
+            http::fail(400, "limit must be a positive integer");
+        if (limit > 1000) limit = 1000;
+    }
+    std::vector<reqstat::QEntry> recs;
+    uint64_t total = 0;
+    reqstat::ScanInfo info;
+    std::string err;
+    if (!reqstat::page((uint64_t)offset, (uint32_t)limit, &recs, &total,
+                       &info, &err)) {
+        r->status = 500;
+        r->body = http::error_json("reqstat read failed: " + err,
+                                   "server_error", "server_error");
+        return;
+    }
+    json arr = json::array();
+    for (const auto& e : recs) arr.push_back(reqstat_record_json(e));
+    json j;
+    j["records"] = arr;
+    j["total"] = total;
+    j["offset"] = (uint64_t)offset;
+    j["limit"] = (uint64_t)limit;
+    j["files_total"] = info.files_total;
+    j["files_scanned"] = info.files_scanned;
+    j["bad_crc"] = info.bad_crc;
     r->set("Cache-Control", "no-store");
-    r->body = kDashboardHtml;
+    r->body = json_py::dumps(j, /*spaced=*/false);
+}
+
+// GET 静态页 —— src/api/static/ 下的文件由构建时工具(tools/gen_static_inc.cpp)
+// 嵌入 static_gen.inc，路由在 kStaticAssets，启动时逐条注册 GET。
+// dashboard 页面加载后用同源 fetch 轮询 /health 与 /memory，这里只负责回内容。
+#include "static_gen.inc"
+
+http::Server::Handler make_static_handler(const StaticAsset& asset) {
+    return [asset](const http::Request&, http::Response* r, http::Stream*) {
+        r->content_type = asset.mime;
+        r->set("Cache-Control", "no-store");
+        r->body.assign(reinterpret_cast<const char*>(asset.data), asset.len);
+    };
 }
 
 void handle_health(const http::Request&, http::Response* r, http::Stream*) {
@@ -1841,7 +1893,7 @@ void handle_health(const http::Request&, http::Response* r, http::Stream*) {
     j["model"] = g_cfg.model;
     j["endpoints"] = json::array(
         {"/v1/chat/completions", "/v1/completions", "/v1/models", "/v1/responses",
-         "/dashboard", "/reqstat/summary", "/reqstat/tail"});
+         "/dashboard", "/reqstat/summary", "/reqstat/tail", "/reqstat/page"});
     j["context"] = g_cfg.context;
     if (g_cfg.rope.factor > 1.0) {
         j["rope_scaling"] = {{"type", "yarn"},
@@ -2795,14 +2847,14 @@ int main(int argc, char** argv) {
     fprintf(stderr, "gdec-api: listening on :%d model=%s ctx=%d slots=%d\n", srv.port(),
             g_cfg.model.c_str(), g_cfg.context, g_slots);
 
-    srv.on("GET", "/", handle_dashboard);
-    srv.on("GET", "/dashboard", handle_dashboard);
+    for (const StaticAsset& a : kStaticAssets) srv.on("GET", a.url, make_static_handler(a));
     srv.on("GET", "/v1/models", handle_models);
     srv.on("GET", "/health", handle_health);
     srv.on("GET", "/memory", handle_memory);
     srv.on("GET", "/cache", handle_cache);
     srv.on("GET", "/reqstat/summary", handle_reqstat_summary);
     srv.on("GET", "/reqstat/tail", handle_reqstat_tail);
+    srv.on("GET", "/reqstat/page", handle_reqstat_page);
     srv.on("GET", "/admin/overrides", handle_overrides_get);
     srv.on("POST", "/admin/overrides", handle_overrides_post);
     srv.on("POST", "/v1/completions", handle_completions);

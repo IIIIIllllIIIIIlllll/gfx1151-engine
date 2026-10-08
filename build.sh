@@ -231,9 +231,20 @@ build_bench() {
 
 API_FLAGS=(-O2 -std=c++17 -Isrc/api -Ithird_party -Wall -Wextra -Wpedantic
            -Werror "${BUNDLE_RPATH[@]}")
+# 静态页嵌入:编译生成器并重新生成 src/api/static_gen.inc。生成器输出是确定性的,
+# 内容未变不会重写文件;static_gen.inc 随仓库提交,此处仅保持与 static/ 目录同步。
+gen_static_inc() {
+  if [ ! -x build/gen_static_inc ] || [ tools/gen_static_inc.cpp -nt build/gen_static_inc ]; then
+    echo "[生成] build/gen_static_inc"
+    "$CXX" -O2 -std=c++17 tools/gen_static_inc.cpp -o build/gen_static_inc || return 1
+  fi
+  echo "[生成] src/api/static_gen.inc"
+  ./build/gen_static_inc src/api/static src/api/static_gen.inc
+}
 # tokenizer/chat_template 由 CLI 与服务器共用,每个目标须显式列出源文件
 # (否则 main.cpp 会与 CLI 的 main 冲突)。
 build_api() {
+  gen_static_inc || return 1
   compile build/gdec-api 8 120 "$CXX" "${API_FLAGS[@]}" \
     src/api/http.cpp src/api/engine_client.cpp src/api/tokenizer.cpp \
     src/api/chat_template.cpp src/api/json_py.cpp src/api/toolparse.cpp \

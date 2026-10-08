@@ -1,21 +1,9 @@
-// dashboard_html.inc — gdec-api 自带的控制台（由 GET / 和 GET /dashboard 返回）。
-//
-// 单文件：CSS/JS 全部内联，不引用任何外部资源（无 CDN，离线/局域网可用）。
-// 页面用同源 fetch 访问：
-//   GET /health  每 2 秒   —— API 进程自身的状态，不经过 engine
-//   GET /memory  每 10 秒  —— engine 内存记账（占用推理槽位，间隔勿低于 ~1 秒）
-//   GET/POST /admin/overrides —— 服务端采样/思考参数覆盖表（打开页面时读一次）
-//   GET /reqstat/summary|tail 每 10 秒 —— "请求统计"面板（读 data/reqstat*.bin，不经过 engine）
-//   POST /v1/chat/completions —— "对话测试"面板，以普通客户端身份流式调用
-// /memory 在 engine 不可达时返回 500；页面把错误显示在面板内并保留上次数值，
-// 继续按周期重试，不会白屏。
-
-static const char kDashboardHtml[] = R"HTMLDOC(<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>gdec-api 控制台</title>
+<title>Qwen-Flash-Server 控制台</title>
 <style>
   :root {
     --bg: #0d1117; --panel: #161b22; --border: #30363d;
@@ -133,7 +121,7 @@ static const char kDashboardHtml[] = R"HTMLDOC(<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>gdec-api 控制台</h1>
+  <h1>Qwen-Flash-Server 控制台</h1>
   <span class="mono" id="target"></span>
   <span class="chip" id="conn">连接中…</span>
   <nav><a href="#health">状态</a><a href="#reqs">请求统计</a><a href="#ovr">参数覆盖</a><a href="#chat">对话测试</a><a href="#mem">内存</a></nav>
@@ -852,4 +840,3 @@ window.addEventListener("resize", drawSpark);
 </script>
 </body>
 </html>
-)HTMLDOC";

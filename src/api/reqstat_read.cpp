@@ -132,18 +132,22 @@ std::vector<ChainFile> chain_files(const std::string& dir, ScanInfo* info,
   return files;
 }
 
-// Stream one file record by record; cb returning false stops early.
-void scan_file(const std::string& path, uint64_t t0, uint64_t t1,
-               const std::function<bool(const QEntry&)>& cb, ScanInfo* info) {
+// Stream records [index, index+count) of one file (pass count ~0ULL for
+// "to EOF"); entries outside [t0, t1] are filtered, cb false stops early.
+void read_records(const std::string& path, uint64_t index, uint64_t count,
+                  uint64_t t0, uint64_t t1,
+                  const std::function<bool(const QEntry&)>& cb,
+                  ScanInfo* info) {
   FILE* f = fopen(path.c_str(), "rb");
   if (!f) return;
-  if (!seek64(f, kHeaderSize)) {
+  if (!seek64(f, (uint64_t)kHeaderSize + index * kRecordSize)) {
     fclose(f);
     return;
   }
   uint8_t buf[1024 * kRecordSize];
-  size_t got;
-  while ((got = fread(buf, kRecordSize, 1024, f)) > 0) {
+  while (count > 0) {
+    const size_t want = (size_t)std::min<uint64_t>(count, 1024);
+    const size_t got = fread(buf, kRecordSize, want, f);
     for (size_t i = 0; i < got; i++) {
       QEntry e;
       if (!unpack(buf + i * kRecordSize, &e)) {
@@ -157,6 +161,8 @@ void scan_file(const std::string& path, uint64_t t0, uint64_t t1,
         return;
       }
     }
+    count -= want;
+    if (got < want) break;  // truncated tail
   }
   fclose(f);
 }
@@ -189,7 +195,7 @@ bool scan(uint64_t t0, uint64_t t1,
     fclose(f);
     if (probe && (last < t0 || first > t1)) continue;  // whole file outside
     if (info) info->files_scanned++;
-    scan_file(cf.path, t0, t1, visit, info);
+    read_records(cf.path, 0, ~(uint64_t)0, t0, t1, visit, info);
   }
   return true;
 }
@@ -214,7 +220,7 @@ bool tail(uint32_t n, std::vector<QEntry>* out, ScanInfo* info,
       continue;
     if (info) info->files_scanned++;
     parts.emplace_back();
-    scan_file(it->path, 0, ~(uint64_t)0,
+    read_records(it->path, 0, ~(uint64_t)0, 0, ~(uint64_t)0,
               [&](const QEntry& e) {
                 parts.back().push_back(e);
                 return true;
@@ -229,6 +235,50 @@ bool tail(uint32_t n, std::vector<QEntry>* out, ScanInfo* info,
     all.insert(all.end(), it->begin(), it->end());
   if (all.size() > n) all.erase(all.begin(), all.end() - n);
   *out = std::move(all);
+  return true;
+}
+
+bool page(uint64_t offset, uint32_t limit, std::vector<QEntry>* out,
+          uint64_t* total_out, ScanInfo* info, std::string* err) {
+  if (info) *info = ScanInfo{};
+  out->clear();
+  bool enum_ok;
+  const auto files = chain_files(stat_dir(), info, &enum_ok);
+  if (!enum_ok) {
+    if (err) *err = "cannot enumerate " + stat_dir();
+    return false;
+  }
+  // Physical slot ranges: chain position [base, base+count) per file.
+  struct Slot {
+    const ChainFile* cf;
+    uint64_t base, count;
+  };
+  std::vector<Slot> slots;
+  uint64_t total = 0;
+  for (const auto& cf : files) {
+    std::error_code ec;
+    const uint64_t count =
+        record_count(std::filesystem::file_size(cf.path, ec));
+    if (ec || count == 0) continue;
+    slots.push_back({&cf, total, count});
+    total += count;
+  }
+  if (total_out) *total_out = total;
+  if (limit == 0 || offset >= total) return true;
+  const uint64_t end = total - offset;  // exclusive
+  const uint64_t start = end > limit ? end - limit : 0;
+  for (const auto& s : slots) {
+    if (s.base + s.count <= start || s.base >= end) continue;
+    const uint64_t i0 = start > s.base ? start - s.base : 0;
+    const uint64_t cnt = std::min(s.count - i0, end - (s.base + i0));
+    if (info) info->files_scanned++;
+    read_records(s.cf->path, i0, cnt, 0, ~(uint64_t)0,
+                 [&](const QEntry& e) {
+                   out->push_back(e);
+                   return true;
+                 },
+                 info);
+  }
   return true;
 }
 
