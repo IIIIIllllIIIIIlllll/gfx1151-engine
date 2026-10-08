@@ -44,7 +44,7 @@ decoding are identical; switch by using the other launcher:
 
 | | hgn standard | hgn high quality (HQ) | GGUF UD-Q4_K_XL |
 | --- | --- | --- | --- |
-| Files | current default (`qwen38-flash-next-v2.hgn` + ngram/MTP) | converted from the original weights, see [HGN-HQ.md](HGN-HQ.md) (Chinese) | released by Unsloth, the same files llama.cpp uses |
+| Files | current default (`qwen38-flash-next-v2.hgn` + ngram/MTP) | converted from the original weights, see [HGN-HQ.md](docs/HGN-HQ.md) (Chinese) | released by Unsloth, the same files llama.cpp uses |
 | Routed experts | 4-bit (q4cp) | 4-bit (q4cp, imatrix-weighted) | mostly Q4_K / Q5_1 |
 | Dense (attention, GDN, shared expert, embed, lm_head) | 4-bit | 8-bit (q8g32 overlay) | 8-bit (Q8_0) |
 | KLD vs BF16 (lower is better) | 0.163 | **0.0558** | 0.0511 |
@@ -56,7 +56,7 @@ decoding are identical; switch by using the other launcher:
 | Windows | yes | yes (not yet measured) | no |
 
 - KLD: BF16 reference, wikitext-2, 64 chunks × 512, measured the same way as
-  unsloth / llama.cpp (see [KLD.md](KLD.md), Chinese); llama.cpp on the same
+  unsloth / llama.cpp (see [KLD.md](docs/KLD.md), Chinese); llama.cpp on the same
   GGUF gives 0.049.
 - Almost the whole quality gap comes from the dense bit width: 8-bit dense
   takes KLD from 0.163 to 0.063, imatrix-weighted experts bring it to 0.0558.
@@ -71,7 +71,7 @@ decoding are identical; switch by using the other launcher:
   only, a few seconds).
 - The default configuration is still hgn standard. The HQ files pass
   `tools/hq_verify.sh`; deployment is described in section 6 of
-  [HGN-HQ.md](HGN-HQ.md).
+  [HGN-HQ.md](docs/HGN-HQ.md).
 
 ## Features
 
@@ -98,14 +98,14 @@ decoding are identical; switch by using the other launcher:
   the GPU round-robins between requests and each request's output is
   bit-identical to running alone; long-prompt prefill is chunked to yield
   the GPU, capping other sessions' worst stall at ~0.6 s. Configuration
-  and semantics in [CONCURRENCY.md](CONCURRENCY.md) (Chinese).
+  and semantics in [CONCURRENCY.md](docs/CONCURRENCY.md) (Chinese).
 - **Two weight formats**: the native `.hgn` (Linux / Windows) and llama.cpp
   GGUF (Unsloth UD-Q4_K_XL, Linux); comparison above.
 - **Model conversion tool**: HF safetensors → `.hgn`. The default output is
   the high-quality variant (8-bit dense overlay + weighted 4-bit experts); a
   llama.cpp-format imatrix is used if you have one, and conversion works
   without one too. Usable for your own fine-tunes of the same architecture
-  (see [HGN-HQ.md](HGN-HQ.md), [CONVERT_EN.md](CONVERT_EN.md)).
+  (see [HGN-HQ.md](docs/HGN-HQ.md), [CONVERT_EN.md](docs/CONVERT_EN.md)).
 
 ## Requirements
 
@@ -126,11 +126,11 @@ bash start_gguf.sh   # or GGUF weights (Unsloth UD-Q4_K_XL, the same files llama
 
 Both launchers read weights from `./models` and list any missing files before
 exiting; configuration is centralized in `service.conf` (one section each for
-hgn and GGUF; GGUF details in [GGUF.md](GGUF.md)). See [QUICKSTART_EN.md](QUICKSTART_EN.md)
+hgn and GGUF; GGUF details in [GGUF.md](docs/GGUF.md)). See [QUICKSTART_EN.md](docs/QUICKSTART_EN.md)
 for details.
 
 For repeatable standalone performance measurements, build and run the
-command-line benchmark described in [BENCHMARK_EN.md](BENCHMARK_EN.md):
+command-line benchmark described in [BENCHMARK_EN.md](docs/BENCHMARK_EN.md):
 `bash build.sh` on Linux or `bash build_win.sh` on Windows. Each default build
 produces all required platform artifacts, including the engine, API, and
 benchmark; Windows also builds the native launcher. It loads only the model
@@ -151,8 +151,8 @@ It writes the base `.hgn`, the 8-bit dense overlay, the 8-bit MTP draft, the
 vision tower, the tokenizer and a ready-to-run `start.sh`; ~1.5 hours on 32
 cores, ~125 GiB of disk, needs only numpy. `--classic` is the old data-free
 converter (byte-identical output to before). High-quality conversion: see
-[HGN-HQ.md](HGN-HQ.md); format and the old converter: see
-[CONVERT_EN.md](CONVERT_EN.md).
+[HGN-HQ.md](docs/HGN-HQ.md); format and the old converter: see
+[CONVERT_EN.md](docs/CONVERT_EN.md).
 
 ## YaRN and Shared KV Pool Configuration
 
@@ -369,14 +369,14 @@ Equal pool sizes do not imply identical total memory with different
   difference), not a promise of zero overhead for every workload. A short
   probe had factor-2 versus
   native mean KLD 0.0234 and same-top 93.5%; outputs need not be identical.
-  See [YARN-512K.md](YARN-512K.md) for implementation/limits and
-  [YARN-512K-RESULTS.md](YARN-512K-RESULTS.md) for the hardware report.
+  See [YARN-512K.md](docs/YARN-512K.md) for implementation/limits and
+  [YARN-512K-RESULTS.md](docs/YARN-512K-RESULTS.md) for the hardware report.
 
 ## Windows
 
 The Windows version has feature parity with the Linux version (engine +
 OpenAI API + multimodal). Porting notes and measurements are in
-[PORTING-WINDOWS_EN.md](PORTING-WINDOWS_EN.md). Builds run in Git Bash
+[PORTING-WINDOWS_EN.md](docs/PORTING-WINDOWS_EN.md). Builds run in Git Bash
 (or double-click `build_win.bat`; Git is only needed at build time):
 
 ```bash
@@ -427,7 +427,7 @@ Differences from the Linux version:
 - Only hgn weights are supported: usable VRAM on Windows is capped at
   about 96 GiB, and GGUF weights are larger (hgn saves ~11 GiB over GGUF)
   and do not fit — `start_gguf.sh` does not apply; hgn weights are
-  produced by the conversion tool, see [CONVERT_EN.md](CONVERT_EN.md).
+  produced by the conversion tool, see [CONVERT_EN.md](docs/CONVERT_EN.md).
   The high-quality hgn works by swapping files: weight arena +2.2 GiB,
   estimated ~93.2 GiB at 256K / chunk 8192 (limit 95); not yet measured
   on Windows
@@ -449,34 +449,34 @@ pending, priority very low):
   Fixed: the launcher is now a tray app whose logs bypass the console, and
   kvsnap no longer prints while holding its lock; pending verification)
 
-Build details are in [BUILD_EN.md](BUILD_EN.md).
+Build details are in [BUILD_EN.md](docs/BUILD_EN.md).
 
 ## Documentation
 
-- [QUICKSTART_EN.md](QUICKSTART_EN.md) — build, launch, configuration
-- [BUILD_EN.md](BUILD_EN.md) — build environment details and
+- [QUICKSTART_EN.md](docs/QUICKSTART_EN.md) — build, launch, configuration
+- [BUILD_EN.md](docs/BUILD_EN.md) — build environment details and
   troubleshooting
-- [GGUF.md](GGUF.md) (Chinese) — GGUF weight loading, performance vs hgn
-- [HGN-HQ.md](HGN-HQ.md) (Chinese) — high-quality hgn: one-step conversion
+- [GGUF.md](docs/GGUF.md) (Chinese) — GGUF weight loading, performance vs hgn
+- [HGN-HQ.md](docs/HGN-HQ.md) (Chinese) — high-quality hgn: one-step conversion
   (optional imatrix), results, deployment
-- [CONVERT_EN.md](CONVERT_EN.md) — model conversion tool
-- [KLD.md](KLD.md) (Chinese) — quality testing (KLD, same method as
+- [CONVERT_EN.md](docs/CONVERT_EN.md) — model conversion tool
+- [KLD.md](docs/KLD.md) (Chinese) — quality testing (KLD, same method as
   unsloth / llama.cpp)
-- [MTP_EN.md](MTP_EN.md) — speculative decoding parameters and comparison
+- [MTP_EN.md](docs/MTP_EN.md) — speculative decoding parameters and comparison
   methods
-- [NGRAM_EN.md](NGRAM_EN.md) — ngram verification design, benefits, and
+- [NGRAM_EN.md](docs/NGRAM_EN.md) — ngram verification design, benefits, and
   known divergences
-- [CONCURRENCY.md](CONCURRENCY.md) — concurrent requests (PARALLEL)
+- [CONCURRENCY.md](docs/CONCURRENCY.md) — concurrent requests (PARALLEL)
   configuration and semantics (Chinese)
-- [YARN-512K.md](YARN-512K.md) — YaRN 512K implementation, pool admission and validation scope
-- [YARN-512K-RESULTS.md](YARN-512K-RESULTS.md) (Chinese) — Linux/gfx1151 long-context and concurrency results
-- [HGN-FORMAT_EN.md](HGN-FORMAT_EN.md) — the `.hgn` weight container
+- [YARN-512K.md](docs/YARN-512K.md) — YaRN 512K implementation, pool admission and validation scope
+- [YARN-512K-RESULTS.md](docs/YARN-512K-RESULTS.md) (Chinese) — Linux/gfx1151 long-context and concurrency results
+- [HGN-FORMAT_EN.md](docs/HGN-FORMAT_EN.md) — the `.hgn` weight container
   format
-- [GGUF.md](GGUF.md) — running directly from llama.cpp GGUF weights
+- [GGUF.md](docs/GGUF.md) — running directly from llama.cpp GGUF weights
   (Chinese)
 - [data/README_EN.md](data/README_EN.md) — numerical regression benchmark
   (data/qsa-oracle) description
-- [PORTING-WINDOWS_EN.md](PORTING-WINDOWS_EN.md) — Windows porting notes
+- [PORTING-WINDOWS_EN.md](docs/PORTING-WINDOWS_EN.md) — Windows porting notes
   and measurements
 
 ## Tests
@@ -486,15 +486,15 @@ bash build.sh test     # Kernel unit tests, no model loading, expect ALL PASS
 python3 tools/bpw.py   # bpw of the weights under models/ by category (headers only)
 ```
 
-Quality (KLD) testing needs a BF16 reference; see [KLD.md](KLD.md).
+Quality (KLD) testing needs a BF16 reference; see [KLD.md](docs/KLD.md).
 
 ## Acknowledgements
 
-This project's implementation borrows from [halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server) by peonist-ai. The `.hgn` weight container format is halogen's checkpoint container format — see [HGN-FORMAT_EN.md](HGN-FORMAT_EN.md). Many thanks to the halogen authors.
+This project's implementation borrows from [halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server) by peonist-ai. The `.hgn` weight container format is halogen's checkpoint container format — see [HGN-FORMAT_EN.md](docs/HGN-FORMAT_EN.md). Many thanks to the halogen authors.
 
-GGUF support heavily references [gufo](https://github.com/gufo-org/gufo) (MIT license): the routed-expert F16 WMMA GEMM kernel is ported from its RoutedF16GEMMKernel (`src/gpu/parts/26_kernels_moe_gguf.inc`); the LUT-decoded variants for hgn q4cp / GGUF IQ4 follow the same pipeline (`27_kernels_moe_lut.inc`); the GGUF↔engine tensor transform semantics reference its reference.cpp (`src/gguf_map.h`). Prefill optimizations such as HC gate fusion and producer epilogues writing the next GEMM's input directly also borrow from gufo's approach (comparison analysis in [GUFO-GAP.md](GUFO-GAP.md), Chinese).
+GGUF support heavily references [gufo](https://github.com/gufo-org/gufo) (MIT license): the routed-expert F16 WMMA GEMM kernel is ported from its RoutedF16GEMMKernel (`src/gpu/parts/26_kernels_moe_gguf.inc`); the LUT-decoded variants for hgn q4cp / GGUF IQ4 follow the same pipeline (`27_kernels_moe_lut.inc`); the GGUF↔engine tensor transform semantics reference its reference.cpp (`src/gguf_map.h`). Prefill optimizations such as HC gate fusion and producer epilogues writing the next GEMM's input directly also borrow from gufo's approach (comparison analysis in [GUFO-GAP.md](docs/GUFO-GAP.md), Chinese).
 
-The ngram speculative drafting approach and the two-tier prompt cache borrow ideas from the open-source [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT license); GGUF weights and the vision tower (mmproj) reuse the very same files as llama.cpp. See the "Attribution" section of [NGRAM_EN.md](NGRAM_EN.md).
+The ngram speculative drafting approach and the two-tier prompt cache borrow ideas from the open-source [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT license); GGUF weights and the vision tower (mmproj) reuse the very same files as llama.cpp. See the "Attribution" section of [NGRAM_EN.md](docs/NGRAM_EN.md).
 
 ## License
 

@@ -37,7 +37,7 @@ greedy 略低。权重格式(GGUF / hgn)不同数字会有出入;ROCm 7.14 与 1
 
 | | hgn 标准 | hgn 高质量(HQ) | GGUF UD-Q4_K_XL |
 | --- | --- | --- | --- |
-| 文件 | 当前默认(`qwen38-flash-next-v2.hgn` + ngram/MTP) | 从原始权重转换,见 [HGN-HQ.md](HGN-HQ.md) | Unsloth 发布,与 llama.cpp 同一份文件 |
+| 文件 | 当前默认(`qwen38-flash-next-v2.hgn` + ngram/MTP) | 从原始权重转换,见 [HGN-HQ.md](docs/HGN-HQ.md) | Unsloth 发布,与 llama.cpp 同一份文件 |
 | 路由专家 | 4-bit(q4cp) | 4-bit(q4cp,imatrix 加权) | Q4_K / Q5_1 为主 |
 | dense(注意力、GDN、shared expert、embed、lm_head) | 4-bit | 8-bit(q8g32 overlay) | 8-bit(Q8_0) |
 | KLD vs BF16(越低越好) | 0.163 | **0.0558** | 0.0511 |
@@ -48,7 +48,7 @@ greedy 略低。权重格式(GGUF / hgn)不同数字会有出入;ROCm 7.14 与 1
 | 启动 | `start_hgn.sh` | `start_hgn.sh`(改 `MODEL_FILE` / `OVERLAY_FILE`) | `start_gguf.sh` |
 | Windows | 支持 | 支持(尚未实测) | 不支持 |
 
-- KLD:BF16 基准,wikitext-2 64 chunk × 512,测法与 unsloth / llama.cpp 相同(见 [KLD.md](KLD.md));
+- KLD:BF16 基准,wikitext-2 64 chunk × 512,测法与 unsloth / llama.cpp 相同(见 [KLD.md](docs/KLD.md));
   llama.cpp 跑同一份 GGUF 为 0.049。
 - 质量差距几乎全部来自 dense 的位宽:dense 改成 8-bit 后 KLD 0.163 → 0.063,imatrix 专家再降到
   0.0558。代价是 decode 每 token 读量增加,慢约 16%(与 GGUF 相同);prefill 不受影响。
@@ -57,7 +57,7 @@ greedy 略低。权重格式(GGUF / hgn)不同数字会有出入;ROCm 7.14 与 1
 - 常驻权重不含 PLE n-gram 表(hgn fp8 47.7 GiB,GGUF IQ4_NL 26.8 GiB),该表留在磁盘按需读。
   `python3 tools/bpw.py` 按类别复核各文件的 bpw(只读文件头,几秒)。
 - 默认配置仍是 hgn 标准。HQ 文件已通过 `tools/hq_verify.sh`;部署方法见
-  [HGN-HQ.md](HGN-HQ.md) 第 6 节。
+  [HGN-HQ.md](docs/HGN-HQ.md) 第 6 节。
 
 ## 特性
 
@@ -74,12 +74,12 @@ greedy 略低。权重格式(GGUF / hgn)不同数字会有出入;ROCm 7.14 与 1
 - **并发请求**:多条请求共享同一个分页 KV 页池(默认 4 路、总共 256K,
   类似 llama.cpp 的共享上下文),GPU 按请求轮转,每条输出与单独运行逐位
   一致;长 prompt prefill 分段让出 GPU,其它会话最长卡顿约 0.6 s。配置与
-  语义见 [CONCURRENCY.md](CONCURRENCY.md)。
+  语义见 [CONCURRENCY.md](docs/CONCURRENCY.md)。
 - **两种权重格式**:自有 `.hgn`(Linux / Windows)与 llama.cpp 的 GGUF
   (Unsloth UD-Q4_K_XL,Linux),对比见上。
 - **模型转换工具**:HF safetensors → `.hgn`,默认输出高质量版(8-bit dense overlay
   + 加权 4-bit 专家);有 llama.cpp 格式的 imatrix 就用,没有也能转。可用于自己的
-  同架构微调模型(见 [HGN-HQ.md](HGN-HQ.md)、[CONVERT.md](CONVERT.md))。
+  同架构微调模型(见 [HGN-HQ.md](docs/HGN-HQ.md)、[CONVERT.md](docs/CONVERT.md))。
 
 ## 要求
 
@@ -98,10 +98,10 @@ bash start_gguf.sh   # 或 GGUF 权重(Unsloth UD-Q4_K_XL,与 llama.cpp 同一�
 ```
 
 两个启动器都从 `./models` 读取权重,缺文件时列出缺失项并退出;配置集中在
-`service.conf`(hgn、GGUF 各一段)。GGUF 见 [GGUF.md](GGUF.md)。
-详见 [QUICKSTART.md](QUICKSTART.md)。
+`service.conf`(hgn、GGUF 各一段)。GGUF 见 [GGUF.md](docs/GGUF.md)。
+详见 [QUICKSTART.md](docs/QUICKSTART.md)。
 
-独立性能测试工具见 [BENCHMARK.md](BENCHMARK.md)。编译脚本不带参数时会
+独立性能测试工具见 [BENCHMARK.md](docs/BENCHMARK.md)。编译脚本不带参数时会
 一次性编译引擎、API 前端和 benchmark；Windows 还会编译原生启动器。测试
 程序本身的输出使用英语，文档仍以中文为主。
 
@@ -116,8 +116,8 @@ python3 tools/flashnext2hgn.py /path/to/hf-model --out ./models --imatrix /path/
 
 输出基座 `.hgn`、8-bit dense overlay、8-bit MTP 草稿、视觉塔、分词器,以及可直接运行的
 `start.sh`;32 核约 1.5 小时,磁盘约 125 GiB,只依赖 numpy。`--classic` 为旧的无数据转换器
-(输出与以前逐字节相同)。高质量转换见 [HGN-HQ.md](HGN-HQ.md),格式与旧转换器见
-[CONVERT.md](CONVERT.md)。
+(输出与以前逐字节相同)。高质量转换见 [HGN-HQ.md](docs/HGN-HQ.md),格式与旧转换器见
+[CONVERT.md](docs/CONVERT.md)。
 
 ## YaRN 与共享 KV 池配置
 
@@ -296,13 +296,13 @@ GPU 在安全调度点轮转,并发数翻倍不意味着吞吐翻倍,请求延�
   原生 1589.4 vs YaRN 1582.1 tok/s(2026-10-07 复测,约 0.5% 差异),不表示
   任意负载都无开销。
   短文本探针 factor 2 与原生 mean KLD 0.0234、same-top 93.5%,因此不承诺两者
-  输出一致。详细实现/限制见 [YARN-512K.md](YARN-512K.md),实测见
-  [YARN-512K-RESULTS.md](YARN-512K-RESULTS.md)。
+  输出一致。详细实现/限制见 [YARN-512K.md](docs/YARN-512K.md),实测见
+  [YARN-512K-RESULTS.md](docs/YARN-512K-RESULTS.md)。
 
 ## Windows
 
 Windows 版与 Linux 版功能一致(引擎 + OpenAI API + 多模态),移植记录与
-实测见 [PORTING-WINDOWS.md](PORTING-WINDOWS.md)。编译在 Git Bash 中执行
+实测见 [PORTING-WINDOWS.md](docs/PORTING-WINDOWS.md)。编译在 Git Bash 中执行
 (或双击 `build_win.bat`,仅编译期需要 Git):
 
 ```bash
@@ -331,7 +331,7 @@ Linux `start_gguf.sh` 用)、第 2 页上下文/并发/YaRN 勾选(扩展倍数�
 
 - 只支持 hgn 权重:Windows 下可用显存上限约 96 GiB,GGUF 权重体积更大
   (hgn 比 GGUF 省约 11 GiB)放不下,`start_gguf.sh` 不适用;hgn 权重由
-  转换工具生成,见 [CONVERT.md](CONVERT.md)。高质量 hgn 换文件即可用:
+  转换工具生成,见 [CONVERT.md](docs/CONVERT.md)。高质量 hgn 换文件即可用:
   weight arena +2.2 GiB,256K / chunk 8192 估算约 93.2 GiB(上限 95),
   尚未在 Windows 实测
 - 图片解码经 stb_image 支持 PNG/JPEG(WebP 未接)
@@ -347,25 +347,25 @@ Linux `start_gguf.sh` 用)、第 2 页上下文/并发/YaRN 勾选(扩展倍数�
 - 模型 decode 过程中卡死(疑为控制台输出反压:控制台被点选暂停后,子进程写日志
   阻塞。已修复:启动器改为托盘程序、日志不经过控制台,kvsnap 不再持锁打印;待验证)
 
-编译细节见 [BUILD.md](BUILD.md)。
+编译细节见 [BUILD.md](docs/BUILD.md)。
 
 ## 文档
 
-- [QUICKSTART.md](QUICKSTART.md) — 编译、启动、配置
-- [BUILD.md](BUILD.md) — 编译环境细节与排错
-- [GGUF.md](GGUF.md) — GGUF 权重加载、与 hgn 的性能对比
-- [HGN-HQ.md](HGN-HQ.md) — 高质量 hgn:一键转换(可选 imatrix)、结果与部署
-- [CONVERT.md](CONVERT.md) — 模型转换工具
-- [KLD.md](KLD.md) — 质量测试(KLD,与 unsloth / llama.cpp 同口径)
-- [MTP.md](MTP.md) — 投机解码参数与对比方法
-- [NGRAM.md](NGRAM.md) — ngram 验证的设计、收益与已知分歧
-- [CONCURRENCY.md](CONCURRENCY.md) — 并发请求(PARALLEL)的配置与语义
-- [YARN-512K.md](YARN-512K.md) — YaRN 512K 实现、共享池准入与验证范围
-- [YARN-512K-RESULTS.md](YARN-512K-RESULTS.md) — Linux/gfx1151 长上下文与并发实测
-- [HGN-FORMAT.md](HGN-FORMAT.md) — `.hgn` 权重容器格式
-- [GGUF.md](GGUF.md) — 直接用 llama.cpp GGUF 权重运行
+- [QUICKSTART.md](docs/QUICKSTART.md) — 编译、启动、配置
+- [BUILD.md](docs/BUILD.md) — 编译环境细节与排错
+- [GGUF.md](docs/GGUF.md) — GGUF 权重加载、与 hgn 的性能对比
+- [HGN-HQ.md](docs/HGN-HQ.md) — 高质量 hgn:一键转换(可选 imatrix)、结果与部署
+- [CONVERT.md](docs/CONVERT.md) — 模型转换工具
+- [KLD.md](docs/KLD.md) — 质量测试(KLD,与 unsloth / llama.cpp 同口径)
+- [MTP.md](docs/MTP.md) — 投机解码参数与对比方法
+- [NGRAM.md](docs/NGRAM.md) — ngram 验证的设计、收益与已知分歧
+- [CONCURRENCY.md](docs/CONCURRENCY.md) — 并发请求(PARALLEL)的配置与语义
+- [YARN-512K.md](docs/YARN-512K.md) — YaRN 512K 实现、共享池准入与验证范围
+- [YARN-512K-RESULTS.md](docs/YARN-512K-RESULTS.md) — Linux/gfx1151 长上下文与并发实测
+- [HGN-FORMAT.md](docs/HGN-FORMAT.md) — `.hgn` 权重容器格式
+- [GGUF.md](docs/GGUF.md) — 直接用 llama.cpp GGUF 权重运行
 - [data/README.md](data/README.md) — 数值回归基准(data/qsa-oracle)说明
-- [PORTING-WINDOWS.md](PORTING-WINDOWS.md) — Windows 移植记录与实测
+- [PORTING-WINDOWS.md](docs/PORTING-WINDOWS.md) — Windows 移植记录与实测
 
 ## 测试
 
@@ -374,15 +374,15 @@ bash build.sh test     # kernel 单测,不加载模型,预期 ALL PASS
 python3 tools/bpw.py   # 统计 models/ 下各权重的 bpw(按类别,只读文件头)
 ```
 
-质量(KLD)测试需要 BF16 基准,流程见 [KLD.md](KLD.md)。
+质量(KLD)测试需要 BF16 基准,流程见 [KLD.md](docs/KLD.md)。
 
 ## 致谢
 
-本项目的实现方式借鉴了 peonist-ai 的 [halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server);`.hgn` 权重容器格式即 halogen 的 checkpoint 容器格式(见 [HGN-FORMAT.md](HGN-FORMAT.md))。感谢 halogen 作者的工作。
+本项目的实现方式借鉴了 peonist-ai 的 [halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server);`.hgn` 权重容器格式即 halogen 的 checkpoint 容器格式(见 [HGN-FORMAT.md](docs/HGN-FORMAT.md))。感谢 halogen 作者的工作。
 
-GGUF 支持大量参考了 [gufo](https://github.com/gufo-org/gufo)(MIT 许可证):路由专家 F16 WMMA GEMM kernel 移植自其 RoutedF16GEMMKernel(`src/gpu/parts/26_kernels_moe_gguf.inc`),hgn q4cp / GGUF IQ4 的 LUT 解码版沿用同一条流水线(`27_kernels_moe_lut.inc`),GGUF 与引擎张量间的变换语义参考其 reference.cpp(`src/gguf_map.h`);prefill 的 HC 门控融合、生产者 epilogue 直写下一 GEMM 输入等优化也借鉴了 gufo 的做法(对照分析见 [GUFO-GAP.md](GUFO-GAP.md))。
+GGUF 支持大量参考了 [gufo](https://github.com/gufo-org/gufo)(MIT 许可证):路由专家 F16 WMMA GEMM kernel 移植自其 RoutedF16GEMMKernel(`src/gpu/parts/26_kernels_moe_gguf.inc`),hgn q4cp / GGUF IQ4 的 LUT 解码版沿用同一条流水线(`27_kernels_moe_lut.inc`),GGUF 与引擎张量间的变换语义参考其 reference.cpp(`src/gguf_map.h`);prefill 的 HC 门控融合、生产者 epilogue 直写下一 GEMM 输入等优化也借鉴了 gufo 的做法(对照分析见 [GUFO-GAP.md](docs/GUFO-GAP.md))。
 
-ngram 投机解码的起草思路与两级 prompt 缓存借鉴了开源项目 [llama.cpp](https://github.com/ggml-org/llama.cpp)(MIT 许可证),GGUF 权重与视觉塔(mmproj)直接复用 llama.cpp 的同一份文件;ngram 声明详见 [NGRAM.md](NGRAM.md) 的「来源与声明」一节。
+ngram 投机解码的起草思路与两级 prompt 缓存借鉴了开源项目 [llama.cpp](https://github.com/ggml-org/llama.cpp)(MIT 许可证),GGUF 权重与视觉塔(mmproj)直接复用 llama.cpp 的同一份文件;ngram 声明详见 [NGRAM.md](docs/NGRAM.md) 的「来源与声明」一节。
 
 ## 许可证
 
