@@ -1,6 +1,7 @@
 build/
 logs/
 models/
+dev-docs/
 *.tmp.*
 start_win.exe
 __pycache__/
