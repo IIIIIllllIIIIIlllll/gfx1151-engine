@@ -634,6 +634,12 @@ void check_vram_page(CheckLines& c, const PanelVals& v, bool service_running) {
     if (parallel < 1) parallel = 1;
     if (kv_pool < 0) kv_pool = 0;
     if (prefill < 0) prefill = 0;
+    // GDEC_PREFILL_CHUNK(conf 里的 GDEC_* 会导出到引擎环境)才是真正的 prefill
+    // 分段;它比 PREFILL_CHUNK 大时以它为准,工作区估算才贴合引擎实际分配。
+    if (const auto it = g_conf.find("GDEC_PREFILL_CHUNK"); it != g_conf.end()) {
+        long g = 0;
+        if (pn_int(it->second, &g) && g > prefill) prefill = g;
+    }
 
     // 权重文件总大小：按第 1 页所选版本的文件集合，去重
     unsigned long long weights = 0;
@@ -658,9 +664,14 @@ void check_vram_page(CheckLines& c, const PanelVals& v, bool service_running) {
         }
         check_line(c, "提示", "GGUF 配置在 Windows 不启动，本页估算仅供 Linux 参考");
     } else {
+        // v2 的 n-gram 表是磁盘分页的（引擎按需 gather，只有小 staging 驻留），
+        // 单列且不计入显存估算；v1 的表内嵌在主权重里本就无此项。
+        unsigned long long ngram_bytes = 0;
+        if (v.weights_ver == kVerV2 && !v.ngram.empty() && file_exists(v.ngram) &&
+            !same_file(v.ngram, v.model))
+            file_size_of(v.ngram, &ngram_bytes);
         const std::string files[] = {v.model,
-                                     v.weights_ver == kVerV2 ? v.ngram
-                                                             : (v.no_overlay ? "" : v.overlay),
+                                     v.weights_ver == kVerV2 ? "" : (v.no_overlay ? "" : v.overlay),
                                      v.no_mtp ? "" : v.mtp, v.no_vision ? "" : v.vision};
         std::vector<std::string> uniq;
         for (const std::string& f : files) {
@@ -679,6 +690,9 @@ void check_vram_page(CheckLines& c, const PanelVals& v, bool service_running) {
         }
         check_line(c, "提示", "权重文件：" + std::to_string(uniq.size()) + " 个合计 " +
                                   gib((double)weights) + " GiB");
+        if (ngram_bytes)
+            check_line(c, "提示", "n-gram 表：" + gib((double)ngram_bytes) +
+                                      " GiB，磁盘分页按需读取，不驻留显存");
     }
 
     // 显存估算（系数来自 src/gpu/parts/40_model.inc 分配代码核算，2026-10：
