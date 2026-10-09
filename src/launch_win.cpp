@@ -55,6 +55,7 @@ PanelResult panel_run(bool allow_start);
 namespace {
 
 std::string g_root;
+std::wstring g_root_w;  // 宽字符版 exe 目录：ANSI 路径在非 ASCII 目录下会乱码，图片加载等用这条
 std::string g_stamp;                        // 本次启动的时间戳，日志文件名用
 HANDLE g_children[2] = {nullptr, nullptr};  // 0 = 引擎，1 = API
 HANDLE g_job = nullptr;
@@ -887,7 +888,12 @@ int main(int argc, char** argv) {
     g_root = exe_path;
     size_t slash = g_root.find_last_of("\\/");
     g_root = slash == std::string::npos ? "." : g_root.substr(0, slash);
-    SetCurrentDirectoryA(g_root.c_str());
+    wchar_t exe_w[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe_w, MAX_PATH);
+    g_root_w = exe_w;
+    const size_t wslash = g_root_w.find_last_of(L"\\/");
+    if (wslash != std::wstring::npos) g_root_w.resize(wslash);
+    SetCurrentDirectoryW(g_root_w.empty() ? L"." : g_root_w.c_str());
 
     {
         SYSTEMTIME st;

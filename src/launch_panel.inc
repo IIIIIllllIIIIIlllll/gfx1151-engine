@@ -20,7 +20,7 @@
 // g_art_w（210px），所有控件经 add_ctrl 统一右移，WM_PAINT 里 GDI+ 绘制
 // （PNG alpha 合成，底部对齐）；图片缺失时 g_art_w=0，退回经典紧凑布局。
 //
-// 依赖 launch_win.cpp 中已定义的：g_root、g_conf、load_conf()、cfg()、
+// 依赖 launch_win.cpp 中已定义的：g_root、g_root_w、g_conf、load_conf()、cfg()、
 // cfg_optional()、to_w()、msgbox()、file_exists()、dir_exists()、same_file()、
 // port_free()、engine_net::address()（launch_win.cpp 已 include engine_net.h）。
 //
@@ -1024,6 +1024,19 @@ const int kBrX = 564, kBrW = 72;      // 浏览按钮
 const int kHintX = 328, kHintW = 308; // 第 2 页行尾提示（edit 202+120=322 右侧）
 const int kListBottom = 452;          // 各页检查区下缘（底部按钮行在其下）
 
+// 统一字体：不用 DEFAULT_GUI_FONT（MS Shell Dlg 在不同机器上替换表不同，
+// 有的落到宋体，西文更宽会溢出固定宽度布局）。YaHei UI 自 Vista 起全版本自带。
+HFONT panel_font() {
+    static HFONT f = [] {
+        HFONT h = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                              L"Microsoft YaHei UI");
+        return h ? h : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    }();
+    return f;
+}
+
 HWND add_ctrl(HWND parent, const wchar_t* cls, DWORD style, int x, int y, int w, int h,
               const wchar_t* text, int id) {
     // 深色主题下按钮全部 owner-draw（WM_DRAWITEM 里 GDI+ 深色圆角卡片）；
@@ -1045,7 +1058,7 @@ HWND add_ctrl(HWND parent, const wchar_t* cls, DWORD style, int x, int y, int w,
     // 编辑框滚动条深色化（DarkMode_Explorer 主题类，Win10 1809+；失败则保持默认）
     if (g_panel_bg && wcscmp(cls, L"Edit") == 0)
         SetWindowTheme(c, L"DarkMode_Explorer", nullptr);
-    SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+    SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(panel_font()), TRUE);
     return c;
 }
 
@@ -1285,7 +1298,7 @@ void load_panel_art() {
         if (Gdiplus::GdiplusStartup(&gdip_token, &input, nullptr) != Gdiplus::Ok) return;
     }
     delete g_art;
-    g_art = Gdiplus::Image::FromFile(to_w(g_root + "\\media\\qwen-charactor-alpha.png").c_str());
+    g_art = Gdiplus::Image::FromFile((g_root_w + L"\\media\\qwen-charactor-alpha.png").c_str());
     if (g_art && g_art->GetLastStatus() == Gdiplus::Ok) {
         g_art_w = 210;
     } else {
@@ -1294,7 +1307,7 @@ void load_panel_art() {
         g_art_w = 0;
     }
     delete g_bg_img;
-    g_bg_img = Gdiplus::Image::FromFile(to_w(g_root + "\\media\\panel-bg.png").c_str());
+    g_bg_img = Gdiplus::Image::FromFile((g_root_w + L"\\media\\panel-bg.png").c_str());
     if (g_bg_img && g_bg_img->GetLastStatus() != Gdiplus::Ok) {
         delete g_bg_img;
         g_bg_img = nullptr;
@@ -1340,6 +1353,8 @@ void draw_panel_button(const DRAWITEMSTRUCT* d) {
               hh = d->rcItem.bottom - d->rcItem.top;
     if (g_bg_dc)
         BitBlt(d->hDC, 0, 0, w, hh, g_bg_dc, d->rcItem.left, d->rcItem.top, SRCCOPY);
+    else
+        FillRect(d->hDC, &d->rcItem, g_panel_bg);  // 无背景图时先铺底色，否则半透明填充会叠在残留白色上
     const bool hot = (d->itemState & ODS_HOTLIGHT) != 0;
     const bool pressed = (d->itemState & ODS_SELECTED) != 0;
     const bool checked = (d->itemState & ODS_CHECKED) != 0;
