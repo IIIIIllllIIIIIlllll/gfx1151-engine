@@ -1007,8 +1007,11 @@ Gdiplus::Image* g_bg_img = nullptr; // 全窗背景（media/panel-bg.png，banne
 int g_art_w = 0;                    // 立绘条宽度；图片缺失时为 0，退回经典紧凑布局
 HDC g_bg_dc = nullptr;              // 烘焙好的全窗背景（背景图+立绘），erase 时 BitBlt
 HBITMAP g_bg_bmp = nullptr;
-HBRUSH g_panel_bg = nullptr;        // 面板底色刷（淡蓝紫白，替代系统 BTNFACE 灰）
-constexpr COLORREF kPanelBg = RGB(236, 239, 247);
+HBRUSH g_panel_bg = nullptr;        // 面板底色刷（夜空深蓝，背景图缺失时的兜底）
+HBRUSH g_edit_bg = nullptr;         // 输入框深色卡片刷
+constexpr COLORREF kPanelBg = RGB(16, 20, 34);
+constexpr COLORREF kPanelFg = RGB(232, 236, 246);  // 深色背景上的浅色文字
+constexpr COLORREF kEditBg = RGB(24, 30, 50);      // 输入框卡片：比压暗层略亮
 
 // 布局常量：内容区 644×504（立绘加载成功时窗口左侧再加 g_art_w 宽的立绘条，
 // 所有控件经 add_ctrl 统一右移），内容右缘 636。
@@ -1023,9 +1026,25 @@ const int kListBottom = 452;          // 各页检查区下缘（底部按钮行
 
 HWND add_ctrl(HWND parent, const wchar_t* cls, DWORD style, int x, int y, int w, int h,
               const wchar_t* text, int id) {
+    // 深色主题下按钮全部 owner-draw（WM_DRAWITEM 里 GDI+ 深色圆角卡片）；
+    // 页签的 BS_PUSHLIKE 单选改成 BS_OWNERDRAW，选中态由 show_page 手动维护
+    if (g_panel_bg && wcscmp(cls, L"Button") == 0) {
+        const DWORD ty = style & BS_TYPEMASK;
+        if (ty == BS_PUSHBUTTON || ty == BS_DEFPUSHBUTTON || (style & BS_PUSHLIKE))
+            style = (style & ~(BS_TYPEMASK | BS_PUSHLIKE)) | BS_OWNERDRAW;
+    }
     HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, x + g_art_w, y, w, h,
                              parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                              GetModuleHandleW(nullptr), nullptr);
+    // 勾选框/单选钮：去主题退回经典绘制，由 WM_CTLCOLORSTATIC 的浅色文字 +
+    // 透明底接管（主题样式的文字是深色，夜空背景上看不清）
+    if (g_panel_bg && wcscmp(cls, L"Button") == 0 &&
+        ((style & BS_TYPEMASK) == BS_AUTOCHECKBOX ||
+         (style & BS_TYPEMASK) == BS_AUTORADIOBUTTON))
+        SetWindowTheme(c, L"", L"");
+    // 编辑框滚动条深色化（DarkMode_Explorer 主题类，Win10 1809+；失败则保持默认）
+    if (g_panel_bg && wcscmp(cls, L"Edit") == 0)
+        SetWindowTheme(c, L"DarkMode_Explorer", nullptr);
     SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
     return c;
 }
@@ -1245,8 +1264,12 @@ void layout_page1(int ver) {
 }
 
 void show_page(int idx) {
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 4; ++i) {
         for (HWND c : g_page_ctls[i]) ShowWindow(c, i == idx ? SW_SHOW : SW_HIDE);
+        // owner-draw 页签没有自动互斥，选中态手动维护
+        SendMessageW(g_pc.tabs[i], BM_SETCHECK, i == idx ? BST_CHECKED : BST_UNCHECKED, 0);
+        InvalidateRect(g_pc.tabs[i], nullptr, FALSE);
+    }
     if (idx == 0) layout_page1(g_weights_ver);  // 重新隐藏非当前版本的文件行
 }
 
@@ -1287,7 +1310,15 @@ void load_panel_art() {
     HGDIOBJ old = SelectObject(g_bg_dc, g_bg_bmp);
     Gdiplus::Graphics g(g_bg_dc);
     g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-    g.DrawImage(g_bg_img, 0, 0, cw, kCliH);
+    // 按高度等比铺满，横向平移让月亮落到立绘条中央（源图月心约 x=390/1915），
+    // 控件区不被亮部压字
+    const double scale = (double)kCliH / g_bg_img->GetHeight();
+    const int bw = static_cast<int>(g_bg_img->GetWidth() * scale);
+    const int moon_x = static_cast<int>(390.0 / g_bg_img->GetWidth() * bw);
+    g.DrawImage(g_bg_img, g_art_w / 2 - moon_x, 0, bw, kCliH);
+    // 控件区压一层半透明深色，浅色文字在任何云纹上都可读
+    Gdiplus::SolidBrush dim(Gdiplus::Color(115, 8, 10, 22));
+    g.FillRectangle(&dim, g_art_w, 0, kCliW, kCliH);
     if (g_art) {  // 立绘居中烘焙进背景
         const int iw = static_cast<int>(g_art->GetWidth()),
                   ih = static_cast<int>(g_art->GetHeight());
@@ -1301,11 +1332,82 @@ void load_panel_art() {
     SelectObject(g_bg_dc, old);
 }
 
+// owner-draw 按钮：深色圆角卡片。先贴回烘焙背景（圆角外不残留旧像素），
+// 再按状态（悬停/按下/选中页签/禁用）绘制。ODS_HOTLIGHT 由主题激活的按钮
+// 热追踪提供。
+void draw_panel_button(const DRAWITEMSTRUCT* d) {
+    const int w = d->rcItem.right - d->rcItem.left,
+              hh = d->rcItem.bottom - d->rcItem.top;
+    if (g_bg_dc)
+        BitBlt(d->hDC, 0, 0, w, hh, g_bg_dc, d->rcItem.left, d->rcItem.top, SRCCOPY);
+    const bool hot = (d->itemState & ODS_HOTLIGHT) != 0;
+    const bool pressed = (d->itemState & ODS_SELECTED) != 0;
+    const bool checked = (d->itemState & ODS_CHECKED) != 0;
+    const bool disabled = (d->itemState & ODS_DISABLED) != 0;
+    Gdiplus::Graphics g(d->hDC);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    Gdiplus::Color fill =
+        disabled   ? Gdiplus::Color(140, 20, 24, 40)
+        : pressed  ? Gdiplus::Color(230, 14, 17, 32)
+        : checked  ? Gdiplus::Color(225, 56, 74, 116)   // 当前页签：蓝调强调
+        : hot      ? Gdiplus::Color(215, 42, 52, 82)
+                   : Gdiplus::Color(205, 26, 32, 54);
+    Gdiplus::Color edge = checked ? Gdiplus::Color(255, 130, 160, 220)
+                                  : Gdiplus::Color(255, 96, 110, 150);
+    Gdiplus::GraphicsPath path;
+    const int r = 5, x0 = 1, y0 = 1, x1 = w - 2, y1 = hh - 2;
+    path.AddArc(x0, y0, r * 2, r * 2, 180, 90);
+    path.AddArc(x1 - r * 2, y0, r * 2, r * 2, 270, 90);
+    path.AddArc(x1 - r * 2, y1 - r * 2, r * 2, r * 2, 0, 90);
+    path.AddArc(x0, y1 - r * 2, r * 2, r * 2, 90, 90);
+    path.CloseFigure();
+    Gdiplus::SolidBrush fb(fill);
+    g.FillPath(&fb, &path);
+    Gdiplus::Pen pen(edge, 1.0f);
+    g.DrawPath(&pen, &path);
+    wchar_t txt[128];
+    GetWindowTextW(d->hwndItem, txt, 128);
+    HFONT hf = reinterpret_cast<HFONT>(SendMessageW(d->hwndItem, WM_GETFONT, 0, 0));
+    Gdiplus::Font font(d->hDC, hf);
+    Gdiplus::StringFormat sf;
+    sf.SetAlignment(Gdiplus::StringAlignmentCenter);
+    sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    Gdiplus::RectF rc(0, 0, (Gdiplus::REAL)w, (Gdiplus::REAL)hh);
+    Gdiplus::SolidBrush tb(disabled ? Gdiplus::Color(255, 112, 120, 142)
+                                    : Gdiplus::Color(255, GetRValue(kPanelFg),
+                                                     GetGValue(kPanelFg), GetBValue(kPanelFg)));
+    g.DrawString(txt, -1, &font, rc, &sf, &tb);
+}
+
 LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_DRAWITEM) {
+        const DRAWITEMSTRUCT* d = reinterpret_cast<const DRAWITEMSTRUCT*>(lp);
+        if (d->CtlType == ODT_BUTTON && g_panel_bg) {
+            draw_panel_button(d);
+            return TRUE;
+        }
+    }
     if (msg == WM_CTLCOLORSTATIC && g_panel_bg) {
-        // 标签/勾选框/单选钮：文字透明底 + 面板底色刷，否则会露出系统灰补丁
+        // 标签/勾选框/单选钮：浅色文字 + HOLLOW_BRUSH 不填底（实心画刷会填满
+        // 整个控件矩形，SetBkMode 只管字符格），夜空背景完整透出
+        SetTextColor(reinterpret_cast<HDC>(wp), kPanelFg);
         SetBkMode(reinterpret_cast<HDC>(wp), TRANSPARENT);
-        return reinterpret_cast<LRESULT>(g_panel_bg);
+        return reinterpret_cast<LRESULT>(GetStockObject(HOLLOW_BRUSH));
+    }
+    if (msg == WM_CTLCOLOREDIT && g_edit_bg) {
+        // 可编辑输入框：深色卡片 + 浅色文字（只读编辑框走 WM_CTLCOLORSTATIC，
+        // 保持透明不受影响）
+        HDC dc = reinterpret_cast<HDC>(wp);
+        SetTextColor(dc, kPanelFg);
+        SetBkColor(dc, kEditBg);
+        return reinterpret_cast<LRESULT>(g_edit_bg);
+    }
+    if (msg == WM_CTLCOLORLISTBOX && g_edit_bg) {
+        // 下拉列表（并发路数 ComboBox 展开的列表部分）
+        HDC dc = reinterpret_cast<HDC>(wp);
+        SetTextColor(dc, kPanelFg);
+        SetBkColor(dc, kEditBg);
+        return reinterpret_cast<LRESULT>(g_edit_bg);
     }
     if (msg == WM_ERASEBKGND) {
         if (g_bg_dc) {  // 擦除 = 贴回烘焙背景（透明标签下方永远是真实背景像素）
@@ -1523,13 +1625,20 @@ PanelResult panel_run(bool allow_start) {
     static bool registered = false;
     if (!registered) {
         if (!g_panel_bg) g_panel_bg = CreateSolidBrush(kPanelBg);
-        WNDCLASSW wc{};
+        if (!g_edit_bg) g_edit_bg = CreateSolidBrush(kEditBg);
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof wc;
         wc.lpfnWndProc = panel_proc;
         wc.hInstance = hi;
         wc.lpszClassName = L"gfx1151_setup_panel";
         wc.hbrBackground = g_panel_bg;
         wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));  // IDC_ARROW
-        RegisterClassW(&wc);
+        // 窗口图标（任务栏按钮用）：内嵌 ICO，否则任务栏是空白默认图标
+        static HICON cls_big = app_icon(GetSystemMetrics(SM_CXICON));
+        static HICON cls_small = app_icon(GetSystemMetrics(SM_CXSMICON));
+        wc.hIcon = cls_big;
+        wc.hIconSm = cls_small;
+        RegisterClassExW(&wc);
         registered = true;
     }
     load_panel_art();  // 决定 g_art_w，窗口宽度随之确定
@@ -1551,6 +1660,11 @@ PanelResult panel_run(bool allow_start) {
         return kPanelCancel;
     }
     g_panel = h;
+    // 深色标题栏（Win10 1809+/Win11；不支持的平台静默失败保持默认）
+    if (g_panel_bg) {
+        const BOOL dark = TRUE;
+        DwmSetWindowAttribute(h, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof dark);
+    }
 
     const PanelVals init = panel_vals_from_conf();
     g_weights_ver = init.weights_ver;

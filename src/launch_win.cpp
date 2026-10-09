@@ -28,6 +28,8 @@
 #include "engine_net.h"
 #include <windows.h>
 #include <shellapi.h>
+#include <uxtheme.h>
+#include <dwmapi.h>
 #include <gdiplus.h>  // 面板左侧立绘（PNG alpha 合成），系统自带组件
 #include <cctype>
 #include <cerrno>
