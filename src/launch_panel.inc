@@ -269,6 +269,47 @@ bool file_size_of(const std::string& path, unsigned long long* size) {
     return true;
 }
 
+// HGN1 头（104B）+ 记录表（160B/条，布局见 src/hgn.h）：只读文件头，
+// 返回指定 tensor 的 data_size。用于把磁盘分页的 PLE n-gram 表从权重
+// 文件大小里剔除 —— 它按需 gather，不驻留显存（v1 内嵌、v2 独立文件）。
+#pragma pack(push, 1)
+struct HgnHeader {
+    char magic[4];
+    uint32_t version, tensor_count, reserved;
+    uint64_t records_offset, data_offset, file_size;
+    char model_name[64];
+};
+struct HgnRecord {
+    char name[96];
+    uint32_t dtype, ndims;
+    uint64_t dims[4];
+    uint64_t data_offset, data_size, extra;
+};
+#pragma pack(pop)
+static_assert(sizeof(HgnHeader) == 104 && sizeof(HgnRecord) == 160,
+              "HGN1 layout must match src/hgn.h");
+
+unsigned long long hgn_tensor_bytes(const std::string& path, const char* name) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return 0;
+    HgnHeader h{};
+    unsigned long long bytes = 0;
+    if (fread(&h, sizeof h, 1, f) == 1 && memcmp(h.magic, "HGN1", 4) == 0 &&
+        h.tensor_count <= 4096 &&
+        _fseeki64(f, (long long)h.records_offset, SEEK_SET) == 0) {
+        for (uint32_t i = 0; i < h.tensor_count; i++) {
+            HgnRecord r{};
+            if (fread(&r, sizeof r, 1, f) != 1) break;
+            if (strncmp(r.name, name, sizeof r.name) == 0) {  // name[96] 定长，可能无 NUL
+                bytes = r.data_size;
+                break;
+            }
+        }
+    }
+    fclose(f);
+    return bytes;
+}
+
 std::string sniff_magic(const std::string& path) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return "";
@@ -790,12 +831,17 @@ void check_vram_page(CheckLines& c, const PanelVals& v, bool service_running) {
                    TR("GGUF 配置在 Windows 不启动，本页估算仅供 Linux 参考",
                       "GGUF configs do not start on Windows; estimates here are for Linux reference"));
     } else {
-        // v2 的 n-gram 表是磁盘分页的（引擎按需 gather，只有小 staging 驻留），
-        // 单列且不计入显存估算；v1 的表内嵌在主权重里本就无此项。
+        // n-gram 表是磁盘分页的（引擎按需 gather，只有小 staging 驻留），
+        // 单列且不计入显存估算：v2 是独立文件（直接不算进 weights）；
+        // v1 内嵌在主权重文件里，从 HGN 头读出表大小后从驻留口径里减掉。
         unsigned long long ngram_bytes = 0;
         if (v.weights_ver == kVerV2 && !v.ngram.empty() && file_exists(v.ngram) &&
             !same_file(v.ngram, v.model))
             file_size_of(v.ngram, &ngram_bytes);
+        const unsigned long long ngram_embedded =
+            (v.weights_ver == kVerV1 && file_exists(v.model))
+                ? hgn_tensor_bytes(v.model, "layers.1.ple.ngram_embedding.weight")
+                : 0;
         const std::string files[] = {v.model,
                                      v.weights_ver == kVerV2 ? "" : (v.no_overlay ? "" : v.overlay),
                                      v.no_mtp ? "" : v.mtp, v.no_vision ? "" : v.vision};
@@ -821,6 +867,14 @@ void check_vram_page(CheckLines& c, const PanelVals& v, bool service_running) {
                        TR("n-gram 表：", "n-gram table: ") + gib((double)ngram_bytes) +
                            TR(" GiB，磁盘分页按需读取，不驻留显存",
                               " GiB, disk-paged on demand, not VRAM-resident"));
+        if (ngram_embedded)
+            check_line(c, kLvHint,
+                       TR("n-gram 表（内嵌）：", "n-gram table (embedded): ") +
+                           gib((double)ngram_embedded) +
+                           TR(" GiB，磁盘分页按需读取，不驻留显存",
+                              " GiB, disk-paged on demand, not VRAM-resident"));
+        // 显存估算按驻留口径：减掉内嵌表（v2 的独立表本就未计入）
+        if (ngram_embedded < weights) weights -= ngram_embedded;
     }
 
     // 显存估算（系数来自 src/gpu/parts/40_model.inc 分配代码核算，2026-10：
@@ -842,7 +896,12 @@ void check_vram_page(CheckLines& c, const PanelVals& v, bool service_running) {
     check_line(c, kLvHint, TR("并发 GDN 状态：", "Parallel GDN state: ") +
                                std::to_string(parallel) + TR(" 路 ≈ ", " streams ≈ ") +
                                gib(gdn_bytes) + " GiB");
-    if (hip_ok && !service_running) {
+    if (!hip_ok) {
+        // 查不到显存也要给出估算总量 —— 它不依赖 HIP 查询，只有对比结论需要
+        check_line(c, kLvHint, TR("显存估算 ≈ ", "VRAM estimate ≈ ") + gib(total) +
+                                   TR(" GiB（显存查询失败，请自行对照）",
+                                      " GiB (VRAM query failed; compare manually)"));
+    } else if (!service_running) {
         if (total > (double)hip_free)
             check_line(c, kLvFail, TR("预计占用 ", "Estimated use ") + gib(total) +
                                        TR(" GiB 超过当前可用 ", " GiB exceeds the free ") +
