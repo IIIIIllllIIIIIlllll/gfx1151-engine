@@ -659,7 +659,10 @@ std::wstring status_text() {
 }
 
 void tray_update_tip() {
-    const std::wstring tip = L"gfx1151-engine · " + status_text();
+    // 就绪时 tooltip 只留状态本身（地址在右键菜单首项和气球里都有）
+    const std::wstring tip = g_state == kReady
+        ? TR(L"引擎就绪", L"Engine ready")
+        : L"gfx1151-engine · " + status_text();
     g_nid.uFlags = NIF_TIP;
     lstrcpynW(g_nid.szTip, tip.c_str(), ARRAYSIZE(g_nid.szTip));
     if (g_tray_added) Shell_NotifyIconW(NIM_MODIFY, &g_nid);
