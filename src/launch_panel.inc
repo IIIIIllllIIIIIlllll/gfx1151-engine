@@ -1497,11 +1497,12 @@ PanelResult panel_run(bool allow_start) {
         SendMessageW(g_pc.yarn, BM_SETCHECK, rope_init > 1 ? BST_CHECKED : BST_UNCHECKED, 0);
     }
     y2 += 26;
-    plabel(1, h, kLblX, y2, L"KV 快照上限 (GiB)");
+    plabel(1, h, kLblX, y2, TR(L"KV 快照上限 (GiB)", L"KV snapshot cap (GiB)"));
     g_pc.kvsnap = pctl(1, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y2, 120,
                        22, L"", kEdKvsnap);
     set_edit(g_pc.kvsnap, init.kvsnap_max_gb);
-    plabel(1, h, kHintX, y2, L"RAM 检查点容量，0 = 关闭", kHintW);
+    plabel(1, h, kHintX, y2, TR(L"RAM 检查点容量，0 = 关闭", L"RAM checkpoint capacity, 0 = off"),
+           kHintW);
     y2 += 26;
     g_pc.out2 = pctl(1, h, L"Edit",
                      WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
