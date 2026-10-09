@@ -414,10 +414,68 @@ static double seconds_since(Clock::time_point start) {
   return std::chrono::duration<double>(Clock::now() - start).count();
 }
 
-static void run_prefill(GpuModel& model, const BenchConfig& config, int maxctx) {
+struct PrefillRow {
+  std::string name;
+  size_t tokens = 0;
+  double rate = 0;
+};
+
+struct DecodeRow {
+  std::string name;
+  size_t prompt_tokens = 0;
+  double rate = 0;
+  double acceptance = 0;
+};
+
+struct BenchSummary {
+  std::string format;
+  std::string model_path;
+  int maxctx = 0;
+  int prefill_repeats = 0;
+  std::vector<PrefillRow> prefill_rows;
+  double prefill_avg = 0;
+  bool decode_ran = false;
+  int decode_gamma = 0;
+  int decode_generated = 0;
+  int decode_repeats = 0;
+  std::vector<DecodeRow> decode_rows;
+  double decode_avg = 0;
+  double decode_accept_avg = 0;
+};
+
+static void print_summary(const BenchSummary& summary) {
+  printf("\n================ Benchmark Summary ================\n");
+  printf("Model       : %s (%s)\n", summary.model_path.c_str(), summary.format.c_str());
+  printf("Max context : %d tokens\n", summary.maxctx);
+  printf("\nPrefill (%d sample%s per file)\n", summary.prefill_repeats,
+         summary.prefill_repeats == 1 ? "" : "s");
+  printf("  %-18s %10s %12s\n", "token file", "tokens", "tok/s");
+  for (const auto& row : summary.prefill_rows)
+    printf("  %-18s %10zu %12.1f\n", row.name.c_str(), row.tokens, row.rate);
+  printf("  %-18s %10s %12.1f  (weighted average over %zu files)\n", "TOTAL", "-",
+         summary.prefill_avg, summary.prefill_rows.size());
+  if (summary.decode_ran) {
+    printf("\nDecode / TG (greedy, gamma=%d, %d generated tokens, %d sample%s per scenario)\n",
+           summary.decode_gamma, summary.decode_generated, summary.decode_repeats,
+           summary.decode_repeats == 1 ? "" : "s");
+    printf("  %-18s %10s %12s %12s\n", "scenario", "prompt", "tok/s", "MTP accept");
+    for (const auto& row : summary.decode_rows)
+      printf("  %-18s %10zu %12.1f %11.1f%%\n", row.name.c_str(), row.prompt_tokens,
+             row.rate, row.acceptance * 100.0);
+    printf("  %-18s %10s %12.1f %11.1f%%  (weighted average)\n", "TOTAL", "-",
+           summary.decode_avg, summary.decode_accept_avg * 100.0);
+  } else {
+    printf("\nDecode / TG : skipped (no usable MTP weights or tokenizer)\n");
+  }
+  printf("===================================================\n");
+}
+
+static void run_prefill(GpuModel& model, const BenchConfig& config, int maxctx,
+                        BenchSummary& summary) {
   const int repeats = config_int(config, "BENCH_PREFILL_REPEATS", 2);
   if (repeats < 1) throw std::runtime_error("BENCH_PREFILL_REPEATS must be positive");
   const auto files = token_files(config);
+  summary.prefill_repeats = repeats;
   double total_tokens = 0, total_seconds = 0;
   for (const auto& path : files) {
     const std::vector<int> tokens = read_token_file(path);
@@ -439,12 +497,15 @@ static void run_prefill(GpuModel& model, const BenchConfig& config, int maxctx) 
       elapsed += seconds_since(start);
     }
     const double rate = tokens.size() * repeats / elapsed;
-    printf("  %-10s %7zu tokens  %8.1f tok/s\n", path.stem().string().c_str(), tokens.size(), rate);
+    printf("  %-18s %7zu tokens  %8.1f tok/s\n", path.stem().string().c_str(),
+           tokens.size(), rate);
+    summary.prefill_rows.push_back({path.stem().string(), tokens.size(), rate});
     total_tokens += (double)tokens.size() * repeats;
     total_seconds += elapsed;
   }
+  summary.prefill_avg = total_tokens / total_seconds;
   printf("Prefill average: %.1f tok/s (weighted over %zu files, %d samples each)\n",
-         total_tokens / total_seconds, files.size(), repeats);
+         summary.prefill_avg, files.size(), repeats);
 }
 
 struct DecodeCase {
@@ -458,7 +519,8 @@ static std::vector<int> encode_case(const gdec::Tokenizer& tokenizer, const char
   return tokenizer.encode(formatted);
 }
 
-static int run_decode(GpuModel& model, const BenchConfig& config, int maxctx) {
+static int run_decode(GpuModel& model, const BenchConfig& config, int maxctx,
+                      BenchSummary& summary) {
   if (!model.mtp_avail) {
     fprintf(stderr, "MTP decode benchmark skipped: no usable MTP weights are loaded.\n");
     return 1;
@@ -489,6 +551,10 @@ static int run_decode(GpuModel& model, const BenchConfig& config, int maxctx) {
   int gamma = config_int(config, "MTP_GAMMA", 4);
   if (gamma == 0) gamma = 4;
   gamma = std::max(1, std::min(8, gamma));
+  summary.decode_ran = true;
+  summary.decode_gamma = gamma;
+  summary.decode_generated = generated;
+  summary.decode_repeats = repeats;
   printf("\nTG / MTP decode benchmark (greedy, gamma=%d, %d generated tokens)\n", gamma,
          generated);
   printf("  %-18s %7s %10s %12s %14s\n", "scenario", "prompt", "decode", "MTP accept", "samples");
@@ -515,14 +581,16 @@ static int run_decode(GpuModel& model, const BenchConfig& config, int maxctx) {
     const double acceptance = proposed > 0 ? accepted / proposed : 0;
     printf("  %-18s %7zu %10.1f %11.1f%% %14d\n", test.name, prompt.size(), rate,
            acceptance * 100.0, repeats);
+    summary.decode_rows.push_back({test.name, prompt.size(), rate, acceptance});
     total_tokens += decoded;
     total_seconds += elapsed;
     total_proposed += proposed;
     total_accepted += accepted;
   }
+  summary.decode_avg = total_tokens / total_seconds;
+  summary.decode_accept_avg = total_proposed > 0 ? total_accepted / total_proposed : 0;
   printf("TG average: %.1f tok/s; MTP acceptance average: %.1f%% (weighted)\n",
-         total_tokens / total_seconds,
-         total_proposed > 0 ? 100.0 * total_accepted / total_proposed : 0.0);
+         summary.decode_avg, summary.decode_accept_avg * 100.0);
   return 0;
 }
 
@@ -555,9 +623,14 @@ int main(int argc, char** argv) {
     CK(hipDeviceSynchronize());
     model.reset_state();
     printf("Model load: PASS (%s)\n", paths.base.string().c_str());
+    BenchSummary summary;
+    summary.format = paths.format;
+    summary.model_path = paths.base.string();
+    summary.maxctx = maxctx;
     printf("\nPrefill benchmark\n");
-    run_prefill(model, config, maxctx);
-    const int decode_result = run_decode(model, config, maxctx);
+    run_prefill(model, config, maxctx, summary);
+    const int decode_result = run_decode(model, config, maxctx, summary);
+    print_summary(summary);
     if (decode_result != 0) return decode_result;
     printf("\nBenchmark complete: PASS\n");
     return 0;
