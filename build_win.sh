@@ -126,9 +126,15 @@ build_launcher() {
     RES=()
     if "$CXX" -dumpmachine | grep -q msvc; then
       GUI_LDFLAGS=(-Xlinker -subsystem:windows -Xlinker -entry:mainCRTStartup)
-      # exe 文件图标（可选）：TheRock 带 llvm-rc 就编进去；没有也不影响托盘图标。
+      # exe 文件图标（可选）：优先 TheRock 的 llvm-rc，没有则退回 Windows SDK
+      # 的 rc.exe（取最新版本目录）；都没有也不影响托盘图标。
       RC="$TR/lib/llvm/bin/llvm-rc.exe"
-      if [[ -x "$RC" ]] && "$RC" -no-preprocess -fo build/launch_win.res src/launch_win.rc; then
+      RCFLAGS=(-no-preprocess)
+      if [[ ! -x "$RC" ]]; then
+        RC="$(ls "/c/Program Files (x86)/Windows Kits/10/bin"/*/x64/rc.exe 2>/dev/null | sort -V | tail -1)"
+        RCFLAGS=()
+      fi
+      if [[ -n "$RC" && -x "$RC" ]] && "$RC" "${RCFLAGS[@]}" -fo build/launch_win.res src/launch_win.rc; then
         RES=(build/launch_win.res)
       else
         echo "提示：llvm-rc 不可用，start_win.exe 文件不带图标（托盘图标不受影响）" >&2
