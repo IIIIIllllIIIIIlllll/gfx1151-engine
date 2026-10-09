@@ -1004,6 +1004,8 @@ AllChecks g_last_checks;
 std::vector<HWND> g_page_ctls[4];   // 每页的控件句柄（切页时整体 ShowWindow）
 Gdiplus::Image* g_art = nullptr;    // 左侧立绘（media/qwen-charactor-alpha.png）
 int g_art_w = 0;                    // 立绘条宽度；图片缺失时为 0，退回经典紧凑布局
+HBRUSH g_panel_bg = nullptr;        // 面板底色刷（淡蓝紫白，替代系统 BTNFACE 灰）
+constexpr COLORREF kPanelBg = RGB(236, 239, 247);
 
 // 布局常量：内容区 644×504（立绘加载成功时窗口左侧再加 g_art_w 宽的立绘条，
 // 所有控件经 add_ctrl 统一右移），内容右缘 636。
@@ -1265,13 +1267,18 @@ void load_panel_art() {
 }
 
 LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_CTLCOLORSTATIC && g_panel_bg) {
+        // 标签/勾选框/单选钮：文字透明底 + 面板底色刷，否则会露出系统灰补丁
+        SetBkMode(reinterpret_cast<HDC>(wp), TRANSPARENT);
+        return reinterpret_cast<LRESULT>(g_panel_bg);
+    }
     if (msg == WM_ERASEBKGND && g_art_w > 0) {
         // 只擦控件区；立绘条由 WM_PAINT 完整重绘，避免切版本/翻页时闪烁
         HDC dc = reinterpret_cast<HDC>(wp);
         RECT rc;
         GetClientRect(h, &rc);
         RECT r{g_art_w, 0, rc.right, rc.bottom};
-        FillRect(dc, &r, GetSysColorBrush(COLOR_BTNFACE));
+        FillRect(dc, &r, g_panel_bg);
         return 1;
     }
     if (msg == WM_PAINT) {
@@ -1280,7 +1287,8 @@ LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_art && g_art_w > 0) {
             Gdiplus::Graphics g(dc);
             g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-            Gdiplus::SolidBrush bg(Gdiplus::Color(255, 255, 255, 255));
+            Gdiplus::SolidBrush bg(Gdiplus::Color(255, GetRValue(kPanelBg), GetGValue(kPanelBg),
+                                                  GetBValue(kPanelBg)));
             g.FillRectangle(&bg, 0, 0, g_art_w, kCliH);
             const int iw = static_cast<int>(g_art->GetWidth()),
                       ih = static_cast<int>(g_art->GetHeight());
@@ -1289,7 +1297,7 @@ LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 dh = kCliH;
                 dw = static_cast<int>((double)dh * iw / ih);
             }
-            g.DrawImage(g_art, (g_art_w - dw) / 2, kCliH - dh, dw, dh);  // 底部对齐
+            g.DrawImage(g_art, (g_art_w - dw) / 2, (kCliH - dh) / 2, dw, dh);  // 居中
         }
         EndPaint(h, &ps);
         return 0;
@@ -1471,11 +1479,12 @@ PanelResult panel_run(bool allow_start) {
     HINSTANCE hi = GetModuleHandleW(nullptr);
     static bool registered = false;
     if (!registered) {
+        if (!g_panel_bg) g_panel_bg = CreateSolidBrush(kPanelBg);
         WNDCLASSW wc{};
         wc.lpfnWndProc = panel_proc;
         wc.hInstance = hi;
         wc.lpszClassName = L"gfx1151_setup_panel";
-        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.hbrBackground = g_panel_bg;
         wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));  // IDC_ARROW
         RegisterClassW(&wc);
         registered = true;
