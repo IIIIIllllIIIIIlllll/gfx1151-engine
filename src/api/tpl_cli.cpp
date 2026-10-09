@@ -37,7 +37,9 @@ int main() {
 
             auto result = chat_template::render_chat_template(pick("messages"), opts);
             if (result.ok) {
-                resp = {{"ok", true}, {"text", result.text}};
+                resp = {{"ok", true},
+                        {"text", result.text},
+                        {"thinking_enabled", result.thinking_enabled}};
             } else {
                 resp = {{"ok", false}, {"error", result.error}};
             }

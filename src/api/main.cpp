@@ -2288,13 +2288,6 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
     require_optional_boolean(body, "preserve_reasoning");
     require_optional_boolean(body, "auto_disable_thinking_with_tools");
     require_optional_boolean(body, "add_vision_id");
-    bool thinking_enabled = !body.contains("enable_thinking") ||
-                             body["enable_thinking"].is_null() ||
-                             body["enable_thinking"].get<bool>();
-    if (opts.reasoning_effort != nullptr && opts.reasoning_effort->is_string() &&
-        (opts.reasoning_effort->get<std::string>() == "none" ||
-         opts.reasoning_effort->get<std::string>() == "off"))
-        thinking_enabled = false;
     if (body.contains("enable_thinking") && !body["enable_thinking"].is_null())
         opts.enable_thinking = &body["enable_thinking"];
     if (body.contains("preserve_thinking") && !body["preserve_thinking"].is_null())
@@ -2327,7 +2320,7 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
 
     chat_template::RenderResult rr = chat_template::render_chat_template(&messages, opts);
     if (!rr.ok) http::fail(400, rr.error);
-    rr.text += tool_setup.choice.prompt_suffix(thinking_enabled, tool_format);
+    rr.text += tool_setup.choice.prompt_suffix(rr.thinking_enabled, tool_format);
 
     GenSpec spec;
     std::vector<size_t> starts;
@@ -2373,7 +2366,7 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
         if (tool_setup.choice.forced())
             answer = o.text;
         else
-            split_reasoning(o.text, thinking_enabled, &reasoning, &answer);
+            split_reasoning(o.text, rr.thinking_enabled, &reasoning, &answer);
         toolparse::StreamParser parser(
             tool_setup.tools, []() { return make_id("call_"); }, tool_setup.enabled(), tool_format,
         tool_setup.choice.name);
@@ -2410,7 +2403,7 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
     }
 
     r->sse = true;
-    ThinkSplitter splitter(thinking_enabled);
+    ThinkSplitter splitter(rr.thinking_enabled);
     toolparse::StreamParser parser(
         tool_setup.tools, []() { return make_id("call_"); }, tool_setup.enabled(), tool_format,
         tool_setup.choice.name);
@@ -2497,9 +2490,6 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
     const bool parallel_tool_calls = bool_field(body, "parallel_tool_calls", true);
     require_optional_boolean(body, "enable_thinking");
     require_optional_boolean(body, "preserve_thinking");
-    bool thinking_enabled = !body.contains("enable_thinking") ||
-                             body["enable_thinking"].is_null() ||
-                             body["enable_thinking"].get<bool>();
 
     ToolSetup tool_setup = parse_tool_setup(body);
     chat_template::Options opts;
@@ -2544,10 +2534,6 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
         if (reasoning.contains("effort"))
             opts.reasoning_effort =
                 normalize_reasoning_effort(&reasoning["effort"], &normalized_effort);
-        if (opts.reasoning_effort != nullptr && opts.reasoning_effort->is_string() &&
-            (opts.reasoning_effort->get<std::string>() == "none" ||
-             opts.reasoning_effort->get<std::string>() == "off"))
-            thinking_enabled = false;
         for (const char* key : {"summary", "generate_summary"}) {
             if (reasoning.contains(key) && !reasoning[key].is_null() &&
                 !reasoning[key].is_string())
@@ -2557,7 +2543,7 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
 
     chat_template::RenderResult rr = chat_template::render_chat_template(&messages, opts);
     if (!rr.ok) http::fail(400, rr.error);
-    rr.text += tool_setup.choice.prompt_suffix(thinking_enabled, tool_format);
+    rr.text += tool_setup.choice.prompt_suffix(rr.thinking_enabled, tool_format);
 
     GenSpec spec;
     std::vector<size_t> starts;
@@ -2634,7 +2620,7 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
         if (tool_setup.choice.forced())
             answer = o.text;
         else
-            split_reasoning(o.text, thinking_enabled, &reasoning, &answer);
+            split_reasoning(o.text, rr.thinking_enabled, &reasoning, &answer);
         toolparse::StreamParser parser(
             tool_setup.tools, []() { return make_id("call_"); }, tool_setup.enabled(), tool_format,
         tool_setup.choice.name);
@@ -2796,7 +2782,7 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
         return true;
     };
 
-    ThinkSplitter splitter(thinking_enabled);
+    ThinkSplitter splitter(rr.thinking_enabled);
     toolparse::StreamParser parser(
         tool_setup.tools, []() { return make_id("call_"); }, tool_setup.enabled(), tool_format,
         tool_setup.choice.name);

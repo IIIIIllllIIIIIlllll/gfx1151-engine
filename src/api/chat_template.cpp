@@ -341,6 +341,9 @@ class Renderer {
         add_vision_id_ = truthy(opts.add_vision_id);
     }
 
+    // Valid after run(): the thinking state the render settled on.
+    bool thinking() const { return thinking_; }
+
     std::string run(const json* messages) {
         std::string out;
 
@@ -764,8 +767,10 @@ class Renderer {
 RenderResult render_chat_template(const json* messages, const Options& opts) {
     RenderResult result;
     try {
-        result.text = Renderer(opts).run(messages);
+        Renderer renderer(opts);
+        result.text = renderer.run(messages);
         result.ok = true;
+        result.thinking_enabled = renderer.thinking();
     } catch (const TemplateError& e) {
         result.error = e.message;
     } catch (const std::exception& e) {

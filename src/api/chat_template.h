@@ -78,6 +78,11 @@ struct Options {
 
 struct RenderResult {
     bool ok = false;
+    // The thinking state the render actually used, after every input that can
+    // flip it (enable_thinking, reasoning_effort none/off,
+    // auto_disable_thinking_with_tools, <|think_*|> control tags). Callers
+    // splitting the model's reply must use this, not their own reconstruction.
+    bool thinking_enabled = true;
     std::string text;   // when ok
     std::string error;  // when !ok: the exact raise_exception / jinja2
                         // runtime error message the template would produce
