@@ -151,7 +151,8 @@ __global__ void k_f32_to_bf16(const float* __restrict__ x, uint16_t* __restrict_
 // base pointers (host-checked, scalar kernel is the fallback)
 __global__ void k_f32_to_bf16_v4(const float* __restrict__ x,
                                  uint16_t* __restrict__ out, uint64_t xs, int P,
-                                 int n) {
+                                 int n, const int* __restrict__ dvb = nullptr) {
+  if (dvb) out += (size_t)(*dvb) * n;  // P3-B: device-mirrored base offset
   uint64_t n4 = (uint64_t)n / 4;
   uint64_t i4 = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
   if (i4 >= (uint64_t)P * n4) return;
@@ -197,7 +198,9 @@ __global__ void k_sigmoid_gate_bf16_v4(const float* __restrict__ a,
 // output a function of valid rows only, identical for paged / unpaged.
 __global__ void k_f32_to_bf16_v4_bt(const float* __restrict__ x,
                                     uint16_t* __restrict__ out, uint64_t xs,
-                                    int P, int n, int base) {
+                                    int P, int n, int base,
+                                    const int* __restrict__ dvb = nullptr) {
+  if (dvb) base = *dvb;  // P3-B: device-mirrored base
   const int dims = n / 2;
   const int b0 = base / 4;
   const int b1 = (base + P + 3) / 4;
@@ -229,6 +232,85 @@ __global__ void k_f32_to_bf16_v4_bt(const float* __restrict__ x,
     for (int slot = 0; slot < 4; ++slot)
       if (valid & (1 << slot)) dst[slot] = v[slot];
   }
+}
+
+// P3-B: device-base + page-table variants for graph capture. Logical rows
+// [*dvb, *dvb+P) are mapped through kv_row (identity when ptab == null), so a
+// single launch replaces the host kv_runs loop; element math is the same
+// f2bf / raw-copy as the kernels above -> bit-identical outputs.
+__global__ void k_f32_to_bf16_v4_pd(const float* __restrict__ x,
+                                    uint16_t* __restrict__ out,
+                                    const int* __restrict__ ptab, int P, int n,
+                                    const int* __restrict__ dvb) {
+  const int base = *dvb;
+  uint64_t n4 = (uint64_t)n / 4;
+  uint64_t i4 = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+  if (i4 >= (uint64_t)P * n4) return;
+  uint64_t t = i4 / n4;
+  uint64_t c = (i4 - t * n4) * 4;
+  float4 v = *(const float4*)(x + t * n + c);
+  uint16_t o[4] = {f2bf(v.x), f2bf(v.y), f2bf(v.z), f2bf(v.w)};
+  uint2 pk;
+  pk.x = (uint32_t)o[0] | ((uint32_t)o[1] << 16);
+  pk.y = (uint32_t)o[2] | ((uint32_t)o[3] << 16);
+  *(uint2*)(out + (size_t)kv_row(ptab, base + (int)t) * n + c) = pk;
+}
+
+// Block-transposed V store for logical rows [*dvb, *dvb+P), paged. A page
+// holds whole 4-token blocks, so all four slots of a logical block land in
+// one physical block; the partial-edge keep/zero rules match
+// k_f32_to_bf16_v4_bt exactly (slots < base keep, slots >= base+P zero).
+__global__ void k_f32_to_bf16_v4_bt_pd(const float* __restrict__ x,
+                                       uint16_t* __restrict__ out,
+                                       const int* __restrict__ ptab, int P,
+                                       int n, const int* __restrict__ dvb) {
+  const int base = *dvb;
+  const int dims = n / 2;
+  const int b0 = base / 4;
+  const int b1 = (base + P + 3) / 4;
+  uint64_t gid = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+  uint64_t work = (uint64_t)(b1 - b0) * n;
+  if (gid >= work) return;
+  int b = b0 + (int)(gid / n);
+  int hd = (int)(gid % n);
+  int kvh = hd / dims;
+  int dim = hd - kvh * dims;
+  uint16_t v[4] = {};
+  int valid = 0;
+#pragma unroll
+  for (int slot = 0; slot < 4; ++slot) {
+    int abs = b * 4 + slot;
+    if (abs >= base) {
+      if (abs < base + P) v[slot] = f2bf(x[(size_t)(abs - base) * n + kvh * dims + dim]);
+      valid |= 1 << slot;
+    }
+  }
+  const int pb = kv_row(ptab, max(base, b * 4)) >> 2;
+  uint16_t* dst = out + (((size_t)pb * 2 + kvh) * dims + dim) * 4;
+  if (valid == 0xf) {
+    uint2 pk;
+    pk.x = (uint32_t)v[0] | ((uint32_t)v[1] << 16);
+    pk.y = (uint32_t)v[2] | ((uint32_t)v[3] << 16);
+    *(uint2*)dst = pk;
+  } else {
+#pragma unroll
+    for (int slot = 0; slot < 4; ++slot)
+      if (valid & (1 << slot)) dst[slot] = v[slot];
+  }
+}
+
+// FP32 KV rows [base, base+P) through the page table (replaces the host
+// kv_runs memcpy loop during capture; pure copy, bit-identical).
+__global__ void k_kv_rows_store_pd(float* __restrict__ dst,
+                                   const float* __restrict__ src,
+                                   const int* __restrict__ ptab, int P,
+                                   const int* __restrict__ dvb) {
+  const int lr = blockIdx.x;
+  if (lr >= P) return;
+  const int phys = kv_row(ptab, *dvb + lr);
+  const float4* s = (const float4*)(src + (size_t)lr * 512);
+  float4* d = (float4*)(dst + (size_t)phys * 512);
+  for (int i = threadIdx.x; i < 128; i += blockDim.x) d[i] = s[i];
 }
 
 // Rebuild block-transposed V for absolute rows [r0, r1) from the row-major
@@ -936,24 +1018,28 @@ __global__ void k_qsa_flash(const float* __restrict__ q, const KVT* __restrict__
                             int first = 0, const int* pos = nullptr,
                             float* pacc = nullptr, float* pml = nullptr,
                             int kbase = 0,
-                            const int* __restrict__ ptab = nullptr) {
+                            const int* __restrict__ ptab = nullptr,
+                            const int* __restrict__ dvb = nullptr) {
   static_assert(!SharedV || Sparse, "shared V is a sparse-attention specialization");
+  // P3-B: dvb carries the batch base on device (graph capture); sparse first
+  // is recomputed as max(base, 2051), matching the host launcher exactly.
+  const int kb = dvb ? *dvb : kbase;
   const int h = blockIdx.y;
   const int kvh = Sparse ? h : h / (hq / hkv);
-  const int token = pos ? *pos : first + (int)blockIdx.x;
+  const int token = pos ? *pos : (dvb && Sparse ? max(kb, 2051) : first) + (int)blockIdx.x;
   // Dense decode tokens (< 2051) are handled here too: ntok = token+1 and
   // qsa_source_pos degrades to identity, so the split partials cover the
   // whole visible range (empty splits write m=-1e30, l=0 and merge as 0).
   const int* blocks =
-      Sparse ? selected + (size_t)(Split ? 0 : blockIdx.x) * 512 : nullptr;
+      Sparse ? selected + (size_t)(Split ? 0 : (dvb ? token - kb : (int)blockIdx.x)) * 512 : nullptr;
   const int ts = blockIdx.x * QSA_TR;   // first q row of this tile
-  // Sparse: q/out rows are batch-local (token - kbase); token stays absolute
-  // for ntok/source bookkeeping. Dense: rows local, keys/mask absolute (kbase).
-  const int qrow = token - kbase;
+  // Sparse: q/out rows are batch-local (token - kb); token stays absolute
+  // for ntok/source bookkeeping. Dense: rows local, keys/mask absolute (kb).
+  const int qrow = token - kb;
   // selected == nullptr (GDEC_QSA_DENSE decode): every visible position.
   const int ntok = Sparse ? ((token < 2051 || !selected) ? token + 1
                                                          : 2048 + (token + 1) % 4)
-                          : min(kbase + P, kbase + ts + QSA_TR);
+                          : min(kb + P, kb + ts + QSA_TR);
   constexpr int QR = SharedV ? 12 : QSA_TR;
   __shared__ float qs[QR][QSA_LP];
   __shared__ float kt[QSA_KT][QSA_LP];
@@ -1051,7 +1137,7 @@ __global__ void k_qsa_flash(const float* __restrict__ q, const KVT* __restrict__
         s4.w += qv.w * kv.w;
       }
       float s = ((s4.x + s4.y) + (s4.z + s4.w)) * scale;
-      bool masked = Sparse ? p0 + pl >= ntok : p0 + pl > kbase + rg;
+      bool masked = Sparse ? p0 + pl >= ntok : p0 + pl > kb + rg;
       if (masked) s = -1e30f;
       // chunk max/sum over the 8 lanes of this row (width-8 shfl groups)
       float cm = s;
@@ -1223,11 +1309,14 @@ __global__ void k_qsa_flash_bf16(const float* __restrict__ q,
                                  const KVT* __restrict__ vc,
                                  float* __restrict__ out, int P, int dh, int hkv,
                                  int hq, const int* __restrict__ selected,
-                                 int first, int kbase = 0) {
+                                 int first, int kbase = 0,
+                                 const int* __restrict__ dvb = nullptr) {
+  // P3-B: dvb carries the batch base on device (graph capture).
+  const int kb = dvb ? *dvb : kbase;
   const int kvh = blockIdx.y;
-  const int token = first + (int)blockIdx.x;
-  const int qrow = token - kbase;  // batch-local q/out row; token stays absolute
-  const int* blocks = selected + (size_t)blockIdx.x * 512;
+  const int token = (dvb ? max(kb, 2051) : first) + (int)blockIdx.x;
+  const int qrow = token - kb;  // batch-local q/out row; token stays absolute
+  const int* blocks = selected + (size_t)(dvb ? token - kb : (int)blockIdx.x) * 512;
   const int ntok = token < 2051 ? token + 1 : 2048 + (token + 1) % 4;
   constexpr int QR = 12;
   __shared__ __align__(16) uint16_t qs[QR][QSA_LPB];
@@ -1426,11 +1515,32 @@ __global__ void __launch_bounds__(256)
                const uint16_t* __restrict__ vc, const uint16_t* __restrict__ vct,
                float* __restrict__ out, int P,
                int dh, int hkv, int hq, const int* __restrict__ selected,
-               int first, int kbase = 0, const int* __restrict__ ptab = nullptr) {
-  (void)P;
+               int first, int kbase = 0, const int* __restrict__ ptab = nullptr,
+               const int* __restrict__ dvb = nullptr, int dvb_edge = 0) {
   (void)ptab;
-  const int token = first + (int)blockIdx.x, kvh = blockIdx.y;
-  const int qrow = token - kbase;  // batch-local q/out row; token stays absolute
+  // P3-B: dvb carries the batch base on device (graph capture). dvb_edge:
+  // 0 = full sparse range [max(kb,2051), kb+P) (grid == P), 1 = union right
+  // ragged edge [(kb+P)&~3, kb+P), 2 = union left ragged edge [max(kb,2051),
+  // (max(kb,2051)+3)&~3). Grids are baked worst-case; out-of-range blocks
+  // exit. Dense: first = kbase = kb, exactly as the scalar launcher passes.
+  const int kb = dvb ? *dvb : kbase;
+  int first_ = first;
+  if (dvb) {
+    if (Dense) first_ = kb;
+    else if (dvb_edge == 1) first_ = (kb + P) & ~3;
+    else first_ = max(kb, 2051);
+  }
+  const int token = first_ + (int)blockIdx.x, kvh = blockIdx.y;
+  if (dvb && !Dense) {
+    const int ga_ = (max(kb, 2051) + 3) & ~3;
+    if (dvb_edge == 1) {
+      // right edge [ge, kb+P): only exists when ge >= ga (as the host check)
+      if (token >= kb + P || ((kb + P) & ~3) < ga_) return;
+    } else if (dvb_edge == 2) {
+      if (token >= ga_ || token >= kb + P) return;  // left edge [fa, min(ga, kb+P))
+    }
+  }
+  const int qrow = token - kb;  // batch-local q/out row; token stays absolute
   const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
   __shared__ uint16_t Qs[16][QW_DH + 8];   // 8704B
   __shared__ uint16_t Pbuf[2][16][136];    // [phase][qrow][key], double-buffered
@@ -1454,7 +1564,7 @@ __global__ void __launch_bounds__(256)
     }
   }
   __syncthreads();
-  const int* blocks = Dense ? nullptr : selected + (size_t)blockIdx.x * 512;
+  const int* blocks = Dense ? nullptr : selected + (size_t)(dvb ? token - kb : (int)blockIdx.x) * 512;
   const int ntok = Dense ? token + 1 : 2048 + (token + 1) % 4;
   const long tail0 = Dense ? 0 : ((token + 1) / 4) * 4L;  // dense tail (visible = token+1)
   const int qw_niter = Dense ? (ntok + QW_KITER - 1) / QW_KITER : QW_NITER;
@@ -1888,15 +1998,21 @@ __global__ void __launch_bounds__(128)
 __global__ void __launch_bounds__(128)
     k_qsa_union_merge(const int* __restrict__ sel, int g0,
                       uint16_t* __restrict__ ublk, uint16_t* __restrict__ umask,
-                      int* __restrict__ ucount, int cap, int sbase = 0) {
+                      int* __restrict__ ucount, int cap, int sbase = 0,
+                      int dvb_P = 0, const int* __restrict__ dvb = nullptr) {
   __shared__ int rows_s[4][512];
   __shared__ int scan_s[128];
   const int lane = threadIdx.x, g = blockIdx.x;
-  const int t0 = g0 + 4 * g;  // 组首 token（绝对，4 对齐）
+  // P3-B: dvb carries the batch base on device (graph capture); g0/sbase are
+  // recomputed and the baked worst-case grid is masked by the ge guard.
+  const int kb = dvb ? *dvb : sbase;
+  const int g0_ = dvb ? ((max(kb, 2051) + 3) & ~3) : g0;
+  const int t0 = g0_ + 4 * g;  // 组首 token（绝对，4 对齐）
+  if (dvb && t0 >= ((kb + dvb_P) & ~3)) return;
 #pragma unroll
   for (int qi = 0; qi < 4; ++qi) {
-    // sel 行号 = 绝对 token - sbase（A1b：d_iselected 按 batch 局部行存放）
-    const int* src = sel + (size_t)(t0 + qi - sbase) * 512;
+    // sel 行号 = 绝对 token - kb（A1b：d_iselected 按 batch 局部行存放）
+    const int* src = sel + (size_t)(t0 + qi - kb) * 512;
     for (int j = lane; j < 512; j += 128) rows_s[qi][j] = src[j];
   }
   __syncthreads();
@@ -2021,11 +2137,17 @@ __global__ void __launch_bounds__(256)
                  const uint16_t* __restrict__ ublk,
                  const uint16_t* __restrict__ umask,
                  const int* __restrict__ ucount, int cap, int g0, int kbase,
-                 const int* __restrict__ ptab = nullptr) {
+                 const int* __restrict__ ptab = nullptr, int dvb_P = 0,
+                 const int* __restrict__ dvb = nullptr) {
   (void)ptab;
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, r = lane & 15,
             hi = lane >> 4;
   const int g = blockIdx.x, kvh = blockIdx.y;
+  // P3-B: dvb carries the batch base on device (graph capture); g0/kbase are
+  // recomputed and the baked worst-case grid is masked by the ge guard.
+  const int kb = dvb ? *dvb : kbase;
+  const int g0_ = dvb ? ((max(kb, 2051) + 3) & ~3) : g0;
+  if (dvb && g0_ + 4 * g >= ((kb + dvb_P) & ~3)) return;
   __shared__ float4 part[3][8][64];
   __shared__ uint4 ptile[3][32];
   __shared__ float alpha_s[48];
@@ -2033,8 +2155,8 @@ __global__ void __launch_bounds__(256)
   const uint16_t* gblk = ublk + (size_t)g * cap;
   const uint16_t* gmsk = umask + (size_t)g * cap;
   const int nchunks = ucount[g] >> 2;
-  const int own_blk = (g0 >> 2) + g;
-  const int tok0 = g0 + 4 * g - kbase;  // 组首 token 的 batch 行
+  const int own_blk = (g0_ >> 2) + g;
+  const int tok0 = g0_ + 4 * g - kb;  // 组首 token 的 batch 行
   const int hqk = hq / hkv;             // 12
 
   // Q stage：warp w 负责全部 48 行的 [32w,+32) 维切片（fp32 -> bf16 RNE）
@@ -2288,7 +2410,8 @@ template <bool Bf16 = false>
 __global__ void k_qsa_kprep(const float* __restrict__ kb, const float* __restrict__ knw,
                             float* __restrict__ kout, uint16_t* __restrict__ kc,
                             float eps, int rope_base,
-                            const float2* __restrict__ ropecs);
+                            const float2* __restrict__ ropecs,
+                            const int* __restrict__ dvb = nullptr);
 __global__ void k_axpy_sg(float* __restrict__ acc, const float* __restrict__ y,
                           const float* __restrict__ sg, int n, int total);
 

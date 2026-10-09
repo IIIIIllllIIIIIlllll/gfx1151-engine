@@ -588,6 +588,269 @@ int main() {
     TCK(hipFree(dvb));
   }
 
+  // ---- 1e2. P3-B graph-capture kernels: scalar base vs device *dvb, and the
+  // paged device-side scatter kernels vs the host per-run loop. All bit-eq. ----
+  {
+    std::mt19937 rng(0x1e2);  // private stream: never disturb later tests
+    auto frand = [&] { return std::uniform_real_distribution<float>(-1.f, 1.f)(rng); };
+    const int P = 5, N = 512;
+    int* dvb;
+    TCK(hipMalloc(&dvb, 4));
+    auto bit_eq = [&](const char* name, const void* a, const void* b,
+                      size_t nbytes) {
+      std::vector<char> va(nbytes), vb2(nbytes);
+      TCK(hipMemcpy(va.data(), a, nbytes, hipMemcpyDeviceToHost));
+      TCK(hipMemcpy(vb2.data(), b, nbytes, hipMemcpyDeviceToHost));
+      size_t mism = memcmp(va.data(), vb2.data(), nbytes) ? 1 : 0;
+      printf("%-28s bit_mism=%zu %s\n", name, mism, mism ? "FAIL" : "PASS");
+      if (mism) fails++;
+    };
+    for (int base : {0, 8189, 8191}) {  // 8189: base%4==1, union edges only
+      TCK(hipMemcpy(dvb, &base, 4, hipMemcpyHostToDevice));
+      char nm[64];
+      const int rows = base + P;
+      const int npg = (rows + KV_PAGE - 1) / KV_PAGE, prows = npg * KV_PAGE;
+      std::vector<int> ptab(npg);
+      for (int p = 0; p < npg; p++) ptab[p] = npg - 1 - p;  // reversed pages
+      auto prow = [&](int t) {
+        return ptab[t / KV_PAGE] * KV_PAGE + t % KV_PAGE;
+      };
+      int* dptab = dup(ptab);
+      // shared source batch: P fp32 rows
+      std::vector<float> src((size_t)P * N);
+      for (auto& v : src) v = frand();
+      float* dsrc = dup(src);
+      // poison-filled outputs so untouched slots must match too
+      std::vector<uint16_t> poi16((size_t)prows * N);
+      for (auto& v : poi16) v = (uint16_t)rng();
+      std::vector<float> poi32((size_t)prows * N);
+      for (auto& v : poi32) v = frand();
+
+      // k_f32_to_bf16_v4: scalar (offset out) vs dvb
+      {
+        uint16_t *o0 = dup(poi16), *o1 = dup(poi16);
+        k_f32_to_bf16_v4<<<(P * 128 + 255) / 256, 256>>>(dsrc, o0 + (size_t)base * N, N, P, N);
+        k_f32_to_bf16_v4<<<(P * 128 + 255) / 256, 256>>>(dsrc, o1, N, P, N, dvb);
+        snprintf(nm, sizeof nm, "vbase_f2bf_v4@%d", base);
+        bit_eq(nm, o0, o1, poi16.size() * 2);
+        TCK(hipFree(o0)); TCK(hipFree(o1));
+      }
+      // k_f32_to_bf16_v4_bt: scalar vs dvb (unpaged)
+      {
+        const int nb = (rows + 3) / 4;
+        std::vector<uint16_t> poib((size_t)(prows / 4) * 2 * 256 * 4);
+        for (auto& v : poib) v = (uint16_t)rng();
+        uint16_t *o0 = dup(poib), *o1 = dup(poib);
+        const int nb0 = (base + P + 3) / 4 - base / 4;
+        k_f32_to_bf16_v4_bt<<<(nb0 * N + 255) / 256, 256>>>(dsrc, o0, N, P, N, base);
+        const int nbw = (P + 6) / 4 + 1;  // worst-case baked grid
+        k_f32_to_bf16_v4_bt<<<(nbw * N + 255) / 256, 256>>>(dsrc, o1, N, P, N, 0, dvb);
+        snprintf(nm, sizeof nm, "vbase_f2bf_v4_bt@%d", base);
+        bit_eq(nm, o0, o1, poib.size() * 2);
+        (void)nb;
+        TCK(hipFree(o0)); TCK(hipFree(o1));
+      }
+      // paged scatters: device-side ptab+dvb vs host per-run emulation
+      {
+        uint16_t *o0 = dup(poi16), *o1 = dup(poi16);
+        // reference: per-row scalar converts at the physical row
+        for (int lr = 0; lr < P; lr++)
+          k_f32_to_bf16_v4<<<(128 + 255) / 256, 256>>>(
+              dsrc + (size_t)lr * N, o0 + (size_t)prow(base + lr) * N, N, 1, N);
+        k_f32_to_bf16_v4_pd<<<(P * 128 + 255) / 256, 256>>>(dsrc, o1, dptab, P, N, dvb);
+        snprintf(nm, sizeof nm, "vbase_f2bf_v4_pd@%d", base);
+        bit_eq(nm, o0, o1, poi16.size() * 2);
+        TCK(hipFree(o0)); TCK(hipFree(o1));
+      }
+      {
+        float *o0 = dup(poi32), *o1 = dup(poi32);
+        for (int lr = 0; lr < P; lr++)
+          TCK(hipMemcpy(o0 + (size_t)prow(base + lr) * N, dsrc + (size_t)lr * N,
+                        N * 4, hipMemcpyDeviceToDevice));
+        k_kv_rows_store_pd<<<P, 128>>>(o1, dsrc, dptab, P, dvb);
+        snprintf(nm, sizeof nm, "vbase_kv_rows_pd@%d", base);
+        bit_eq(nm, o0, o1, poi32.size() * 4);
+        TCK(hipFree(o0)); TCK(hipFree(o1));
+      }
+      {
+        // paged bt: reference = production per-run loop on the host
+        std::vector<uint16_t> poib((size_t)(prows / 4) * 2 * 256 * 4);
+        for (auto& v : poib) v = (uint16_t)rng();
+        uint16_t *o0 = dup(poib), *o1 = dup(poib);
+        for (int lr = 0; lr < P; ) {
+          const int pr0 = prow(base + lr);
+          int n = 1;
+          while (lr + n < P && prow(base + lr + n) == pr0 + n) n++;
+          const int nb0 = (pr0 + n + 3) / 4 - pr0 / 4;
+          k_f32_to_bf16_v4_bt<<<(nb0 * N + 255) / 256, 256>>>(
+              dsrc + (size_t)lr * N, o0, N, n, N, pr0);
+          lr += n;
+        }
+        const int nbw = (P + 6) / 4 + 1;
+        k_f32_to_bf16_v4_bt_pd<<<(nbw * N + 255) / 256, 256>>>(dsrc, o1, dptab, P, N, dvb);
+        snprintf(nm, sizeof nm, "vbase_f2bf_bt_pd@%d", base);
+        bit_eq(nm, o0, o1, poib.size() * 2);
+        TCK(hipFree(o0)); TCK(hipFree(o1));
+      }
+      // k_qsa_kprep<true>: scalar (kc offset by base) vs dvb
+      {
+        std::vector<float> kb((size_t)P * N), knw(256);
+        std::vector<float2> cs((size_t)P * 32);
+        for (auto& v : kb) v = frand();
+        for (auto& v : knw) v = frand() * 0.1f;
+        for (auto& v : cs) v = make_float2(frand(), frand());
+        float *dkb = dup(kb), *dkn = dup(knw);
+        float2* dcs = dup(cs);
+        float *ko0 = dalloc((size_t)P * N), *ko1 = dalloc((size_t)P * N);
+        uint16_t *kc0 = dup(poi16), *kc1 = dup(poi16);
+        k_qsa_kprep<true><<<dim3(2, P), 256>>>(dkb, dkn, ko0, kc0 + (size_t)base * N,
+                                               1e-6f, base, dcs);
+        k_qsa_kprep<true><<<dim3(2, P), 256>>>(dkb, dkn, ko1, kc1, 1e-6f, base,
+                                               dcs, dvb);
+        snprintf(nm, sizeof nm, "vbase_kprep_out@%d", base);
+        bit_eq(nm, ko0, ko1, (size_t)P * N * 4);
+        snprintf(nm, sizeof nm, "vbase_kprep_kc@%d", base);
+        bit_eq(nm, kc0, kc1, poi16.size() * 2);
+        TCK(hipFree(dkb)); TCK(hipFree(dkn)); TCK(hipFree(dcs));
+        TCK(hipFree(ko0)); TCK(hipFree(ko1)); TCK(hipFree(kc0)); TCK(hipFree(kc1));
+      }
+      // sparse attention kernels at this base (rows are batch-local, sel row 0)
+      if (base >= 2051) {
+        const int HQ = 24, HKV = 2, DH = 256;
+        std::vector<float> q((size_t)P * HQ * DH);
+        for (auto& v : q) v = frand();
+        std::vector<int> sel((size_t)P * 512);
+        for (int r = 0; r < P; r++)
+          for (int i = 0; i < 512; i++) sel[(size_t)r * 512 + i] = i * 3;
+        float* dq = dup(q);
+        int* dsel = dup(sel);
+        // fp32 KV
+        std::vector<float> kf((size_t)rows * HKV * DH), vf(kf.size());
+        for (auto& v : kf) v = frand();
+        for (auto& v : vf) v = frand();
+        float *dkf = dup(kf), *dvf = dup(vf);
+        float *fo0 = dalloc((size_t)P * HQ * DH), *fo1 = dalloc((size_t)P * HQ * DH);
+        k_qsa_flash<true, false, float><<<dim3(P, HKV), 128>>>(
+            dq, dkf, dvf, fo0, P, DH, HKV, HQ, dsel, base, nullptr, nullptr,
+            nullptr, base);
+        k_qsa_flash<true, false, float><<<dim3(P, HKV), 128>>>(
+            dq, dkf, dvf, fo1, P, DH, HKV, HQ, dsel, 0, nullptr, nullptr,
+            nullptr, 0, nullptr, dvb);
+        snprintf(nm, sizeof nm, "vbase_qsa_flash@%d", base);
+        bit_eq(nm, fo0, fo1, (size_t)P * HQ * DH * 4);
+        k_qsa_flash<true, true, float><<<dim3(P, HKV), 128>>>(
+            dq, dkf, dvf, fo0, P, DH, HKV, HQ, dsel, base, nullptr, nullptr,
+            nullptr, base);
+        k_qsa_flash<true, true, float><<<dim3(P, HKV), 128>>>(
+            dq, dkf, dvf, fo1, P, DH, HKV, HQ, dsel, 0, nullptr, nullptr,
+            nullptr, 0, nullptr, dvb);
+        snprintf(nm, sizeof nm, "vbase_qsa_flash_sv@%d", base);
+        bit_eq(nm, fo0, fo1, (size_t)P * HQ * DH * 4);
+        TCK(hipFree(dkf)); TCK(hipFree(dvf));
+        // bf16 KV + transposed V, paged (reversed table)
+        std::vector<uint16_t> kb((size_t)prows * HKV * DH, 0), vb(kb.size(), 0);
+        std::vector<uint16_t> vct((size_t)(prows / 4) * HKV * DH * 4, 0);
+        for (int t = 0; t < rows; t++) {
+          const int pr = prow(t);
+          for (int j = 0; j < HKV * DH; j++) {
+            const uint16_t b = bf16_bits(frand());
+            kb[(size_t)pr * HKV * DH + j] = b;
+            vb[(size_t)pr * HKV * DH + j] = bf16_bits(frand());
+            vct[((size_t)(pr / 4) * HKV * DH + j) * 4 + t % 4] = vb[(size_t)pr * HKV * DH + j];
+          }
+        }
+        uint16_t *dkb = dup(kb), *dvb2 = dup(vb), *dvct = dup(vct);
+        float *wo0 = dalloc((size_t)P * HQ * DH), *wo1 = dalloc((size_t)P * HQ * DH);
+        k_qsa_wmma<true, true><<<dim3(P, HKV), 256>>>(dq, dkb, dvb2, dvct, wo0, P,
+                                                      DH, HKV, HQ, dsel, base, base,
+                                                      dptab);
+        k_qsa_wmma<true, true><<<dim3(P, HKV), 256>>>(dq, dkb, dvb2, dvct, wo1, P,
+                                                      DH, HKV, HQ, dsel, 0, 0, dptab,
+                                                      dvb, 0);
+        snprintf(nm, sizeof nm, "vbase_qsa_wmma@%d", base);
+        bit_eq(nm, wo0, wo1, (size_t)P * HQ * DH * 4);
+        // flash_bf16 (unpaged bf16 path)
+        std::vector<uint16_t> kc16((size_t)rows * HKV * DH), vc16(kc16.size());
+        for (int t = 0; t < rows; t++)
+          for (int j = 0; j < HKV * DH; j++) {
+            kc16[(size_t)t * HKV * DH + j] = kb[(size_t)prow(t) * HKV * DH + j];
+            vc16[(size_t)t * HKV * DH + j] = vb[(size_t)prow(t) * HKV * DH + j];
+          }
+        uint16_t *dkc16 = dup(kc16), *dvc16 = dup(vc16);
+        k_qsa_flash_bf16<uint16_t><<<dim3(P, HKV), 128>>>(dq, dkc16, dvc16, wo0, P,
+                                                          DH, HKV, HQ, dsel, base,
+                                                          base);
+        k_qsa_flash_bf16<uint16_t><<<dim3(P, HKV), 128>>>(dq, dkc16, dvc16, wo1, P,
+                                                          DH, HKV, HQ, dsel, 0, 0,
+                                                          dvb);
+        snprintf(nm, sizeof nm, "vbase_qsa_flash16@%d", base);
+        bit_eq(nm, wo0, wo1, (size_t)P * HQ * DH * 4);
+        // union: merge outputs + wmma_u + both ragged edges
+        {
+          const int ga = (base + 3) & ~3, ge = (base + P) & ~3;
+          const int ng = (ge - ga) >> 2;
+          int ngw = 0;
+          for (int r = 0; r < 4; r++)
+            ngw = std::max(ngw, (((r + P) & ~3) - ((r + 3) & ~3)) >> 2);
+          uint16_t *ub0 = (uint16_t*)dalloc((size_t)ngw * QSA_UCAP * 2 / 4 + 4),
+                   *ub1 = (uint16_t*)dalloc((size_t)ngw * QSA_UCAP * 2 / 4 + 4);
+          uint16_t *um0 = (uint16_t*)dalloc((size_t)ngw * QSA_UCAP * 2 / 4 + 4),
+                   *um1 = (uint16_t*)dalloc((size_t)ngw * QSA_UCAP * 2 / 4 + 4);
+          int *uc0 = (int*)dalloc(ngw + 1), *uc1 = (int*)dalloc(ngw + 1);
+          if (ng > 0)
+            k_qsa_union_merge<<<ng, 128>>>(dsel, ga, ub0, um0, uc0, QSA_UCAP, base);
+          if (ngw > 0)
+            k_qsa_union_merge<<<ngw, 128>>>(dsel, 0, ub1, um1, uc1, QSA_UCAP, 0, P, dvb);
+          snprintf(nm, sizeof nm, "vbase_union_merge@%d", base);
+          bit_eq(nm, ub0, ub1, (size_t)ngw * QSA_UCAP * 2);
+          snprintf(nm, sizeof nm, "vbase_union_mask@%d", base);
+          bit_eq(nm, um0, um1, (size_t)ngw * QSA_UCAP * 2);
+          snprintf(nm, sizeof nm, "vbase_union_cnt@%d", base);
+          bit_eq(nm, uc0, uc1, (size_t)ngw * 4);
+          if (ng > 0)
+            k_qsa_wmma_u<true><<<dim3(ng, HKV), 256>>>(dq, dkb, dvct, wo0, DH, HKV,
+                                                       HQ, ub0, um0, uc0, QSA_UCAP,
+                                                       ga, base, dptab);
+          if (ngw > 0)
+            k_qsa_wmma_u<true><<<dim3(ngw, HKV), 256>>>(dq, dkb, dvct, wo1, DH, HKV,
+                                                        HQ, ub1, um1, uc1, QSA_UCAP,
+                                                        0, 0, dptab, P, dvb);
+          snprintf(nm, sizeof nm, "vbase_wmma_u@%d", base);
+          bit_eq(nm, wo0, wo1, (size_t)P * HQ * DH * 4);
+          // edges: scalar explicit vs dvb edge kinds (grids baked at 3)
+          const int ln = std::min(ga, base + P) - base;   // left tokens
+          const int rn = base + P - std::max(ge, ga);     // right tokens
+          if (ln > 0)
+            k_qsa_wmma<true, true><<<dim3(ln, HKV), 256>>>(dq, dkb, dvb2, dvct, wo0,
+                                                           P, DH, HKV, HQ, dsel,
+                                                           base, base, dptab);
+          if (rn > 0)
+            k_qsa_wmma<true, true><<<dim3(rn, HKV), 256>>>(
+                dq, dkb, dvb2, dvct, wo0, P, DH, HKV, HQ,
+                dsel + (size_t)(ge - base) * 512, ge, base, dptab);
+          k_qsa_wmma<true, true><<<dim3(3, HKV), 256>>>(dq, dkb, dvb2, dvct, wo1, P,
+                                                        DH, HKV, HQ, dsel, 0, 0,
+                                                        dptab, dvb, 2);
+          k_qsa_wmma<true, true><<<dim3(3, HKV), 256>>>(dq, dkb, dvb2, dvct, wo1, P,
+                                                        DH, HKV, HQ, dsel, 0, 0,
+                                                        dptab, dvb, 1);
+          snprintf(nm, sizeof nm, "vbase_wmma_edges@%d", base);
+          bit_eq(nm, wo0, wo1, (size_t)P * HQ * DH * 4);
+          TCK(hipFree(ub0)); TCK(hipFree(ub1)); TCK(hipFree(um0)); TCK(hipFree(um1));
+          TCK(hipFree(uc0)); TCK(hipFree(uc1));
+        }
+        TCK(hipFree(dq)); TCK(hipFree(dsel));
+        TCK(hipFree(dkb)); TCK(hipFree(dvb2)); TCK(hipFree(dvct));
+        TCK(hipFree(dkc16)); TCK(hipFree(dvc16));
+        TCK(hipFree(wo0)); TCK(hipFree(wo1));
+        TCK(hipFree(fo0)); TCK(hipFree(fo1));
+      }
+      TCK(hipFree(dptab));
+      TCK(hipFree(dsrc));
+    }
+    TCK(hipFree(dvb));
+  }
+
   // ---- 1f. k_moe_sort_slots + k_q4cp_gemv_gg slot_order: 纯调度排列逐 bit ----
   {
     const int P = 5, k = 10, E = 32;  // E 小 → 强制大量重复专家

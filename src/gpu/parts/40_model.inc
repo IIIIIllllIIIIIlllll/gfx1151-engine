@@ -3056,7 +3056,12 @@ struct GpuModel {
   template <typename KVT>
   void qsa_flash_b(const KVT* kc, const KVT* vc, int P, int dense_P, int base = 0,
                    const uint16_t* vc_transposed = nullptr,
-                   const int* ptab = nullptr) {
+                   const int* ptab = nullptr, const int* dvb = nullptr) {
+    // dvb (P3-B graph capture): the kernels read base from *dvb and recompute
+    // first_abs / ga / ge on device. Requires base >= 2051 (the verify graph
+    // gate), so first_abs == base, nsparse == P and sel is the batch-local
+    // row-0 pointer; grids are baked worst-case (edges: 3 tokens, union
+    // groups: max over base mod 4) and masked in-kernel.
     // ptab (paged KV) is honoured by k_qsa_flash (all KV types) and, for the
     // BF16 cache, by k_qsa_wmma<*, true> (A1c). The union / wmma6 /
     // k_qsa_flash_bf16 paths are not paged: the constructor refuses paging
@@ -3073,54 +3078,62 @@ struct GpuModel {
             if (ptab)
               k_qsa_wmma<true, true, true><<<dim3(dense_P, 2), 256, 0, g_str>>>(
                   d_qsb, kc, vc, vc_transposed, d_attnb, dense_P, 256, 2, 24,
-                  nullptr, base, base, ptab);
+                  nullptr, base, base, ptab, dvb);
             else
               k_qsa_wmma<true, false, true><<<dim3(dense_P, 2), 256, 0, g_str>>>(
                   d_qsb, kc, vc, vc_transposed, d_attnb, dense_P, 256, 2, 24,
-                  nullptr, base, base);
+                  nullptr, base, base, nullptr, dvb);
           } else {
             if (ptab)
               k_qsa_wmma<false, true, true><<<dim3(dense_P, 2), 256, 0, g_str>>>(
                   d_qsb, kc, vc, nullptr, d_attnb, dense_P, 256, 2, 24, nullptr,
-                  base, base, ptab);
+                  base, base, ptab, dvb);
             else
               k_qsa_wmma<false, false, true><<<dim3(dense_P, 2), 256, 0, g_str>>>(
                   d_qsb, kc, vc, nullptr, d_attnb, dense_P, 256, 2, 24, nullptr,
-                  base, base);
+                  base, base, nullptr, dvb);
           }
         }
       }
       if (!dense_launched)
         k_qsa_flash<false, false, KVT><<<dim3((dense_P + 15) / 16, 24), 128, 0, g_str>>>(
             d_qsb, kc, vc, d_attnb, dense_P, 256, 2, 24, nullptr, 0, nullptr, nullptr,
-            nullptr, base, ptab);
+            nullptr, base, ptab, dvb);
     }
     int first_abs = std::max(base, 2051), nsparse = base + P - first_abs;
+    if (dvb) nsparse = P;  // gate: base >= 2051 -> first_abs == base
     if (!qsa_dense && nsparse > 0) {
       // d_iselected rows are batch-local (row = abs - base; A1b)
-      const int* sel = d_iselected + (size_t)(first_abs - base) * 512;
+      const int* sel = dvb ? d_iselected
+                           : d_iselected + (size_t)(first_abs - base) * 512;
       if (qsa_global_v)
         k_qsa_flash<true, false, KVT><<<dim3(nsparse, 2), 128, 0, g_str>>>(
             d_qsb, kc, vc, d_attnb, P, 256, 2, 24, sel, first_abs, nullptr, nullptr,
-            nullptr, base, ptab);
+            nullptr, base, ptab, dvb);
       else if constexpr (sizeof(KVT) == 2) {
         if (qsa_union && vc_transposed) {
           // 并集路径：[ga, ge) 内的 4 对齐完整组走 merge + k_qsa_wmma_u，
           // 两侧 ragged 边缘回退逐 token 的 k_qsa_wmma<true>
           const int ga = (first_abs + 3) & ~3;
           const int ge = (base + P) & ~3;
-          if (ge - ga >= 4) {
-            const int ngroups = (ge - ga) >> 2;
+          int ngroups = (ge - ga) >> 2;
+          if (dvb) {  // baked worst case over base mod 4; in-kernel ge guard
+            ngroups = 0;
+            for (int r = 0; r < 4; r++)
+              ngroups = std::max(ngroups, (((r + P) & ~3) - ((r + 3) & ~3)) >> 2);
+          }
+          if (ngroups > 0) {
             k_qsa_union_merge<<<ngroups, 128, 0, g_str>>>(
-                d_iselected, ga, d_ublk, d_umask, d_ucount, QSA_UCAP, base);
+                d_iselected, ga, d_ublk, d_umask, d_ucount, QSA_UCAP, base, P,
+                dvb);
             if (ptab)
               k_qsa_wmma_u<true><<<dim3(ngroups, 2), 256, 0, g_str>>>(
                   d_qsb, kc, vc_transposed, d_attnb, 256, 2, 24, d_ublk, d_umask,
-                  d_ucount, QSA_UCAP, ga, base, ptab);
+                  d_ucount, QSA_UCAP, ga, base, ptab, P, dvb);
             else
               k_qsa_wmma_u<<<dim3(ngroups, 2), 256, 0, g_str>>>(
                   d_qsb, kc, vc_transposed, d_attnb, 256, 2, 24, d_ublk, d_umask,
-                  d_ucount, QSA_UCAP, ga, base);
+                  d_ucount, QSA_UCAP, ga, base, nullptr, P, dvb);
           }
           // ragged edges: per-token kernel (selected rows relative to its
           // own first token -> offset sel)
@@ -3133,8 +3146,23 @@ struct GpuModel {
               k_qsa_wmma<true><<<dim3(n, 2), 256, 0, g_str>>>(
                   d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, es, f, base);
           };
-          if (ga > first_abs) edge(first_abs, std::min(ga, base + P) - first_abs);
-          if (base + P > ge && ge >= ga) edge(ge, base + P - ge);
+          if (dvb) {
+            // baked 3-token grids for both edges; kernels mask by *dvb
+            // (dvb_edge 2 = left [first_abs, ga), 1 = right [ge, base+P))
+            for (int ek = 2; ek >= 1; ek--) {
+              if (ptab)
+                k_qsa_wmma<true, true><<<dim3(3, 2), 256, 0, g_str>>>(
+                    d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24,
+                    d_iselected, 0, 0, ptab, dvb, ek);
+              else
+                k_qsa_wmma<true><<<dim3(3, 2), 256, 0, g_str>>>(
+                    d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24,
+                    d_iselected, 0, 0, nullptr, dvb, ek);
+            }
+          } else {
+            if (ga > first_abs) edge(first_abs, std::min(ga, base + P) - first_abs);
+            if (base + P > ge && ge >= ga) edge(ge, base + P - ge);
+          }
         }
         else if (qsa_wmma6 && vc_transposed)
           k_qsa_wmma6<<<dim3(nsparse, 2), 128, 0, g_str>>>(
@@ -3144,29 +3172,30 @@ struct GpuModel {
           if (ptab)  // A1c paged instantiation (never taken unpaged)
             k_qsa_wmma<true, true><<<dim3(nsparse, 2), 256, 0, g_str>>>(
                 d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel, first_abs,
-                base, ptab);
+                base, ptab, dvb);
           else
             k_qsa_wmma<true><<<dim3(nsparse, 2), 256, 0, g_str>>>(
                 d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel, first_abs,
-                base);
+                base, nullptr, dvb);
         } else if (qsa_wmma) {
           // GDEC_QSA_WMMA=1: WMMA bf16 sparse flash (256 thr), see k_qsa_wmma.
           if (ptab)
             k_qsa_wmma<false, true><<<dim3(nsparse, 2), 256, 0, g_str>>>(
                 d_qsb, kc, vc, nullptr, d_attnb, P, 256, 2, 24, sel, first_abs, base,
-                ptab);
+                ptab, dvb);
           else
             k_qsa_wmma<false><<<dim3(nsparse, 2), 256, 0, g_str>>>(
-                d_qsb, kc, vc, nullptr, d_attnb, P, 256, 2, 24, sel, first_abs, base);
+                d_qsb, kc, vc, nullptr, d_attnb, P, 256, 2, 24, sel, first_abs, base,
+                nullptr, dvb);
         } else
           // BF16 KV mode (!qsa_kv_fp32): bf16 LDS tiles + fdot2 (-61% at 32K).
           k_qsa_flash_bf16<KVT><<<dim3(nsparse, 2), 128, 0, g_str>>>(
-              d_qsb, kc, vc, d_attnb, P, 256, 2, 24, sel, first_abs, base);
+              d_qsb, kc, vc, d_attnb, P, 256, 2, 24, sel, first_abs, base, dvb);
       }
       else
         k_qsa_flash<true, true, KVT><<<dim3(nsparse, 2), 128, 0, g_str>>>(
             d_qsb, kc, vc, d_attnb, P, 256, 2, 24, sel, first_abs, nullptr, nullptr,
-            nullptr, base, ptab);
+            nullptr, base, ptab, dvb);
     }
   }
 
@@ -3527,16 +3556,27 @@ struct GpuModel {
   // QSA: projections batched. Flash path: qsplit/norm/rope batched, KV rows
   // bulk-copied to cache slots 0..P-1, one causal flash kernel over all
   // positions. GDEC_QSA_LOOP=1 falls back to the per-token loop (debug).
-  void qsa_b(int l, int qi, int P, int base = 0) {
+  // Indexer + score/select phase of qsa_b: host-driven, base-dependent grids,
+  // so verify graph capture (P3-B) runs it eagerly between graph segments.
+  void qsa_idx_b(int l, int qi, int P, int base) {
+    if (qsa_dense) return;
     char buf[128];
-    const uint16_t* attn_bf = nullptr;  // gated o_proj input already in bf16
-    if (!qsa_dense) {
+    {
       KP_SUB("qsa:idx");
       // rope cos/sin table for the indexer kernels below (idempotent; the QSA
       // prep path re-ensures the same (base, P) later and hits the cache)
       ensure_rope_tab(g_cfg.rope_theta, 64);
       ensure_rope_cs(base, P);
       snprintf(buf, sizeof buf, "layers.%d.self_attn.indexer.index_qk_proj.weight", l);
+      if (getenv("GDEC_VGDUMP")) {  // P3-B: xf16 cache state at the idx gemm
+        fprintf(stderr, "[xc%d] P=%d hit=%d xf16P=%d xf16K=%d\n", l, P,
+                (int)(xf16_src == d_xb && xf16_xs == (size_t)g_cfg.d &&
+                      xf16_P == P && xf16_K == g_cfg.d),
+                xf16_P, xf16_K);
+        char tag[12];
+        snprintf(tag, sizeof tag, "xb%d", l);
+        vg_dump_buf(tag, P, d_xbf16, (size_t)P * 2560 * 2);
+      }
       if (index_f32) {
         iproj_sgemm(d_iw + (size_t)qi * 640 * 2560, d_xb, d_iproj, P);
       } else {
@@ -3552,6 +3592,17 @@ struct GpuModel {
       // absolute 4-token blocks [base/4, (base+P)/4); a left-straddling block
       // (base%4 != 0) is completed with history rows from the raw ring
       int nb = (base + P) / 4, b0 = base / 4;
+      if (getenv("GDEC_VGDUMP") && P >= 2 && P <= 16 && !vg_capturing_) {
+        char tag[12];
+        snprintf(tag, sizeof tag, "ir0_%d", l);
+        vg_dump_buf(tag, P, d_iraw + (size_t)qi * 512, 512 * 4);
+        int vbv = -1;
+        if (vbptr()) {
+          CK(hipStreamSynchronize(g_str));
+          CK(hipMemcpy(&vbv, d_vbase, 4, hipMemcpyDeviceToHost));
+        }
+        fprintf(stderr, "[vb%d] P=%d base=%d vbase=%d\n", l, P, base, vbv);
+      }
       if (nb > b0)
         k_index_pool<<<nb - b0, 128, 0, g_str>>>(d_iproj, d_inorm + qi * 256 + 128,
                                                  keys, g_cfg.norm_eps,
@@ -3590,6 +3641,41 @@ struct GpuModel {
       const int a0 = std::max(2051, base);
       const int grid =
           2051 + (a0 - 2051 + INDEX_BATCH - 1) / INDEX_BATCH * INDEX_BATCH;
+      if (getenv("GDEC_VGDUMP")) {  // P3-B bisect: selection inputs
+        char tag[12];
+        // split keys hash: prefix blocks vs last two blocks (freshly pooled)
+        snprintf(tag, sizeof tag, "ikp%d", l);
+        vg_dump_buf(tag, P, skeys, (size_t)(nb > 2 ? nb - 2 : 0) * 128 * 4);
+        snprintf(tag, sizeof tag, "ikl%d", l);
+        vg_dump_buf(tag, P, skeys + (size_t)(nb > 2 ? nb - 2 : 0) * 128,
+                    (size_t)(nb > 2 ? 2 : nb) * 128 * 4);
+        if (skeys16) {
+          snprintf(tag, sizeof tag, "ih%d", l);
+          vg_dump_buf(tag, P, skeys16, (size_t)nb * 128 * 2);
+        }
+        snprintf(tag, sizeof tag, "ip%d", l);
+        vg_dump_buf(tag, P, d_iproj, (size_t)P * 640 * 4);
+        if (P >= 2 && P <= 16) {  // q-half vs k-half split
+          CK(hipStreamSynchronize(g_str));
+          std::vector<float> ip((size_t)P * 640);
+          CK(hipMemcpy(ip.data(), d_iproj, (size_t)P * 640 * 4,
+                       hipMemcpyDeviceToHost));
+          uint64_t hq = 1469598103934665603ULL, hk = 1469598103934665603ULL;
+          for (int t = 0; t < P; t++)
+            for (int d = 0; d < 640; d++) {
+              uint32_t u;
+              memcpy(&u, &ip[(size_t)t * 640 + d], 4);
+              if (d < 512) { hq ^= u; hq *= 1099511628211ULL; }
+              else { hk ^= u; hk *= 1099511628211ULL; }
+            }
+          fprintf(stderr, "[ips%d] P=%d q=%016llx k=%016llx\n", l, P,
+                  (unsigned long long)hq, (unsigned long long)hk);
+        }
+        snprintf(tag, sizeof tag, "ir%d", l);
+        vg_dump_buf(tag, P, d_iraw + (size_t)qi * 512, 512 * 4);
+        snprintf(tag, sizeof tag, "pt%d", l);
+        vg_dump_buf(tag, P, d_ptab, (size_t)kv_lpages * 4);
+      }
       for (int first = a0; first < base + P;) {
         int nxt = first < grid ? min(grid, base + P)
                                : min(first + INDEX_BATCH, base + P);
@@ -3644,8 +3730,29 @@ struct GpuModel {
                      count);
         first = nxt;
       }
+      if (getenv("GDEC_VGDUMP")) {
+        char tag[12];
+        snprintf(tag, sizeof tag, "is%d", l);
+        vg_dump_buf(tag, P, d_iselected, (size_t)P * 512 * 4);
+        snprintf(tag, sizeof tag, "iq%d", l);
+        vg_dump_buf(tag, P, d_iq, (size_t)P * 512 * 4);
+        snprintf(tag, sizeof tag, "rc%d", l);
+        vg_dump_buf(tag, P, d_ropecs, (size_t)P * 32 * 8);
+      }
       KP_SUB_END();
     }
+  }
+
+  void qsa_b(int l, int qi, int P, int base = 0, const int* dvb = nullptr) {
+    qsa_idx_b(l, qi, P, base);
+    qsa_main_b(l, qi, P, base, dvb);
+  }
+
+  // Graphable remainder of qsa_b (P3-B): dvb = device base mirror (graph
+  // capture) or nullptr (direct execution, identical scalar path).
+  void qsa_main_b(int l, int qi, int P, int base, const int* dvb) {
+    char buf[128];
+    const uint16_t* attn_bf = nullptr;  // gated o_proj input already in bf16
     KP_SUB("qsa:proj");
     snprintf(buf, sizeof buf, "layers.%d.self_attn.q_proj.weight", l);
     gemm(wview(ckpt.at(buf)), d_xb, d_qgb, P);
@@ -3684,11 +3791,16 @@ struct GpuModel {
                                                           base, d_ropecs);
         // absolute positions base..base+P-1 are logically contiguous: one bulk
         // copy (unpaged) or one copy per physically contiguous page run
-        kv_rows_store(kc, d_kbb, base, P);
-        kv_rows_store(vc, d_vbb, base, P);
+        if (dvb) {  // P3-B graph capture: device-side base + page mapping
+          k_kv_rows_store_pd<<<P, 128, 0, g_str>>>(kc, d_kbb, kvpt(), P, dvb);
+          k_kv_rows_store_pd<<<P, 128, 0, g_str>>>(vc, d_vbb, kvpt(), P, dvb);
+        } else {
+          kv_rows_store(kc, d_kbb, base, P);
+          kv_rows_store(vc, d_vbb, base, P);
+        }
         KP_SUB_END();
         KP_SUB("qsa:flash");
-        qsa_flash_b(kc, vc, P, dense_P, base, nullptr, kvpt());
+        qsa_flash_b(kc, vc, P, dense_P, base, nullptr, kvpt(), dvb);
         KP_SUB_END();
       } else {
         uint16_t* kc = d_kcb + qsa_off;
@@ -3719,16 +3831,18 @@ struct GpuModel {
         }
         if (!kv_paged) {
           k_qsa_kprep<true><<<dim3(2, P), 256, 0, g_str>>>(
-              d_kbb, knw, d_kbb, kc + (size_t)base * 512, g_cfg.norm_eps, base,
-              d_ropecs);
+              d_kbb, knw, d_kbb, dvb ? kc : kc + (size_t)base * 512,
+              g_cfg.norm_eps, base, d_ropecs, dvb);
           // absolute positions base..base+P-1 are contiguous: one bulk convert
           k_f32_to_bf16_v4<<<(unsigned)(((size_t)P * 128 + 255) / 256), 256, 0,
-                             g_str>>>(d_vbb, vc + (size_t)base * 512, 512, P, 512);
-          if (vct)
-            k_f32_to_bf16_v4_bt<<<(unsigned)(((size_t)((base + P + 3) / 4 - base / 4) *
-                                              512 + 255) /
-                                                 256),
-                                 256, 0, g_str>>>(d_vbb, vct, 512, P, 512, base);
+                             g_str>>>(d_vbb, dvb ? vc : vc + (size_t)base * 512,
+                                      512, P, 512, dvb);
+          if (vct) {
+            // dvb: baked worst-case grid (base mod 4 unknown at capture)
+            const int btb = dvb ? (P + 6) / 4 + 1 : (base + P + 3) / 4 - base / 4;
+            k_f32_to_bf16_v4_bt<<<(unsigned)(((size_t)btb * 512 + 255) / 256),
+                                 256, 0, g_str>>>(d_vbb, vct, 512, P, 512, base, dvb);
+          }
         } else {
           // A1c paged: kprep writes the fp32 K rows only (kprep<true> stores
           // f2bf of exactly those values, so converting afterwards is the same
@@ -3739,20 +3853,35 @@ struct GpuModel {
           // block pr/4 is the physical block ik_blk(lr/4).
           k_qsa_kprep<false><<<dim3(2, P), 256, 0, g_str>>>(
               d_kbb, knw, d_kbb, nullptr, g_cfg.norm_eps, base, d_ropecs);
-          kv_runs(base, base + P, KV_PAGE, [&](int lr, size_t prz, int n) {
-            const int pr = (int)prz;
-            const size_t so = (size_t)(lr - base) * 512;
-            const unsigned g = (unsigned)(((size_t)n * 128 + 255) / 256);
-            k_f32_to_bf16_v4<<<g, 256, 0, g_str>>>(d_kbb + so, kc + prz * 512, 512, n,
-                                                   512);
-            k_f32_to_bf16_v4<<<g, 256, 0, g_str>>>(d_vbb + so, vc + prz * 512, 512, n,
-                                                   512);
-            if (vct)
-              k_f32_to_bf16_v4_bt<<<(unsigned)(((size_t)((pr + n + 3) / 4 - pr / 4) *
-                                                512 + 255) /
-                                                   256),
-                                   256, 0, g_str>>>(d_vbb + so, vct, 512, n, 512, pr);
-          });
+          if (dvb) {  // P3-B graph capture: one launch per output, device-side
+                      // base + page mapping (same bits as the per-run loop)
+            const unsigned g = (unsigned)(((size_t)P * 128 + 255) / 256);
+            k_f32_to_bf16_v4_pd<<<g, 256, 0, g_str>>>(d_kbb, kc, kvpt(), P, 512,
+                                                      dvb);
+            k_f32_to_bf16_v4_pd<<<g, 256, 0, g_str>>>(d_vbb, vc, kvpt(), P, 512,
+                                                      dvb);
+            if (vct)  // baked worst-case grid; the kernel masks by *dvb
+              k_f32_to_bf16_v4_bt_pd<<<(unsigned)(((((size_t)P + 6) / 4 + 1) *
+                                                   512 + 255) /
+                                                  256),
+                                    256, 0, g_str>>>(d_vbb, vct, kvpt(), P, 512,
+                                                     dvb);
+          } else {
+            kv_runs(base, base + P, KV_PAGE, [&](int lr, size_t prz, int n) {
+              const int pr = (int)prz;
+              const size_t so = (size_t)(lr - base) * 512;
+              const unsigned g = (unsigned)(((size_t)n * 128 + 255) / 256);
+              k_f32_to_bf16_v4<<<g, 256, 0, g_str>>>(d_kbb + so, kc + prz * 512,
+                                                     512, n, 512);
+              k_f32_to_bf16_v4<<<g, 256, 0, g_str>>>(d_vbb + so, vc + prz * 512,
+                                                     512, n, 512);
+              if (vct)
+                k_f32_to_bf16_v4_bt<<<(unsigned)(((size_t)((pr + n + 3) / 4 - pr / 4) *
+                                                  512 + 255) /
+                                                     256),
+                                     256, 0, g_str>>>(d_vbb + so, vct, 512, n, 512, pr);
+            });
+          }
         }
         if (vct && getenv("GDEC_VCT_TAILZERO") && ((base + P) & 3)) {  // debug only
           const int r0 = base + P, r1 = (r0 + 3) & ~3;
@@ -3763,7 +3892,7 @@ struct GpuModel {
         }
         KP_SUB_END();
         KP_SUB("qsa:flash");
-        qsa_flash_b(kc, vc, P, dense_P, base, vct, kvpt());
+        qsa_flash_b(kc, vc, P, dense_P, base, vct, kvpt(), dvb);
         KP_SUB_END();
         if (base > 0 && getenv("GDEC_ATTN_HASH")) dbg_attn_hash(qi, base, P, kc, vc, vct);
       }
@@ -4624,8 +4753,11 @@ struct GpuModel {
       k_ple_ring_wr<<<9, 256, 0, g_str>>>(d_Unb, d_cring, cut_r_, 10240, base, vbptr());
   }
 
-  void enq_layer_b(int l, int P, bool fuse_prev_mlp = false,
-                   bool flush_mlp = true, int base = 0) {
+  // P3-B: the layer's HC read + attention norm as a standalone step. A
+  // verify-graph segment boundary runs this eagerly ahead of qsa_idx_b,
+  // because the indexer reads d_xb, which this norm writes (it also carries
+  // layer l-1's deferred MLP write-back under gr_scatter_norm).
+  void enq_layer_norm_b(int l, int P, bool fuse_prev_mlp) {
     char attn_prefix[128], mlp_prefix[128];
     snprintf(attn_prefix, sizeof attn_prefix,
              "layers.%d.attn_hyper_connection", l);
@@ -4637,10 +4769,36 @@ struct GpuModel {
     } else {
       gr_read_b(attn_prefix, P);
     }
+    if (getenv("GDEC_VGDUMP")) {
+      char tag[12];
+      snprintf(tag, sizeof tag, "nx%d", l);
+      vg_dump_buf(tag, P, d_xb, (size_t)P * 2560 * 4);
+      snprintf(tag, sizeof tag, "xn%d", l);
+      vg_dump_buf(tag, P, d_xbf16, (size_t)P * 2560 * 2);
+      snprintf(tag, sizeof tag, "rn%d", l);
+      vg_dump_buf(tag, P, d_Rhatbf16, (size_t)P * 10240 * 2);
+      snprintf(tag, sizeof tag, "gb%d", l);
+      vg_dump_buf(tag, P, d_Gb, (size_t)P * 10240 * 4);
+    }
+  }
+
+  void enq_layer_b(int l, int P, bool fuse_prev_mlp = false,
+                   bool flush_mlp = true, int base = 0,
+                   const int* dvb = nullptr, bool skip_qsa_idx = false) {
+    char attn_prefix[128], mlp_prefix[128];
+    snprintf(attn_prefix, sizeof attn_prefix,
+             "layers.%d.attn_hyper_connection", l);
+    // skip_qsa_idx (P3-B): norm + indexer ran eagerly between graph segments
+    // (enq_layer_norm_b + qsa_idx_b); start at the attention projections.
+    // Callers pass it only for QSA layers.
+    if (!skip_qsa_idx) enq_layer_norm_b(l, P, fuse_prev_mlp);
     KP(is_qsa(l) ? "qsa" : "gdn");
-    if (is_qsa(l))
-      qsa_b(l, l / 4, P, base);
-    else
+    if (is_qsa(l)) {
+      if (skip_qsa_idx)  // P3-B: indexer ran eagerly between graph segments
+        qsa_main_b(l, l / 4, P, base, dvb);
+      else
+        qsa_b(l, l / 4, P, base, dvb);
+    } else
       gdn_b(l, l - (l + 1) / 4, P);
     if (dbg) {
       h_rms("gpu", l, "attn-x", d_xb + (size_t)(P - 1) * 2560, 2560);
@@ -4902,6 +5060,97 @@ struct GpuModel {
     ple_fl.pool.clear();
   }
 
+  // GDEC_VGDUMP (debug): sync + D2H an arbitrary device buffer, FNV-1a hash.
+  void vg_dump_buf(const char* tag, int P, const void* p, size_t bytes) {
+    if (vg_capturing_ || P < 2 || P > 16 || !getenv("GDEC_VGDUMP")) return;
+    CK(hipStreamSynchronize(g_str));
+    std::vector<uint8_t> h(bytes);
+    CK(hipMemcpy(h.data(), p, bytes, hipMemcpyDeviceToHost));
+    uint64_t fnv = 1469598103934665603ULL;
+    for (uint8_t b : h) { fnv ^= b; fnv *= 1099511628211ULL; }
+    fprintf(stderr, "[%s] P=%d bufhash=%016llx\n", tag, P,
+            (unsigned long long)fnv);
+  }
+
+  // GDEC_VGDUMP (debug): sync + D2H d_Rb rows [0,P), print an FNV-1a hash of
+  // the raw row bytes (bf16 or f32 depending on gr_bf16) — sensitive
+  // round-state comparator for verify-graph bisection.
+  void vg_dump_row(const char* tag, int P, int base) {
+    if (vg_capturing_ || P > 16 || !getenv("GDEC_VGDUMP")) return;
+    CK(hipStreamSynchronize(g_str));
+    const size_t row = (size_t)10240 * (gr_bf16 ? 2 : 4);
+    std::vector<uint8_t> h((size_t)P * row);
+    CK(hipMemcpy(h.data(), (const uint8_t*)d_Rb, (size_t)P * row,
+                 hipMemcpyDeviceToHost));
+    uint64_t fnv = 1469598103934665603ULL;
+    for (uint8_t b : h) { fnv ^= b; fnv *= 1099511628211ULL; }
+    fprintf(stderr, "[%s] P=%d base=%d rowhash=%016llx\n", tag, P, base,
+            (unsigned long long)fnv);
+  }
+
+  // embed all tokens: gather rows then repeat to 4 branches (in-place safe).
+  // src is the H2D source: pageable in direct prefill, the pinned staging
+  // p_vgtok under verify graph capture (P3-B).
+  void enq_embed_body(const int* src, int P) {
+    CK(hipMemcpyAsync(d_tokarr, src, P * 4, hipMemcpyHostToDevice, g_str));
+    WView et = wview(ckpt.at("embed_tokens.weight"));
+    if (gr_bf16)
+      embed_rows(et, d_tokarr, P, d_Rb, 0, true);
+    else {
+      embed_rows(et, d_tokarr, P, d_Rb, 10240);
+      k_repeat4_b<<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(d_Rb, d_Rb, g_cfg.d);
+    }
+    if (!vg_capturing_ && getenv("GDEC_VGDUMP")) {
+      CK(hipStreamSynchronize(g_str));
+      int tk[16] = {};
+      int nd = P < 16 ? P : 16;
+      CK(hipMemcpy(tk, d_tokarr, (size_t)nd * 4, hipMemcpyDeviceToHost));
+      fprintf(stderr, "[vgd] P=%d tok=%d,%d,%d,%d\n", P, tk[0],
+              P > 1 ? tk[1] : -1, P > 2 ? tk[2] : -1, P > 3 ? tk[3] : -1);
+      vg_dump_row("vge", P, -1);
+    }
+  }
+
+  // PLE device phase on a gathered staging buffer: dequant -> conv/ring ->
+  // add. Under verify graph capture (P3-B) the staging-free event is skipped:
+  // the round's closing blocking D2H fences the staging reuse instead.
+  void enq_ple_device_b(int P, int base, int buf) {
+    uint8_t* stg_dev = buf ? ple_eb_dev2 : ple_eb_dev;
+    // dequant staging -> f32 d_eb on GPU (zero-copy read of pinned staging)
+    if (ple_iq4) {
+      size_t nb = (size_t)P * 2560 / 32;
+      k_ple_iq4nl_dequant<<<(unsigned)((nb + 255) / 256), 256, 0, g_str>>>(
+          stg_dev, d_eb, nb);
+    } else {
+      size_t n16 = (size_t)P * 2560 / 16;
+      k_ple_fp8_dequant<<<(unsigned)((n16 + 255) / 256), 256, 0, g_str>>>(
+          stg_dev, d_eb, ple_tscale, n16);
+    }
+    // staging is free once the dequant ran; gates the next gather into buf.
+    if (!vg_capturing_) {
+      CK(hipEventRecord(ple_stg_ev[buf], g_str));
+      ple_stg_ev_ok[buf] = true;
+    }
+    ple_par = buf ^ 1;  // this buffer consumed; the next gather writes the other
+    float* hc_storage = d_Rb;
+    if (gr_bf16) {
+      uint64_t n = (uint64_t)P * 10240;
+      k_bf16_to_f32<<<(unsigned)((n + 255) / 256), 256, 0, g_str>>>(
+          (const uint16_t*)hc_storage, d_Rhatb, n);
+      d_Rb = d_Rhatb;
+    }
+    if (ple_loop)
+      for (int t = 0; t < P; t++) ple_gpu_t(t, base);
+    else
+      ple_gpu_b(P, base);
+    if (gr_bf16) {
+      uint64_t n = (uint64_t)P * 10240;
+      k_f32_to_bf16_v4<<<(unsigned)((n / 4 + 255) / 256), 256, 0, g_str>>>(
+          d_Rb, (uint16_t*)hc_storage, 10240, P, 10240);
+      d_Rb = hc_storage;
+    }
+  }
+
   int prefill_batch(const std::vector<int>& tokens, int base = 0, bool final = true,
                     bool quiet = false) {
     int N = (int)tokens.size();
@@ -5007,15 +5256,7 @@ struct GpuModel {
       for (int t = 0; t < P; t++) chist.push_back(tokens[t]);
     }
     KP("embed_ple");
-    CK(hipMemcpyAsync(d_tokarr, tokens.data(), P * 4, hipMemcpyHostToDevice, g_str));
-    // embed all tokens: gather rows then repeat to 4 branches (in-place safe)
-    WView et = wview(ckpt.at("embed_tokens.weight"));
-    if (gr_bf16)
-      embed_rows(et, d_tokarr, P, d_Rb, 0, true);
-    else {
-      embed_rows(et, d_tokarr, P, d_Rb, 10240);
-      k_repeat4_b<<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(d_Rb, d_Rb, g_cfg.d);
-    }
+    enq_embed_body(tokens.data(), P);
     if (dbg && !gr_bf16)
       h_rms("gpu", -1, "emb", d_Rb + (size_t)(P - 1) * 10240, g_cfg.d);
     // Vision (stage 4): masked_scatter the ViT embeds over this chunk's image
@@ -5038,6 +5279,7 @@ struct GpuModel {
       }
     }
     enq_layer_b(0, P, false, true, base);
+    vg_dump_row("vg0", P, base);
     if (prog_total > 0) prog_probe(0, P);
     phase("embed+L0", TP);
     if (ple_on) {
@@ -5051,39 +5293,9 @@ struct GpuModel {
             std::chrono::duration<double, std::milli>(wait_done - wait_start).count();
       }
       const int buf = ple_fl.buf;
-      uint8_t* stg_dev = buf ? ple_eb_dev2 : ple_eb_dev;
       ple_fl.valid = false;
-      // dequant staging -> f32 d_eb on GPU (zero-copy read of pinned staging)
-      if (ple_iq4) {
-        size_t nb = (size_t)P * 2560 / 32;
-        k_ple_iq4nl_dequant<<<(unsigned)((nb + 255) / 256), 256, 0, g_str>>>(
-            stg_dev, d_eb, nb);
-      } else {
-        size_t n16 = (size_t)P * 2560 / 16;
-        k_ple_fp8_dequant<<<(unsigned)((n16 + 255) / 256), 256, 0, g_str>>>(
-            stg_dev, d_eb, ple_tscale, n16);
-      }
-      // staging is free once the dequant ran; gates the next gather into buf.
-      CK(hipEventRecord(ple_stg_ev[buf], g_str));
-      ple_stg_ev_ok[buf] = true;
-      ple_par = buf ^ 1;  // this buffer consumed; the next gather writes the other
-      float* hc_storage = d_Rb;
-      if (gr_bf16) {
-        uint64_t n = (uint64_t)P * 10240;
-        k_bf16_to_f32<<<(unsigned)((n + 255) / 256), 256, 0, g_str>>>(
-            (const uint16_t*)hc_storage, d_Rhatb, n);
-        d_Rb = d_Rhatb;
-      }
-      if (ple_loop)
-        for (int t = 0; t < P; t++) ple_gpu_t(t, base);
-      else
-        ple_gpu_b(P, base);
-      if (gr_bf16) {
-        uint64_t n = (uint64_t)P * 10240;
-        k_f32_to_bf16_v4<<<(unsigned)((n / 4 + 255) / 256), 256, 0, g_str>>>(
-            d_Rb, (uint16_t*)hc_storage, 10240, P, 10240);
-        d_Rb = hc_storage;
-      }
+      enq_ple_device_b(P, base, buf);
+      vg_dump_row("vgp", P, base);
     }
     phase("ple", TP);
     if (ws_ok_) CK(hipEventRecord(conc_ev_a_, g_str));  // D1b quantum clock
@@ -5091,6 +5303,11 @@ struct GpuModel {
       bool fuse_prev = gr_scatter_norm && l > 1;
       bool flush_mlp = !gr_scatter_norm || l == g_cfg.layers - 1;
       enq_layer_b(l, P, fuse_prev, flush_mlp, base);
+      {
+        char tag[8];
+        snprintf(tag, sizeof tag, "pcL%d", l);
+        vg_dump_row(tag, P, base);
+      }
       if (prog_total > 0) prog_probe(l, P);
       conc_borrow_yield(base, P, l);  // D1b: no-op unless armed and contended
       if (l == 24) phase("L01-24", TP);
@@ -5227,10 +5444,10 @@ struct GpuModel {
       k_acc<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_mh, d_meo, 2560);
       k_repeat4<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_mh, d_mR, g_cfg.d);
     } else {
-      // H-agg=branch: stream[b] = fc_hidden(norm_h[b]) + e (branch identity kept).
-      for (int b = 0; b < 4; b++)
-        gemv(wview(ckpt.at("mtp.fc_hidden.weight")), d_mRhat + (size_t)b * 2560,
-             d_mR + (size_t)b * 2560);
+      // H-agg=branch: stream[b] = fc_hidden(norm_h[b]) + e (branch identity
+      // kept). d_mRhat IS a contiguous [4][2560] batch of branch rows, so
+      // one 4-row gemm streams fc_hidden once instead of once per branch.
+      gemm(wview(ckpt.at("mtp.fc_hidden.weight")), d_mRhat, d_mR, 4, 2560);
       k_acc_broadcast4<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_meo, d_mR, 2560);
     }
   }
@@ -5441,11 +5658,28 @@ struct GpuModel {
       k_repeat4_b<<<(unsigned)(((size_t)P * 2560 + 255) / 256), 256, 0, g_str>>>(
           d_mRb, d_mRb, g_cfg.d);
     } else {
-      for (int b = 0; b < 4; b++) {
-        gemm(wview(ckpt.at("mtp.fc_hidden.weight")), d_mRhatb + (size_t)b * 2560,
-             d_convoutb, P, 10240 /*xstride*/);
-        k_row_branch_copy<<<(unsigned)(((size_t)P * 2560 + 255) / 256), 256, 0,
-                            g_str>>>(d_convoutb, d_mRb, 2560, b);
+      // H-agg=branch, branch-batched: d_mRhatb/d_mRb rows are [p*4+b], so
+      // fc_hidden runs as one R=4P-row pass (chunked <=8-row direct reads for
+      // spec-depth R, a single LT gemm past that) instead of 4 full passes +
+      // 4 row copies.
+      const WView& hw = wview(ckpt.at("mtp.fc_hidden.weight"));
+      const int R = 4 * P;
+      bool done = false;
+      if (R <= 32) {
+        done = true;
+        for (int off = 0; off < R && done; off += 8)
+          done = gemv_multi_q4cp(hw, d_mRhatb + (size_t)off * 2560,
+                                 d_mRb + (size_t)off * 2560,
+                                 std::min(8, R - off), 2560);
+      }
+      if (!done) {
+        // d_xbf16b (BP*6144) overflows past P > 0.6*BP, so convert into the
+        // 10240-wide d_xbf16 ourselves (mtp_gr_read_b pattern).
+        uint64_t tot = (uint64_t)R * 2560;
+        k_f32_to_bf16_v4<<<(unsigned)((tot / 4 + 255) / 256), 256, 0, g_str>>>(
+            d_mRhatb, d_xbf16, 2560, R, 2560);
+        gemm(hw, d_mRhatb, d_mRb, R, 2560, d_xbf16);
+        if (xf16_src == d_xb) xf16_src = nullptr;  // d_xbf16 clobbered
       }
       k_acc_broadcast4<<<(unsigned)(((size_t)P * 2560 + 255) / 256), 256, 0,
                          g_str>>>(d_qnb, d_mRb, 2560);
@@ -6419,9 +6653,11 @@ struct GpuModel {
     while ((int)out.size() < gen) {
       yield_point();  // round top: mtp_pos == pos-1, d_R == h_{pos-1}
       int q = pos - 1;  // trunk processed through q
+      if (d_iraw) vg_dump_buf("irT", 2, d_iraw, 512 * 4);  // P3-B bisect
       int g = std::min(gctl.cur, gen - (int)out.size());
       size_t chist_sz = chist.size();
       mtp_ckpt_save();
+      if (d_iraw) vg_dump_buf("irC", 2, d_iraw, 512 * 4);  // P3-B bisect
       auto t0 = std::chrono::steady_clock::now();
       // draft 1 used the committed (h_q, cur): its indexer ring rows are
       // truth. Later drafts pollute the ring; save/restore around them.
@@ -6441,14 +6677,28 @@ struct GpuModel {
         for (int j = 1; j < g; j++) drafts[j] = mtp_step(d_mR, drafts[j - 1]);
       }
       auto t1 = std::chrono::steady_clock::now();
+      if (d_iraw) vg_dump_buf("irD", 2, d_iraw, 512 * 4);  // P3-B bisect
       std::vector<int> vt;
       vt.reserve(g + 1);
       vt.push_back(cur);
       for (int j = 0; j < g; j++) vt.push_back(drafts[j]);
       spec_snap = true;  // capture per-row rollback snapshots during verify
-      prefill_batch(vt, q + 1, true, true);
-      spec_snap = false;
-      batch_argmax(g + 1, v.data());
+      if (!verify_graph_round_try(vt, q + 1, v.data())) {
+        prefill_batch(vt, q + 1, false, true);
+        spec_snap = false;
+        batch_argmax(g + 1, v.data());
+      } else
+        spec_snap = false;
+      if (getenv("GDEC_VGDUMP")) {  // P3-B bisect: whole-logits round hash
+        CK(hipStreamSynchronize(g_str));
+        const size_t nb = (size_t)(g + 1) * g_cfg.vocab * 4;
+        std::vector<uint8_t> lh(nb);
+        CK(hipMemcpy(lh.data(), d_logits_b, nb, hipMemcpyDeviceToHost));
+        uint64_t fnv = 1469598103934665603ULL;
+        for (uint8_t b : lh) { fnv ^= b; fnv *= 1099511628211ULL; }
+        fprintf(stderr, "[vgl] base=%d logithash=%016llx v=%d,%d,%d,%d\n",
+                q + 1, (unsigned long long)fnv, v[0], v[1], v[2], v[3]);
+      }
       if (!spec_force.empty())  // v[j] predicts out[out.size() + j]
         for (int j = 0; j <= g; j++)
           if (out.size() + j < spec_force.size()) v[j] = spec_force[out.size() + j];
@@ -6551,6 +6801,7 @@ struct GpuModel {
       t_verify += ms(t1, t2);
       t_roll += ms(t3, t4);
       t_ingest += ms(t4, t5);
+      if (d_iraw) vg_dump_buf("irE", 2, d_iraw, 512 * 4);  // P3-B bisect
     }
     double sec =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - T0)
@@ -6818,9 +7069,12 @@ struct GpuModel {
         vt.push_back(cur);
         for (int j = 0; j < g; j++) vt.push_back(drafts[j]);
         spec_snap = true;  // capture per-row rollback snapshots during verify
-        prefill_batch(vt, q + 1, true, true);
-        spec_snap = false;
-        batch_argmax(g + 1, v.data());
+        if (!verify_graph_round_try(vt, q + 1, v.data())) {
+          prefill_batch(vt, q + 1, false, true);
+          spec_snap = false;
+          batch_argmax(g + 1, v.data());
+        } else
+          spec_snap = false;
         verify_ms += elapsed(t0);
         int a = 0;
         while (a < g && drafts[a] == v[a]) a++;
@@ -7769,6 +8023,324 @@ struct GpuModel {
     fprintf(stderr, "decode graphs captured (ple=%d)\n", (int)ple_on);
   }
 
+  // ==================== P3-B: spec-verify segment graphs ====================
+  // One graph set per batch size P (= gamma+1): seg 0 = pinned token upload +
+  // embed + L0 + PLE device phase + L1..L2; then per QSA layer lq an eager
+  // indexer (qsa_idx_b: base-dependent host grids) followed by a captured
+  // segment with lq's layer body and the dense layers up to the next QSA; the
+  // last segment also carries the d_R handoff, the HC mixer read, the batched
+  // lm_head and argmax_rows. Every base-dependent write inside a captured
+  // segment reads *d_vbase (P3-A/P3-B device base), so a replay with a new
+  // base is bit-identical to the eager path: same kernels, same inputs, same
+  // order — only the base scalar moved to device memory. The PLE gather, KV
+  // page backing, indexer and the pos/argmax readback stay eager per round.
+  static constexpr int kVGMaxP = 16;   // graphs for P in [2, 16]
+  static constexpr int kVGMaxSeg = 16; // 1 + layers/4 QSA segments
+  struct VGraph {
+    hipGraphExec_t seg[kVGMaxSeg] = {};
+    int nseg = 0;  // 0 = not built, -1 = capture failed (permanent fallback)
+    // Host-side HC inject-partials pipeline state as the captured sequence
+    // left it after each segment (graph replay runs no host code, so
+    // vgraph_run restores this after each launch; otherwise the eager
+    // inter-segment norm would misjudge have_p and recompute the inject
+    // GEMM — same math, different summation order, different bits).
+    int bnd_injp_cur[kVGMaxSeg] = {};
+    std::string bnd_injp_for[kVGMaxSeg];
+  };
+  VGraph vg_[kVGMaxP - 1];
+  int vg_warm_[kVGMaxP - 1] = {};  // eager rounds per P (descriptor warmup)
+  bool vg_capturing_ = false;      // suppresses capture-illegal side ops
+  int* p_vgtok = nullptr;          // pinned token staging for seg 0's H2D node
+  int* p_vgbase = nullptr;         // pinned base staging for the d_vbase write
+
+  bool vgraph_ok(int P, int base) {
+    static const bool off = env_zero("GDEC_VGRAPH");
+    if (off || !vbase_on()) return false;
+    if ((dbg && !getenv("GDEC_VGRAPH_DBG")) || perf || g_kprof_on)
+      return false;
+    if (P < 2 || P > kVGMaxP || base < 2051 || base + P > maxctx) return false;
+    if (mrope_active_ || cut_abs >= 0 || qsa_dense || qsa_loop || qsa_wmma6)
+      return false;
+    if (ple_on && ple_loop) return false;
+    if (ngram_verify_active || ws_lent_ || prog_total > 0) return false;
+    // graphs bake this slot's pointers (d_ptab, d_R, ...): single-slot only
+    if (nslots > 1) return false;
+    if (injp_cur >= 0 || !hcw_site_.empty()) return false;
+    if (getenv("GDEC_VCT_CHECK") || getenv("GDEC_ATTN_HASH") ||
+        getenv("GDEC_VCT_TAILZERO"))
+      return false;
+    // D1b mid-chunk GPU lending is not part of the graphs (production has
+    // moe_lt on, which already makes the yield a no-op).
+    if (ws_ok_ && borrow_query_fn && !moe_lt && P > conc_rmax_) return false;
+    return true;
+  }
+
+  // Capture the segments for P (kernels do not execute while capturing; the
+  // interleaved eager indexer runs harmlessly on scratch). kv_prepare runs
+  // first so the eager indexer sees a backed page table. On any capture error
+  // the set is discarded and the caller falls back to the eager round.
+  bool vgraph_capture(int P, int base) {
+    VGraph& G = vg_[P - 2];
+    if (!p_vgtok) {
+      if (hipHostMalloc((void**)&p_vgtok, kVGMaxP * 4, hipHostMallocDefault) !=
+              hipSuccess ||
+          hipHostMalloc((void**)&p_vgbase, 4, hipHostMallocDefault) != hipSuccess)
+        return false;
+    }
+    kv_prepare(base, base + P);
+    // The eager boundary ops below (norm + indexer) execute for real during
+    // capture, on stale inputs. Give them the same device base the replay
+    // will use so their pooled-block/ring write footprint matches the
+    // replay's exactly (the replay then rewrites all of it)...
+    set_vbase(base);
+    // ...except the raw indexer ring: its 4 rows are fully overwritten by
+    // the capture-phase indexer, while the replay's pooling reads a history
+    // row (base%4 != 0 straddle) written before this round. Shield it.
+    static float* d_iraw_sav = nullptr;
+    static size_t iraw_sav_sz = 0;
+    const size_t iraw_sz = (size_t)(g_cfg.layers / 4) * 4 * 128 * 4;
+    if (d_iraw) {
+      if (iraw_sav_sz < iraw_sz) {
+        if (d_iraw_sav) (void)hipFree(d_iraw_sav);
+        if (hipMalloc(&d_iraw_sav, iraw_sz) != hipSuccess) return false;
+        iraw_sav_sz = iraw_sz;
+      }
+      CK(hipMemcpyAsync(d_iraw_sav, d_iraw, iraw_sz, hipMemcpyDeviceToDevice,
+                        g_str));
+    }
+    hipStream_t cap = nullptr;
+    if (hipStreamCreate(&cap) != hipSuccess) return false;
+    bool ok = true;
+    hipStream_t save = g_str;
+    g_str = cap;
+    g_kprof_mute = true;
+    vg_capturing_ = true;
+    auto end_seg = [&]() {
+      hipGraph_t gr = nullptr;
+      if (hipStreamEndCapture(cap, &gr) != hipSuccess || !gr) return false;
+      hipGraphExec_t ex = nullptr;
+      const bool iok =
+          hipGraphInstantiate(&ex, gr, nullptr, nullptr, 0) == hipSuccess;
+      (void)hipGraphDestroy(gr);
+      if (!iok) return false;
+      G.seg[G.nseg++] = ex;
+      return true;
+    };
+    if (hipStreamBeginCapture(cap, hipStreamCaptureModeGlobal) != hipSuccess)
+      ok = false;
+    if (ok) {  // seg 0: token upload + embed + L0 + PLE + L1..first QSA-1
+      // GDEC_VGRAPH_NOPLE / GDEC_VGRAPH_NOGDN / GDEC_VGRAPH_NOEMB (debug
+      // bisect): run that part eagerly in vgraph_run instead of capturing it.
+      static const bool s0_ple = !getenv("GDEC_VGRAPH_NOPLE");
+      static const bool s0_gdn = !getenv("GDEC_VGRAPH_NOGDN");
+      static const bool s0_emb = !getenv("GDEC_VGRAPH_NOEMB");
+      if (s0_emb)
+        enq_embed_body(p_vgtok, P);
+      else
+        CK(hipMemcpyAsync(d_tokarr, p_vgtok, P * 4, hipMemcpyHostToDevice,
+                          g_str));
+      if (s0_gdn) enq_layer_b(0, P, false, true, base, d_vbase);
+      if (ple_on && s0_ple) enq_ple_device_b(P, base, 0);
+      if (s0_gdn)
+        for (int l = 1; l < 3 && l < g_cfg.layers; l++) {
+          const bool fuse_prev = gr_scatter_norm && l > 1;
+          const bool flush_mlp = !gr_scatter_norm || l == g_cfg.layers - 1;
+          enq_layer_b(l, P, fuse_prev, flush_mlp, base, d_vbase);
+        }
+      ok = end_seg();
+      if (ok) {  // host-side injp pipeline state this segment's capture left
+        G.bnd_injp_cur[G.nseg - 1] = injp_cur;
+        G.bnd_injp_for[G.nseg - 1] = injp_for;
+      }
+    }
+    // GDEC_VGRAPH_SEGS=k (debug bisect): capture only the first k segments;
+    // vgraph_run finishes the remaining layers eagerly (host base).
+    static const int seg_limit =
+        getenv("GDEC_VGRAPH_SEGS") ? atoi(getenv("GDEC_VGRAPH_SEGS")) : 999;
+    for (int lq = 3; ok && lq < g_cfg.layers && G.nseg < seg_limit; lq += 4) {
+      // The indexer reads d_xb, written by the layer's attention norm: run
+      // the norm eagerly too, ahead of the indexer, outside the graph.
+      enq_layer_norm_b(lq, P, gr_scatter_norm && lq > 1);
+      qsa_idx_b(lq, lq / 4, P, base);
+      if (hipStreamBeginCapture(cap, hipStreamCaptureModeGlobal) != hipSuccess) {
+        ok = false;
+        break;
+      }
+      const int lend = std::min(lq + 4, (int)g_cfg.layers);
+      for (int l = lq; l < lend; l++) {
+        const bool fuse_prev = gr_scatter_norm && l > 1;
+        const bool flush_mlp = !gr_scatter_norm || l == g_cfg.layers - 1;
+        enq_layer_b(l, P, fuse_prev, flush_mlp, base, d_vbase, l == lq);
+      }
+      if (lend == g_cfg.layers) {  // final segment: handoff + logits + argmax
+        if (gr_bf16)
+          k_bf16_to_f32<<<(10240 + 255) / 256, 256, 0, cap>>>(
+              (const uint16_t*)d_Rb + (size_t)(P - 1) * 10240, d_R, 10240);
+        else
+          CK(hipMemcpyAsync(d_R, d_Rb + (size_t)(P - 1) * 10240, 10240 * 4,
+                            hipMemcpyDeviceToDevice, cap));
+        batch_logits_device(P);
+        argmax_rows(d_logits_b, g_cfg.vocab, P, d_amx_cand, d_argmax_arr, cap);
+      }
+      ok = end_seg();
+      if (ok) {  // host-side injp pipeline state this segment's capture left
+        G.bnd_injp_cur[G.nseg - 1] = injp_cur;
+        G.bnd_injp_for[G.nseg - 1] = injp_for;
+      }
+    }
+    g_str = save;
+    g_kprof_mute = false;
+    vg_capturing_ = false;
+    // capture-phase eager boundary writes landed on cap; order the restore
+    (void)hipStreamSynchronize(cap);
+    (void)hipStreamDestroy(cap);
+    if (d_iraw && iraw_sav_sz)
+      CK(hipMemcpyAsync(d_iraw, d_iraw_sav, iraw_sav_sz, hipMemcpyDeviceToDevice,
+                        g_str));
+    if (!ok || G.nseg == 0) {
+      for (int s = 0; s < G.nseg; s++) (void)hipGraphExecDestroy(G.seg[s]);
+      G.nseg = 0;
+      (void)hipGetLastError();  // clear any capture error
+      return false;
+    }
+    return true;
+  }
+
+  // One spec-verify round on the graphs: eager head (page backing, device
+  // base, PLE gather, token staging), segment replays interleaved with the
+  // eager per-QSA-layer indexer, eager tail (position mirrors + blocking
+  // argmax readback). Matches prefill_batch(final=false) + batch_argmax.
+  void vgraph_run(const std::vector<int>& tokens, int base, int* vout) {
+    const int P = (int)tokens.size();
+    VGraph& G = vg_[P - 2];
+    if (d_iraw) vg_dump_buf("irH0", 2, d_iraw, 512 * 4);  // P3-B bisect
+    kv_prepare(base, base + P);
+    *p_vgbase = base;
+    CK(hipMemcpyAsync(d_vbase, p_vgbase, 4, hipMemcpyHostToDevice, g_str));
+    xf16_src = nullptr;  // a new batch invalidates the bf16 conversion cache
+    if (ple_on) {
+      if (ple_fl.valid) {  // stale flight for another chunk: finish and drop
+        ple_join();
+        ple_fl.valid = false;
+      }
+      const int64_t pre0 = chist.empty() ? pad_id : chist.back();
+      const int64_t pre1 = chist.size() < 2 ? pad_id : chist[chist.size() - 2];
+      // fixed staging buffer 0: seg 0's dequant reads ple_eb_dev
+      ple_spawn(std::vector<int>(tokens), base, pre0, pre1, (uint8_t*)ple_eb, 0);
+      for (int t : tokens) chist.push_back(t);
+      ple_join();
+      ple_fl.valid = false;
+      // mirror the host-side buffer flip enq_ple_device_b does outside
+      // capture: replay consumed staging buffer 0, the next gather writes 1
+      ple_par = 1;
+    }
+    memcpy(p_vgtok, tokens.data(), P * 4);
+    if (d_iraw) vg_dump_buf("irH1", 2, d_iraw, 512 * 4);  // P3-B bisect
+    CK(hipGraphLaunch(G.seg[0], g_str));
+    // Graph replay runs no host code: restore the HC inject-partials pipeline
+    // state the capture left after this segment, so the eager code below
+    // branches exactly as the fully-eager reference would.
+    injp_cur = G.bnd_injp_cur[0];
+    injp_for = G.bnd_injp_for[0];
+    if (d_iraw) vg_dump_buf("irH2", 2, d_iraw, 512 * 4);  // P3-B bisect
+    if (getenv("GDEC_VGDUMP")) {
+      CK(hipStreamSynchronize(g_str));
+      int tk[16] = {};
+      int nd = P < 16 ? P : 16;
+      CK(hipMemcpy(tk, d_tokarr, (size_t)nd * 4, hipMemcpyDeviceToHost));
+      fprintf(stderr, "[vgr] P=%d base=%d tok=%d,%d,%d,%d\n", P, base, tk[0],
+              P > 1 ? tk[1] : -1, P > 2 ? tk[2] : -1, P > 3 ? tk[3] : -1);
+      vg_dump_row("vgs", P, base);
+    }
+    {  // eager fallback for parts excluded from seg 0 (bisect envs)
+      static const bool s0_ple = !getenv("GDEC_VGRAPH_NOPLE");
+      static const bool s0_gdn = !getenv("GDEC_VGRAPH_NOGDN");
+      static const bool s0_emb = !getenv("GDEC_VGRAPH_NOEMB");
+      if (!s0_emb) enq_embed_body(tokens.data(), P);  // H2D repeats, same value
+      if (!s0_gdn) enq_layer_b(0, P, false, true, base);
+      if (ple_on && !s0_ple) enq_ple_device_b(P, base, 0);
+      if (!s0_gdn)
+        for (int l = 1; l < 3 && l < g_cfg.layers; l++) {
+          const bool fuse_prev = gr_scatter_norm && l > 1;
+          const bool flush_mlp = !gr_scatter_norm || l == g_cfg.layers - 1;
+          enq_layer_b(l, P, fuse_prev, flush_mlp, base);
+        }
+    }
+    int s = 1, lq = 3;
+    for (; lq < g_cfg.layers && s < G.nseg; lq += 4) {
+      enq_layer_norm_b(lq, P, gr_scatter_norm && lq > 1);
+      qsa_idx_b(lq, lq / 4, P, base);
+      CK(hipGraphLaunch(G.seg[s], g_str));
+      injp_cur = G.bnd_injp_cur[s];  // see the restore after seg[0]
+      injp_for = G.bnd_injp_for[s];
+      s++;
+      if (getenv("GDEC_VGDUMP")) {
+        char tag[8];
+        snprintf(tag, sizeof tag, "vgS%d", s - 1);
+        vg_dump_row(tag, P, base);
+      }
+    }
+    if (lq < g_cfg.layers) {  // GDEC_VGRAPH_SEGS bisect: eager remainder
+      for (int l = lq; l < g_cfg.layers; l++) {
+        if (is_qsa(l)) {
+          enq_layer_norm_b(l, P, gr_scatter_norm && l > 1);
+          qsa_idx_b(l, l / 4, P, base);
+        }
+        const bool fuse_prev = gr_scatter_norm && l > 1;
+        const bool flush_mlp = !gr_scatter_norm || l == g_cfg.layers - 1;
+        enq_layer_b(l, P, fuse_prev, flush_mlp, base, nullptr, is_qsa(l));
+        {
+          char tag[8];
+          snprintf(tag, sizeof tag, "rL%d", l);
+          vg_dump_row(tag, P, base);
+        }
+      }
+      if (gr_bf16)
+        k_bf16_to_f32<<<(10240 + 255) / 256, 256, 0, g_str>>>(
+            (const uint16_t*)d_Rb + (size_t)(P - 1) * 10240, d_R, 10240);
+      else
+        CK(hipMemcpyAsync(d_R, d_Rb + (size_t)(P - 1) * 10240, 10240 * 4,
+                          hipMemcpyDeviceToDevice, g_str));
+      batch_logits_device(P);
+      argmax_rows(d_logits_b, g_cfg.vocab, P, d_amx_cand, d_argmax_arr, g_str);
+    }
+    pos = base + P;
+    ple_ringpos = (base + P) % 9;
+    CK(hipMemcpyAsync(d_pos, &pos, 4, hipMemcpyHostToDevice, g_str));
+    CK(hipMemcpyAsync(d_ringpos, &ple_ringpos, 4, hipMemcpyHostToDevice, g_str));
+    CK(hipMemcpy(vout, d_argmax_arr, (size_t)P * 4, hipMemcpyDeviceToHost));
+  }
+
+  // verify_graph_round_try: graph fast path for MTP verify; false -> caller
+  // runs the legacy eager sequence. The first qualifying round per P stays
+  // eager (warms the P-shaped GEMM/LT descriptors), the second captures.
+  bool verify_graph_round_try(const std::vector<int>& tokens, int base,
+                              int* vout) {
+    const int P = (int)tokens.size();
+    if (!vgraph_ok(P, base)) return false;
+    VGraph& G = vg_[P - 2];
+    if (G.nseg < 0) return false;
+    if (!G.nseg) {
+      if (vg_warm_[P - 2]++ < 1) return false;
+      if (!vgraph_capture(P, base)) {
+        G.nseg = -1;
+        fprintf(stderr, "verify graphs: capture failed for P=%d, staying eager\n",
+                P);
+        return false;
+      }
+      fprintf(stderr, "verify graphs captured (P=%d, %d segments)\n", P, G.nseg);
+      // GDEC_VGRAPH_NOLAUNCH (debug): capture once, then stay eager forever —
+      // isolates capture-time side effects from replay effects.
+      if (getenv("GDEC_VGRAPH_NOLAUNCH")) {
+        for (int s = 0; s < G.nseg; s++) (void)hipGraphExecDestroy(G.seg[s]);
+        G.nseg = -1;
+        return false;
+      }
+    }
+    vgraph_run(tokens, base, vout);
+    return true;
+  }
+
   // ---- Sequence slots (concurrent serve, GDEC_PARALLEL) ----
   // Everything one sequence carries from step to step: host mirrors, GDN /
   // conv / PLE ring / indexer ring state, the page table (the KV pages live
@@ -8268,12 +8840,16 @@ __global__ void k_qsa_qsplit(const float* __restrict__ qg, const float* __restri
 // identical to k_rope_b) + optional bf16 store into the compact KV cache
 // (same f2bf as k_f32_to_bf16_v4). Bit-exact vs the rmsnorm + k_rope_b
 // [+ k_f32_to_bf16_v4] sequence.
-// grid = dim3(2, P); kc (when Bf16) already includes the base*512 offset.
+// grid = dim3(2, P); kc (when Bf16) already includes the base*512 offset —
+// or, with dvb set (P3-B graph capture), kc is the layer base and the kernel
+// adds (*dvb)*512 itself.
 template <bool Bf16>
 __global__ void k_qsa_kprep(const float* __restrict__ kb, const float* __restrict__ knw,
                             float* __restrict__ kout, uint16_t* __restrict__ kc,
                             float eps, int rope_base,
-                            const float2* __restrict__ ropecs) {
+                            const float2* __restrict__ ropecs,
+                            const int* __restrict__ dvb) {
+  if (Bf16 && dvb) kc += (size_t)(*dvb) * 512;
   int h = blockIdx.x;
   int t = threadIdx.x;
   const float* xg = kb + ((size_t)blockIdx.y * 2 + h) * 256;
