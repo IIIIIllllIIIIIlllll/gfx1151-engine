@@ -16,6 +16,10 @@
 // 底部按钮行（启动服务 / 仅保存 / 取消）在所有页之外，恒可见。
 // "启动服务" 仅在所有页无 [失败] 且所选权重为 V1/V2 时可用。
 //
+// 左侧立绘条：media/qwen-charactor-alpha.png 加载成功时窗口左侧加宽
+// g_art_w（210px），所有控件经 add_ctrl 统一右移，WM_PAINT 里 GDI+ 绘制
+// （PNG alpha 合成，底部对齐）；图片缺失时 g_art_w=0，退回经典紧凑布局。
+//
 // 依赖 launch_win.cpp 中已定义的：g_root、g_conf、load_conf()、cfg()、
 // cfg_optional()、to_w()、msgbox()、file_exists()、dir_exists()、same_file()、
 // port_free()、engine_net::address()（launch_win.cpp 已 include engine_net.h）。
@@ -998,8 +1002,11 @@ bool g_pool_touched = false;        // 用户手动改过并发总池框（false
 bool g_pool_guard = false;          // 程序自己在写总池框（防 EN_CHANGE 误置 touched）
 AllChecks g_last_checks;
 std::vector<HWND> g_page_ctls[4];   // 每页的控件句柄（切页时整体 ShowWindow）
+Gdiplus::Image* g_art = nullptr;    // 左侧立绘（media/qwen-charactor-alpha.png）
+int g_art_w = 0;                    // 立绘条宽度；图片缺失时为 0，退回经典紧凑布局
 
-// 布局常量：客户区 644×504，内容右缘 636。
+// 布局常量：内容区 644×504（立绘加载成功时窗口左侧再加 g_art_w 宽的立绘条，
+// 所有控件经 add_ctrl 统一右移），内容右缘 636。
 // label 列要装下 "单请求上限 (token)"（高 DPI 下约 185px），故 kLblW=190。
 const int kCliW = 644, kCliH = 504;
 const int kLblX = 12, kLblW = 190, kEdX = 202;
@@ -1011,8 +1018,8 @@ const int kListBottom = 452;          // 各页检查区下缘（底部按钮行
 
 HWND add_ctrl(HWND parent, const wchar_t* cls, DWORD style, int x, int y, int w, int h,
               const wchar_t* text, int id) {
-    HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, parent,
-                             reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+    HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, x + g_art_w, y, w, h,
+                             parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                              GetModuleHandleW(nullptr), nullptr);
     SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
     return c;
@@ -1175,12 +1182,12 @@ bool panel_browse(HWND edit) {
 // 把一个文件行排到指定 y（SWP_SHOWWINDOW），或整行隐藏
 void place_row(const FileRow& r, int y, bool visible) {
     const UINT flags = SWP_NOZORDER | (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW);
-    const int ex = r.off ? kEdX + kOffW + 8 : kEdX;
-    const int ew = 556 - ex;
-    SetWindowPos(r.label, nullptr, kLblX, y + 3, kLblW, 18, flags);
-    if (r.off) SetWindowPos(r.off, nullptr, kEdX, y, kOffW, 20, flags);
+    const int ex = (r.off ? kEdX + kOffW + 8 : kEdX) + g_art_w;
+    const int ew = 556 + g_art_w - ex;
+    SetWindowPos(r.label, nullptr, kLblX + g_art_w, y + 3, kLblW, 18, flags);
+    if (r.off) SetWindowPos(r.off, nullptr, kEdX + g_art_w, y, kOffW, 20, flags);
     SetWindowPos(r.edit, nullptr, ex, y, ew, 22, flags);
-    if (r.browse) SetWindowPos(r.browse, nullptr, kBrX, y - 1, kBrW, 24, flags);
+    if (r.browse) SetWindowPos(r.browse, nullptr, kBrX + g_art_w, y - 1, kBrW, 24, flags);
 }
 
 // 第 1 页布局：按版本只显示相关文件行，顺序重排，隐藏其余
@@ -1220,8 +1227,8 @@ void layout_page1(int ver) {
             if (order[i] == r) shown = true;
         if (!shown) place_row(*r, 0, false);
     }
-    SetWindowPos(g_pc.tok_hint, nullptr, kEdX, y + 2, 434, 18, SWP_NOZORDER | SWP_SHOWWINDOW);
-    SetWindowPos(g_pc.ver_note, nullptr, kEdX, y + 24, 434, 18, SWP_NOZORDER | SWP_SHOWWINDOW);
+    SetWindowPos(g_pc.tok_hint, nullptr, kEdX + g_art_w, y + 2, 434, 18, SWP_NOZORDER | SWP_SHOWWINDOW);
+    SetWindowPos(g_pc.ver_note, nullptr, kEdX + g_art_w, y + 24, 434, 18, SWP_NOZORDER | SWP_SHOWWINDOW);
     SetWindowTextW(g_pc.ver_note, ver == kVerGguf
                                       ? TR(L"GGUF：仅保存配置，启动需 Linux bash start_gguf.sh",
                                            L"GGUF: config saved only; start on Linux via bash start_gguf.sh")
@@ -1238,7 +1245,55 @@ void show_page(int idx) {
     if (idx == 0) layout_page1(g_weights_ver);  // 重新隐藏非当前版本的文件行
 }
 
+// 立绘加载：GDI+ 惰性初始化（进程一次）。图片缺失时 g_art_w=0，
+// 窗口退回经典 644 宽紧凑布局，功能不受影响。
+void load_panel_art() {
+    static ULONG_PTR gdip_token = 0;
+    if (!gdip_token) {
+        Gdiplus::GdiplusStartupInput input;
+        if (Gdiplus::GdiplusStartup(&gdip_token, &input, nullptr) != Gdiplus::Ok) return;
+    }
+    delete g_art;
+    g_art = Gdiplus::Image::FromFile(to_w(g_root + "\\media\\qwen-charactor-alpha.png").c_str());
+    if (g_art && g_art->GetLastStatus() == Gdiplus::Ok) {
+        g_art_w = 210;
+    } else {
+        delete g_art;
+        g_art = nullptr;
+        g_art_w = 0;
+    }
+}
+
 LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_ERASEBKGND && g_art_w > 0) {
+        // 只擦控件区；立绘条由 WM_PAINT 完整重绘，避免切版本/翻页时闪烁
+        HDC dc = reinterpret_cast<HDC>(wp);
+        RECT rc;
+        GetClientRect(h, &rc);
+        RECT r{g_art_w, 0, rc.right, rc.bottom};
+        FillRect(dc, &r, GetSysColorBrush(COLOR_BTNFACE));
+        return 1;
+    }
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        if (g_art && g_art_w > 0) {
+            Gdiplus::Graphics g(dc);
+            g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+            Gdiplus::SolidBrush bg(Gdiplus::Color(255, 255, 255, 255));
+            g.FillRectangle(&bg, 0, 0, g_art_w, kCliH);
+            const int iw = static_cast<int>(g_art->GetWidth()),
+                      ih = static_cast<int>(g_art->GetHeight());
+            int dw = g_art_w - 8, dh = static_cast<int>((double)dw * ih / iw);
+            if (dh > kCliH) {  // 超高则按高度等比收
+                dh = kCliH;
+                dw = static_cast<int>((double)dh * iw / ih);
+            }
+            g.DrawImage(g_art, (g_art_w - dw) / 2, kCliH - dh, dw, dh);  // 底部对齐
+        }
+        EndPaint(h, &ps);
+        return 0;
+    }
     if (msg == WM_COMMAND) {
         const UINT id = LOWORD(wp), code = HIWORD(wp);
         // 编辑框输入 / 下拉选择变化 → 即时重检（各页列表独立刷新）
@@ -1425,7 +1480,8 @@ PanelResult panel_run(bool allow_start) {
         RegisterClassW(&wc);
         registered = true;
     }
-    RECT rc{0, 0, kCliW, kCliH};
+    load_panel_art();  // 决定 g_art_w，窗口宽度随之确定
+    RECT rc{0, 0, kCliW + g_art_w, kCliH};
     AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
     const int win_w = rc.right - rc.left, win_h = rc.bottom - rc.top;
     RECT work{};
