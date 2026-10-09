@@ -15,6 +15,7 @@
 #include <atomic>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -297,7 +298,7 @@ class TokenCache {
     }
 
     // Persistence (GDEC_API_TOKCACHE_FILE, default data/tcache.bin, "" = off).
-    // Layout, little-endian: magic "GDTC1\0\0\0" | u32 version(1) | u32 vocab
+    // Layout, little-endian: magic "GDTC1\0\0\0" | u32 version(2) | u32 vocab
     // | u64 count | per entry u64 n_ids + n_ids*i32. Byte offsets and pad runs
     // are rebuilt from the ids at load, so the only compatibility guard is the
     // vocab size. Written tmp+rename; a torn file just means an empty cache.
@@ -316,7 +317,7 @@ class TokenCache {
         FILE* f = fopen(tmp.c_str(), "wb");
         if (!f) return;
         const char magic[8] = "GDTC1";
-        const uint32_t ver = 1, vocab = (uint32_t)g_tok.vocab_size();
+        const uint32_t ver = 2, vocab = (uint32_t)g_tok.vocab_size();
         const uint64_t count = snap.size();
         bool ok = fwrite(magic, 1, 8, f) == 8 && fwrite(&ver, 4, 1, f) == 1 &&
                   fwrite(&vocab, 4, 1, f) == 1 && fwrite(&count, 8, 1, f) == 1;
@@ -344,7 +345,7 @@ class TokenCache {
         uint32_t ver = 0, vocab = 0;
         uint64_t count = 0;
         bool ok = fread(magic, 1, 8, f) == 8 && !memcmp(magic, "GDTC1\0\0\0", 8) &&
-                  fread(&ver, 4, 1, f) == 1 && ver == 1 &&
+                  fread(&ver, 4, 1, f) == 1 && ver == 2 &&
                   fread(&vocab, 4, 1, f) == 1 && (int)vocab == g_tok.vocab_size() &&
                   fread(&count, 8, 1, f) == 1 && count <= kMaxEntries * 4;
         size_t entries = 0, tokens = 0;
@@ -1068,16 +1069,28 @@ bool stream_wants_usage(const json& body) {
 const json* normalize_reasoning_effort(const json* value, json* storage) {
     if (value == nullptr || value->is_null()) return nullptr;
     if (!value->is_string()) http::fail(400, "reasoning_effort must be a string");
-    const std::string& effort = value->get_ref<const std::string&>();
-    if (effort == "high" || effort == "max" || effort == "ultra") {
+    std::string effort = value->get_ref<const std::string&>();
+    std::transform(effort.begin(), effort.end(), effort.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (effort == "high" || effort == "max" || effort == "ultra" ||
+        effort == "ultracode" || effort == "extreme") {
         *storage = "xhigh";
         return storage;
     }
-    if (effort == "none" || effort == "minimal") {
+    if (effort == "none" || effort == "off") {
+        *storage = effort;
+        return storage;
+    }
+    if (effort == "minimal") {
         *storage = "low";
         return storage;
     }
-    return value;
+    if (effort == "low" || effort == "medium" || effort == "xhigh") {
+        *storage = effort;
+        return storage;
+    }
+    http::fail(400, "unsupported reasoning_effort: " + effort);
+    return nullptr;
 }
 
 // ------------------------------------------------------- server overrides --
@@ -1098,6 +1111,8 @@ struct OverrideField {
 const OverrideField kOverrideFields[] = {
     {"enable_thinking", 'b', 0, 0},
     {"preserve_thinking", 'b', 0, 0},
+    {"preserve_reasoning", 'b', 0, 0},
+    {"auto_disable_thinking_with_tools", 'b', 0, 0},
     {"reasoning_effort", 'e', 0, 0},
     {"temperature", 'n', 0.0, 2.0},
     {"top_p", 'n', 0.0, 1.0},
@@ -1138,8 +1153,8 @@ json validate_overrides(const json& in) {
             json storage;
             const json* n = normalize_reasoning_effort(&v, &storage);
             const std::string s = n->get<std::string>();
-            if (s != "xhigh" && s != "medium" && s != "low")
-                http::fail(400, k + " must be one of xhigh, high, medium, low, minimal");
+            if (s != "xhigh" && s != "medium" && s != "low" && s != "none" && s != "off")
+                http::fail(400, k + " must be one of none, off, xhigh, high, medium, low, minimal");
             v = s;
         } else {
             const bool ok = f->kind == 'i' ? (v.is_number_integer() || v.is_number_unsigned())
@@ -1213,7 +1228,8 @@ void apply_overrides(json* body, Api api, http::Response* r) {
     for (auto it = table.begin(); it != table.end(); ++it) {
         const std::string& k = it.key();
         const json& e = it.value();
-        if (k == "enable_thinking" || k == "preserve_thinking") {
+        if (k == "enable_thinking" || k == "preserve_thinking" ||
+            k == "preserve_reasoning" || k == "auto_disable_thinking_with_tools") {
             if (api != Api::Completions) put(*body, k.c_str(), e, k);
         } else if (k == "reasoning_effort") {
             if (api == Api::Chat) {
@@ -1944,7 +1960,9 @@ void handle_health(const http::Request&, http::Response* r, http::Stream*) {
                    {"video", false},
                    {"runtime", "native-cpp"}};
     j["supported"] = json::array(
-        {"reasoning_effort", "enable_thinking", "preserve_thinking", "stop",
+        {"reasoning_effort", "enable_thinking", "preserve_thinking", "preserve_reasoning",
+         "auto_disable_thinking_with_tools", "tool_call_format", "max_tool_arg_chars",
+         "max_tool_response_chars", "stop",
          "max_tokens", "max_completion_tokens", "max_output_tokens", "stream",
          "seed", "temperature", "top_p", "top_k", "min_p", "presence_penalty",
          "frequency_penalty", "logit_bias", "logprobs", "tools", "tool_choice",
@@ -1961,7 +1979,8 @@ void handle_health(const http::Request&, http::Response* r, http::Stream*) {
                                      "logit_bias", "logprobs"})}};
     j["max_tokens_cap"] = nullptr;
     j["reasoning_effort_values"] =
-        json::array({"high", "low", "medium", "minimal", "xhigh"});
+        json::array({"none", "off", "minimal", "low", "medium", "high", "xhigh",
+                     "max", "ultracode", "extreme"});
     {
         std::lock_guard<std::mutex> lk(g_ovr_mtx);
         j["server_overrides"] = g_overrides;
@@ -2059,7 +2078,18 @@ void split_reasoning(const std::string& text, bool thinking_enabled,
         *content = text;
         return;
     }
-    const size_t at = text.find("</think>");
+    struct Marker { const char* close; size_t length; };
+    static constexpr Marker markers[] = {{"</think>", 8}, {"</thinking>", 11},
+                                         {"</ think>", 9}, {"</think >", 9}};
+    size_t at = std::string::npos;
+    const Marker* hit = nullptr;
+    for (const auto& marker : markers) {
+        const size_t found = text.find(marker.close);
+        if (found != std::string::npos && (at == std::string::npos || found < at)) {
+            at = found;
+            hit = &marker;
+        }
+    }
     if (at == std::string::npos) {
         *reasoning = text;
         content->clear();
@@ -2067,8 +2097,12 @@ void split_reasoning(const std::string& text, bool thinking_enabled,
         return;
     }
     *reasoning = text.substr(0, at);
+    const size_t open = reasoning->find("<think>");
+    const size_t open_alt = reasoning->find("<thinking>");
+    if (open != std::string::npos) *reasoning = reasoning->substr(open + 7);
+    else if (open_alt != std::string::npos) *reasoning = reasoning->substr(open_alt + 10);
     while (!reasoning->empty() && reasoning->back() == '\n') reasoning->pop_back();
-    *content = text.substr(at + 8);
+    *content = text.substr(at + hit->length);
     while (!content->empty() && (*content)[0] == '\n') content->erase(0, 1);
 }
 
@@ -2089,7 +2123,13 @@ class ThinkSplitter {
               std::string* content_out) {
         buf_ += piece;
         if (!split_) {
-            const size_t at = buf_.find(kMarker);
+            size_t at = buf_.find(kMarker);
+            size_t marker_len = kMarkerLen;
+            const size_t alt = buf_.find("</thinking>");
+            if (alt != std::string::npos && (at == std::string::npos || alt < at)) {
+                at = alt;
+                marker_len = 11;
+            }
             if (at == std::string::npos) {
                 // Hold back len(marker)-1 bytes in case the marker straddles
                 // this piece and the next one, then snap that window to a
@@ -2120,7 +2160,7 @@ class ThinkSplitter {
             split_ = true;
             r_end_ = at;
             while (r_end_ > 0 && buf_[r_end_ - 1] == '\n') --r_end_;
-            cpos_ = at + kMarkerLen;
+            cpos_ = at + marker_len;
         }
         if (rpos_ < r_end_) {
             *reasoning_out = buf_.substr(rpos_, r_end_ - rpos_);
@@ -2134,7 +2174,7 @@ class ThinkSplitter {
         // content starts, or the streamed text would keep a leading "\n\n"
         // that the non-streaming path strips.
         if (!content_started_) {
-            while (cpos_ < buf_.size() && buf_[cpos_] == '\n') ++cpos_;
+            while (cpos_ < buf_.size() && (buf_[cpos_] == '\n' || buf_[cpos_] == '\r')) ++cpos_;
             if (cpos_ < buf_.size()) content_started_ = true;
         }
         if (content_started_ && buf_.size() > cpos_) {
@@ -2245,17 +2285,49 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
             normalize_reasoning_effort(&body["reasoning_effort"], &normalized_effort);
     require_optional_boolean(body, "enable_thinking");
     require_optional_boolean(body, "preserve_thinking");
+    require_optional_boolean(body, "preserve_reasoning");
+    require_optional_boolean(body, "auto_disable_thinking_with_tools");
     require_optional_boolean(body, "add_vision_id");
-    const bool thinking_enabled = bool_field(body, "enable_thinking", true);
+    bool thinking_enabled = !body.contains("enable_thinking") ||
+                             body["enable_thinking"].is_null() ||
+                             body["enable_thinking"].get<bool>();
+    if (opts.reasoning_effort != nullptr && opts.reasoning_effort->is_string() &&
+        (opts.reasoning_effort->get<std::string>() == "none" ||
+         opts.reasoning_effort->get<std::string>() == "off"))
+        thinking_enabled = false;
     if (body.contains("enable_thinking") && !body["enable_thinking"].is_null())
         opts.enable_thinking = &body["enable_thinking"];
     if (body.contains("preserve_thinking") && !body["preserve_thinking"].is_null())
         opts.preserve_thinking = &body["preserve_thinking"];
+    if (body.contains("preserve_reasoning") && !body["preserve_reasoning"].is_null())
+        opts.preserve_reasoning = &body["preserve_reasoning"];
+    if (body.contains("auto_disable_thinking_with_tools"))
+        opts.auto_disable_thinking_with_tools = &body["auto_disable_thinking_with_tools"];
+    std::string tool_format = "xml";
+    if (body.contains("tool_call_format")) {
+        if (!body["tool_call_format"].is_string() ||
+            (body["tool_call_format"] != "xml" && body["tool_call_format"] != "json"))
+            http::fail(400, "tool_call_format must be 'xml' or 'json'");
+        tool_format = body["tool_call_format"].get<std::string>();
+        opts.tool_call_format = &body["tool_call_format"];
+    }
+    if (body.contains("max_tool_arg_chars")) {
+        if (!body["max_tool_arg_chars"].is_number_integer() &&
+            !body["max_tool_arg_chars"].is_number_unsigned())
+            http::fail(400, "max_tool_arg_chars must be a non-negative integer");
+        opts.max_tool_arg_chars = &body["max_tool_arg_chars"];
+    }
+    if (body.contains("max_tool_response_chars")) {
+        if (!body["max_tool_response_chars"].is_number_integer() &&
+            !body["max_tool_response_chars"].is_number_unsigned())
+            http::fail(400, "max_tool_response_chars must be a non-negative integer");
+        opts.max_tool_response_chars = &body["max_tool_response_chars"];
+    }
     if (body.contains("add_vision_id")) opts.add_vision_id = &body["add_vision_id"];
 
     chat_template::RenderResult rr = chat_template::render_chat_template(&messages, opts);
     if (!rr.ok) http::fail(400, rr.error);
-    rr.text += tool_setup.choice.prompt_suffix(thinking_enabled);
+    rr.text += tool_setup.choice.prompt_suffix(thinking_enabled, tool_format);
 
     GenSpec spec;
     std::vector<size_t> starts;
@@ -2303,8 +2375,9 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
         else
             split_reasoning(o.text, thinking_enabled, &reasoning, &answer);
         toolparse::StreamParser parser(
-            tool_setup.tools, []() { return make_id("call_"); }, tool_setup.enabled());
-        parser.feed(tool_setup.choice.parser_prefix());
+            tool_setup.tools, []() { return make_id("call_"); }, tool_setup.enabled(), tool_format,
+        tool_setup.choice.name);
+        parser.feed(tool_setup.choice.parser_prefix(tool_format));
         parser.feed(answer);
         parser.finish();
         json msg;
@@ -2339,7 +2412,8 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
     r->sse = true;
     ThinkSplitter splitter(thinking_enabled);
     toolparse::StreamParser parser(
-        tool_setup.tools, []() { return make_id("call_"); }, tool_setup.enabled());
+        tool_setup.tools, []() { return make_id("call_"); }, tool_setup.enabled(), tool_format,
+        tool_setup.choice.name);
     auto dispatch_tool_events = [&](const std::vector<toolparse::Event>& events) {
         for (const auto& event : events) {
             if (event.type == toolparse::EventType::Content) {
@@ -2364,7 +2438,7 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
         }
         return true;
     };
-    if (!dispatch_tool_events(parser.feed(tool_setup.choice.parser_prefix()))) return;
+    if (!dispatch_tool_events(parser.feed(tool_setup.choice.parser_prefix(tool_format)))) return;
     auto on_wait = [&]() {
         if (st->disconnected()) return false;
         return send_frame(st, text_chunk("content", ""));
@@ -2423,7 +2497,9 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
     const bool parallel_tool_calls = bool_field(body, "parallel_tool_calls", true);
     require_optional_boolean(body, "enable_thinking");
     require_optional_boolean(body, "preserve_thinking");
-    const bool thinking_enabled = bool_field(body, "enable_thinking", true);
+    bool thinking_enabled = !body.contains("enable_thinking") ||
+                             body["enable_thinking"].is_null() ||
+                             body["enable_thinking"].get<bool>();
 
     ToolSetup tool_setup = parse_tool_setup(body);
     chat_template::Options opts;
@@ -2434,6 +2510,32 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
         opts.enable_thinking = &body["enable_thinking"];
     if (body.contains("preserve_thinking") && !body["preserve_thinking"].is_null())
         opts.preserve_thinking = &body["preserve_thinking"];
+    require_optional_boolean(body, "preserve_reasoning");
+    require_optional_boolean(body, "auto_disable_thinking_with_tools");
+    if (body.contains("preserve_reasoning") && !body["preserve_reasoning"].is_null())
+        opts.preserve_reasoning = &body["preserve_reasoning"];
+    if (body.contains("auto_disable_thinking_with_tools"))
+        opts.auto_disable_thinking_with_tools = &body["auto_disable_thinking_with_tools"];
+    std::string tool_format = "xml";
+    if (body.contains("tool_call_format")) {
+        if (!body["tool_call_format"].is_string() ||
+            (body["tool_call_format"] != "xml" && body["tool_call_format"] != "json"))
+            http::fail(400, "tool_call_format must be 'xml' or 'json'");
+        tool_format = body["tool_call_format"].get<std::string>();
+        opts.tool_call_format = &body["tool_call_format"];
+    }
+    if (body.contains("max_tool_arg_chars")) {
+        if (!body["max_tool_arg_chars"].is_number_integer() &&
+            !body["max_tool_arg_chars"].is_number_unsigned())
+            http::fail(400, "max_tool_arg_chars must be a non-negative integer");
+        opts.max_tool_arg_chars = &body["max_tool_arg_chars"];
+    }
+    if (body.contains("max_tool_response_chars")) {
+        if (!body["max_tool_response_chars"].is_number_integer() &&
+            !body["max_tool_response_chars"].is_number_unsigned())
+            http::fail(400, "max_tool_response_chars must be a non-negative integer");
+        opts.max_tool_response_chars = &body["max_tool_response_chars"];
+    }
 
     json normalized_effort;
     if (body.contains("reasoning") && !body["reasoning"].is_null()) {
@@ -2442,6 +2544,10 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
         if (reasoning.contains("effort"))
             opts.reasoning_effort =
                 normalize_reasoning_effort(&reasoning["effort"], &normalized_effort);
+        if (opts.reasoning_effort != nullptr && opts.reasoning_effort->is_string() &&
+            (opts.reasoning_effort->get<std::string>() == "none" ||
+             opts.reasoning_effort->get<std::string>() == "off"))
+            thinking_enabled = false;
         for (const char* key : {"summary", "generate_summary"}) {
             if (reasoning.contains(key) && !reasoning[key].is_null() &&
                 !reasoning[key].is_string())
@@ -2451,7 +2557,7 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
 
     chat_template::RenderResult rr = chat_template::render_chat_template(&messages, opts);
     if (!rr.ok) http::fail(400, rr.error);
-    rr.text += tool_setup.choice.prompt_suffix(thinking_enabled);
+    rr.text += tool_setup.choice.prompt_suffix(thinking_enabled, tool_format);
 
     GenSpec spec;
     std::vector<size_t> starts;
@@ -2530,8 +2636,9 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
         else
             split_reasoning(o.text, thinking_enabled, &reasoning, &answer);
         toolparse::StreamParser parser(
-            tool_setup.tools, []() { return make_id("call_"); }, tool_setup.enabled());
-        parser.feed(tool_setup.choice.parser_prefix());
+            tool_setup.tools, []() { return make_id("call_"); }, tool_setup.enabled(), tool_format,
+        tool_setup.choice.name);
+        parser.feed(tool_setup.choice.parser_prefix(tool_format));
         parser.feed(answer);
         parser.finish();
 
@@ -2691,8 +2798,9 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
 
     ThinkSplitter splitter(thinking_enabled);
     toolparse::StreamParser parser(
-        tool_setup.tools, []() { return make_id("call_"); }, tool_setup.enabled());
-    if (!dispatch_tool_events(parser.feed(tool_setup.choice.parser_prefix()))) return;
+        tool_setup.tools, []() { return make_id("call_"); }, tool_setup.enabled(), tool_format,
+        tool_setup.choice.name);
+    if (!dispatch_tool_events(parser.feed(tool_setup.choice.parser_prefix(tool_format)))) return;
     auto on_wait = [&]() {
         if (st->disconnected()) return false;
         // No response item exists until generation starts, so use a standard

@@ -68,6 +68,11 @@ struct Options {
     const json* reasoning_effort = nullptr;
     const json* enable_thinking = nullptr;
     const json* preserve_thinking = nullptr;
+    const json* preserve_reasoning = nullptr;
+    const json* auto_disable_thinking_with_tools = nullptr;
+    const json* tool_call_format = nullptr;
+    const json* max_tool_arg_chars = nullptr;
+    const json* max_tool_response_chars = nullptr;
     const json* add_vision_id = nullptr;
 };
 
