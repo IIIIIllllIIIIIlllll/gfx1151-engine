@@ -492,7 +492,7 @@ static void run_prefill(GpuModel& model, const BenchConfig& config, int maxctx,
       model.mtp_tap_capture = false;
       model.reset_state();
       const auto start = Clock::now();
-      model.prefill_batch(tokens);
+      model.prefill_batch(tokens, 0, true, /*quiet=*/true);
       CK(hipDeviceSynchronize());
       elapsed += seconds_since(start);
     }
@@ -567,7 +567,7 @@ static int run_decode(GpuModel& model, const BenchConfig& config, int maxctx,
     for (int sample = 0; sample < repeats; sample++) {
       model.mtp_tap_capture = true;
       model.reset_state();
-      const int first = model.prefill_batch(prompt);
+      const int first = model.prefill_batch(prompt, 0, true, /*quiet=*/true);
       CK(hipDeviceSynchronize());
       const auto start = Clock::now();
       const std::vector<int> output = model.spec_loop(first, generated, gamma);
@@ -619,7 +619,8 @@ int main(int argc, char** argv) {
     GpuModel& model = *loaded.model;
     std::vector<int> warm((size_t)model.maxbatch, 0);
     model.mtp_tap_capture = false;
-    model.prefill_batch(warm);
+    model.bench_quiet = true;
+    model.prefill_batch(warm, 0, true, /*quiet=*/true);
     CK(hipDeviceSynchronize());
     model.reset_state();
     printf("Model load: PASS (%s)\n", paths.base.string().c_str());

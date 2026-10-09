@@ -408,6 +408,7 @@ struct GpuModel {
   bool ngram_legacy_gdn = getenv("GDEC_NGRAM_LEGACY_GDN") != nullptr;
   bool ngram_legacy_final = getenv("GDEC_NGRAM_LEGACY_FINAL") != nullptr;
   bool mtp_tap_capture = false;  // prefill_chunk copies d_Rb rows into d_mtap
+  bool bench_quiet = false;      // offline bench: suppress per-layer/per-run diagnostics
   int mtp_norm_mode = 0;       // 0 = full-10240 RMSNorm (H1), 1 = 4x2560 (H2)
   int mtp_hagg_mode = 0;       // 0 = sum branches + repeat4, 1 = per-branch + bcast e
   int mtp_pos = 0;             // host mirror of the MTP stream position
@@ -4842,7 +4843,7 @@ struct GpuModel {
     } else if (hcw) {
       hcw_site_ = mlp_prefix;
     }
-    if (!dbg && isatty(2)) {  // per-layer \r is terminal-only; logs use prefill-live
+    if (!dbg && !bench_quiet && isatty(2)) {  // per-layer \r is terminal-only; logs use prefill-live
       fprintf(stderr, "\rprefill L%02d/%d", l + 1, g_cfg.layers);
       fflush(stderr);
     }
@@ -6806,18 +6807,20 @@ struct GpuModel {
     double sec =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - T0)
             .count();
-    fprintf(stderr,
-            "\nspec: %d tokens in %.2f s = %.1f tok/s | rounds=%d commit/round=%.2f "
-            "rollbacks=%d\n",
-            (int)out.size(), sec, out.size() / sec, rounds,
-            (double)out.size() / rounds, rollbacks);
-    fprintf(stderr, "spec depth acc:");
-    for (int j = 0; j < 8 && depth_tot[j]; j++)
-      fprintf(stderr, " %d:%.3f", j + 1, (double)depth_hits[j] / depth_tot[j]);
-    fprintf(stderr,
-            "\nspec time: draft=%.0fms verify=%.0fms rollback+reprefill=%.0fms "
-            "ingest=%.0fms\n",
-            t_draft, t_verify, t_roll, t_ingest);
+    if (!bench_quiet) {
+      fprintf(stderr,
+              "\nspec: %d tokens in %.2f s = %.1f tok/s | rounds=%d commit/round=%.2f "
+              "rollbacks=%d\n",
+              (int)out.size(), sec, out.size() / sec, rounds,
+              (double)out.size() / rounds, rollbacks);
+      fprintf(stderr, "spec depth acc:");
+      for (int j = 0; j < 8 && depth_tot[j]; j++)
+        fprintf(stderr, " %d:%.3f", j + 1, (double)depth_hits[j] / depth_tot[j]);
+      fprintf(stderr,
+              "\nspec time: draft=%.0fms verify=%.0fms rollback+reprefill=%.0fms "
+              "ingest=%.0fms\n",
+              t_draft, t_verify, t_roll, t_ingest);
+    }
     gctl.report("spec");
     last_spec_rounds = rounds;
     last_spec_commit = (int)out.size();
