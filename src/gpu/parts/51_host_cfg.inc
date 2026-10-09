@@ -2541,6 +2541,12 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
                 log_ts(), (long long)g.req, ngen, el,
                 (ngen - dl_last_ngen) / iv, el > 0 ? ngen / el : 0.0);
       }
+      perfsnap::write_decode((uint64_t)g.req, (ngen - dl_last_ngen) / iv,
+                             el > 0 ? ngen / el : 0.0,
+                             m.live_spec_rounds > 0 && m.live_spec_proposed
+                                 ? 100.0 * (m.live_spec_commits - m.live_spec_rounds) /
+                                       (double)m.live_spec_proposed
+                                 : -1.0);
       dl_last = now;
       dl_last_ngen = ngen;
     };
@@ -2728,6 +2734,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
         m.yield_point();
       }
     if (dead) {  // client gone: no D line, no end-of-turn snapshot
+      perfsnap::write_idle();
       c.in_flight = false;
       sock_shutdown(c.fd);
       return;
@@ -2794,6 +2801,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
                           : (use_ngram ? "ngram" : "mtp"));
       }
     }
+    perfsnap::write_idle();  // tooltip 下一轮轮询即回归纯地址
     // SSD prompt cache: capture the end-of-turn state, then commit it with
     // the cut captures (new pages + MTP sections + checkpoints go to the
     // background writer). Cancelled turns are valid too -- hist tracks
@@ -2814,6 +2822,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     hist.clear();
     mtp_live = false;
     finish(err_line());
+    perfsnap::write_idle();
   }
 }
 
@@ -2870,6 +2879,18 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
       // wait until every in-flight turn committed and the SSD writer is
       // idle (tests/ops); replies "K <ckpts> <pages> <mtp> <bytes>"
       alive = c.send(kvs.dir.empty() ? std::string("K 0 0 0 0\n") : kvsnap::sync_line());
+    } else if (verb == "SNAP") {
+      // 实时性能快照（托盘 tooltip 3s 轮询）：P ts_ms state req pp_toks
+      // done total tg_inst tg_avg accept_pct；state 0=idle 1=prefill 2=decode
+      PerfSnap ps = perfsnap::snapshot();
+      char pb[192];
+      snprintf(pb, sizeof pb, "P %llu %u %llu %.1f %llu %llu %.1f %.1f %.1f\n",
+               (unsigned long long)ps.ts_ms, (unsigned)ps.state,
+               (unsigned long long)ps.req_id, ps.pp_toks,
+               (unsigned long long)ps.prompt_done,
+               (unsigned long long)ps.prompt_total, ps.tg_inst, ps.tg_avg,
+               ps.accept_pct);
+      alive = c.send(pb);
     } else if (verb == "X") {
       int64_t req = 0;
       ss >> req;

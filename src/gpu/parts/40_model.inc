@@ -4882,6 +4882,8 @@ struct GpuModel {
             log_ts(), (long long)prog_req, (long long)est, prog_total,
             100.0 * est / prog_total, el, (est - prog_last_est) / iv,
             el > 0 ? est / el : 0.0);
+    perfsnap::write_prefill((uint64_t)prog_req, (est - prog_last_est) / iv,
+                            (uint64_t)est, (uint64_t)prog_total);
     prog_last = now;
     prog_last_est = est;
   }

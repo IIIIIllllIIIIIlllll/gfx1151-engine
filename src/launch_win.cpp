@@ -33,6 +33,7 @@
 #include <gdiplus.h>  // 面板左侧立绘（PNG alpha 合成），系统自带组件
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -658,11 +659,70 @@ std::wstring status_text() {
     }
 }
 
+// ---- PerfSnap：3s 轮询引擎行协议的 SNAP 动词（dev-docs/HANDOFF-PERFSNAP.md）----
+constexpr UINT_PTR kTimerPerf = 1;
+constexpr uint64_t kPerfTtlMs = 6000;  // 两个 3s 轮询周期：数据必须会过期
+
+std::wstring perf_count(uint64_t v) {  // 12K 风格缩写
+    wchar_t b[24];
+    if (v >= 10000) swprintf(b, ARRAYSIZE(b), L"%lluK", (unsigned long long)((v + 500) / 1000));
+    else swprintf(b, ARRAYSIZE(b), L"%llu", (unsigned long long)v);
+    return b;
+}
+
+// 空串 = 查询失败 / 已过期 / idle：tooltip 回归纯状态。引擎死/未起时 connect
+// 立即失败；SNAP 是控制动词，由连接读线程内联应答，不排在 GEN 后面。
+std::wstring perf_tip() {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == INVALID_SOCKET) return {};
+    const DWORD tv = 500;  // 本机回环，500ms 足够；挡住引擎卡死连累 UI 线程
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof tv);
+    sockaddr_in addr{};
+    engine_net::address(engine_net::connect_host(g_plan.engine_host), g_plan.engine_port, &addr);
+    char buf[256];
+    int n = -1;
+    if (connect(s, (sockaddr*)&addr, sizeof addr) == 0 &&
+        send(s, "SNAP\n", 5, 0) == 5)
+        n = recv(s, buf, sizeof buf - 1, 0);
+    closesocket(s);
+    if (n <= 0) return {};
+    buf[n] = '\0';
+    // P ts_ms state req pp_toks done total tg_inst tg_avg accept_pct
+    unsigned long long ts = 0, req = 0, done = 0, total = 0;
+    unsigned st = 0;
+    double pp = 0, tg_inst = 0, tg_avg = 0, accept = -1;
+    if (sscanf(buf, "P %llu %u %llu %lf %llu %llu %lf %lf %lf", &ts, &st, &req, &pp,
+               &done, &total, &tg_inst, &tg_avg, &accept) != 9)
+        return {};
+    if (st == 0) return {};
+    const uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+    if (now - ts > kPerfTtlMs) return {};  // 引擎被杀也兜底：ts 不再更新
+    wchar_t b[96];
+    if (st == 1) {
+        const std::wstring d = perf_count(done), t = perf_count(total);
+        swprintf(b, ARRAYSIZE(b), L"pp %.0f tok/s · %ls/%ls", pp, d.c_str(), t.c_str());
+    } else if (accept >= 0) {
+        swprintf(b, ARRAYSIZE(b), TR(L"tg %.1f tok/s · 接受率 %.1f%%", L"tg %.1f tok/s · accept %.1f%%"),
+                 tg_inst, accept);
+    } else {
+        swprintf(b, ARRAYSIZE(b), L"tg %.1f tok/s", tg_inst);
+    }
+    return b;
+}
+
 void tray_update_tip() {
-    // 就绪时 tooltip 只留状态本身（地址在右键菜单首项和气球里都有）
-    const std::wstring tip = g_state == kReady
+    // 就绪时 tooltip 只留状态本身（地址在右键菜单首项和气球里都有）；
+    // 性能行照旧追加在第二行。
+    std::wstring tip = g_state == kReady
         ? TR(L"引擎就绪", L"Engine ready")
         : L"gfx1151-engine · " + status_text();
+    if (g_state == kReady) {
+        const std::wstring perf = perf_tip();
+        if (!perf.empty()) tip += L"\n" + perf;
+    }
     g_nid.uFlags = NIF_TIP;
     lstrcpynW(g_nid.szTip, tip.c_str(), ARRAYSIZE(g_nid.szTip));
     if (g_tray_added) Shell_NotifyIconW(NIM_MODIFY, &g_nid);
@@ -705,7 +765,12 @@ void tray_add() {
     const std::wstring tip = L"gfx1151-engine · " + status_text();
     lstrcpynW(g_nid.szTip, tip.c_str(), ARRAYSIZE(g_nid.szTip));
     // 开机自启时任务栏可能还没起来：失败就等 TaskbarCreated 再加
-    if (Shell_NotifyIconW(NIM_ADD, &g_nid)) InterlockedExchange(&g_tray_added, 1);
+    if (Shell_NotifyIconW(NIM_ADD, &g_nid)) {
+        InterlockedExchange(&g_tray_added, 1);
+        // 128 字符多行 tooltip（uVersion 0 只有 64 字符）；Vista 语义回调格式不变
+        g_nid.uVersion = NOTIFYICON_VERSION;
+        Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
+    }
 }
 
 void tray_remove() {
@@ -806,6 +871,9 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == WM_SVC_STATE) {
+        // 就绪才刷 PerfSnap（3s 轮询），离开就绪停
+        if (wp == static_cast<WPARAM>(kReady)) SetTimer(g_hwnd, kTimerPerf, 3000, nullptr);
+        else KillTimer(g_hwnd, kTimerPerf);
         tray_update_tip();
         if (wp == static_cast<WPARAM>(kReady))
             tray_balloon(TR(L"服务已就绪", L"Service ready"),
@@ -813,6 +881,10 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                              TR(L"双击图标打开控制台，右键查看更多",
                                 L"Double-click the icon to open the console; "
                                 L"right-click for more"));
+        return 0;
+    }
+    if (msg == WM_TIMER && wp == kTimerPerf) {
+        tray_update_tip();
         return 0;
     }
     if (msg == WM_SVC_EXIT) {
