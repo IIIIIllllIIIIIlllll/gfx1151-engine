@@ -29,6 +29,38 @@ struct GpuModel {
     ng_cs_fixed = v > 0;
     ng_cs = ng_cs_fixed ? std::max(1, std::min(64, v)) : 16;
   }
+  // Adaptive ngram gate (chain drafters): the ngram leg only pays on
+  // repetitive content. Track the draft-token accept ratio with an EMA over
+  // ngram rounds, close the leg for 32 rounds, then probe again. Like ng_cs
+  // the state is a Model member shared by both chain loops and kept across
+  // requests (the content mix is a workload property). GDEC_NGRAM_GATE=0
+  // pins the leg open.
+  struct NgGate {
+    double ema = 1.0;  // decayed draft-token accept ratio (starts optimistic)
+    int cd = 0;        // rounds the leg stays closed (probes when it hits 0)
+    int rounds = 0;
+    static bool disabled() {
+      static const int v = [] {
+        const char* e = getenv("GDEC_NGRAM_GATE");
+        return e ? atoi(e) : 1;
+      }();
+      return v == 0;
+    }
+    bool open() {
+      if (disabled()) return true;
+      if (cd > 0) { --cd; return false; }
+      return true;
+    }
+    // A probe round measures the content with a short capped draft; a good
+    // result reopens the leg to full-length drafts on the next round.
+    bool probing() const { return !disabled() && rounds >= 4 && ema < 0.7; }
+    void update(int keep, int proposed) {
+      ++rounds;
+      ema += ((double)keep / std::max(1, proposed) - ema) * 0.25;
+      if (rounds >= 4 && ema < 0.7 && cd == 0) cd = 32;
+    }
+  };
+  NgGate ng_gate;
 
   // device state
   float *d_R, *d_Rhat, *d_x, *d_y, *d_emb;
@@ -6533,8 +6565,13 @@ struct GpuModel {
       // Same budget math as the pure-ngram loop: one slot stays for the
       // target-model continuation, never verify past gen or maxctx.
       int want = std::min({maxg, gen - (int)out.size() - 1, maxctx - pos - 1});
+      const bool ng_open = ng_gate.open();
+      if (ng_open && ng_gate.probing())
+        want = std::min(want, std::max(8, ngram.n_min));
       std::vector<int> draft =
-          want > 0 ? ngram.draft(chist, cur, want) : std::vector<int>{};
+          (want > 0 && ng_open)
+              ? ngram.draft(chist, cur, want)
+              : std::vector<int>{};
       bool stop = false;
       if (!draft.empty() && ng_legacy) {
         // ---- ngram round: long draft, whole-state checkpoint + replay ----
@@ -6583,6 +6620,7 @@ struct GpuModel {
         cur = targets[keep];
         accepted += keep;
         ++ng_rounds;
+        ng_gate.update(keep, (int)draft.size());
         last_spec_proposed += (int)draft.size();
         // Patch the MTP KV over committed positions base-1..base+keep-1: tap
         // row 0 = stashed h_{base-1} paired with cur; rows 1..keep = d_Rb
@@ -6687,6 +6725,7 @@ struct GpuModel {
         cur = cur_c;
         accepted += keep_round;
         ++ng_rounds;
+        ng_gate.update(keep_round, (int)draft.size());
         last_spec_proposed += (int)draft.size();
         if (!ng_cs_fixed) {
           if (round_full && (int)draft.size() > ng_cs)
@@ -7140,8 +7179,13 @@ struct GpuModel {
       // Same budget math as the greedy chain: one slot stays for the
       // target-model continuation, never verify past gen or maxctx.
       int want = std::min({maxg, gen - (int)out.size() - 1, maxctx - pos - 1});
+      const bool ng_open = ng_gate.open();
+      if (ng_open && ng_gate.probing())
+        want = std::min(want, std::max(8, ngram.n_min));
       std::vector<int> draft =
-          want > 0 ? ngram.draft(chist, cur, want) : std::vector<int>{};
+          (want > 0 && ng_open)
+              ? ngram.draft(chist, cur, want)
+              : std::vector<int>{};
       bool stop = false;
       // GPU sampling prep (direction A) applies to all three legs below.
       const bool smg = sms_gpu_active(sampler) && sms_round_shared(sampler);
@@ -7236,6 +7280,7 @@ struct GpuModel {
         if (next >= 0) cur = next;
         accepted += keep;
         ++ng_rounds;
+        ng_gate.update(keep, (int)draft.size());
         last_spec_proposed += (int)draft.size();
         if (mtp_ok) {
           // Patch the MTP KV over committed positions (as spec_loop_chain):
@@ -7371,6 +7416,7 @@ struct GpuModel {
         if (cont >= 0) cur = cur_c;
         accepted += keep_round;
         ++ng_rounds;
+        ng_gate.update(keep_round, (int)draft.size());
         last_spec_proposed += (int)draft.size();
         if (!ng_cs_fixed) {
           if (round_full && (int)draft.size() > ng_cs)
