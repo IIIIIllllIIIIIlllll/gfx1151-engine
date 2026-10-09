@@ -83,6 +83,7 @@ std::atomic<long long> g_req_seq{0};
 // the rest wait in this front-end queue until a slot is released.  Control
 // queries (MEM/CSTAT) use g_ctl and never wait for a generation slot.
 int g_slots = 1;
+int g_kv_pool = 0;  // shared KV pool tokens from INFO (0 = old engine, unknown)
 std::vector<std::unique_ptr<gdec::EngineClient>> g_pool;  // g_slots clients
 std::vector<gdec::EngineClient*> g_pool_free;             // under g_slot_mtx
 gdec::EngineClient g_ctl;
@@ -1950,6 +1951,7 @@ void handle_health(const http::Request&, http::Response* r, http::Stream*) {
     }
     j["slots"] = g_slots;
     j["slot_ctx"] = g_cfg.context;
+    j["kv_pool"] = g_kv_pool;
     {
         std::lock_guard<std::mutex> lk(g_slot_mtx);
         j["queued"] = g_queued;
@@ -2865,6 +2867,7 @@ void probe_engine() {
     } else if (g_ctl.info(&line, &err)) {
         // I mtp draft_head ctx spec_rows default drafter_weights dflash2
         //   cache_mb cache_align kv_slots slot_ctx cache_mode sampling
+        //   kv_pool_tokens
         std::vector<long long> f;
         std::istringstream ss(line);
         std::string tok;
@@ -2875,6 +2878,7 @@ void probe_engine() {
             g_cfg.context = (int)f[2];
         }
         if (f.size() >= 10 && f[9] >= 1 && f[9] <= 64) g_slots = (int)f[9];
+        if (f.size() >= 14 && f[13] > 0) g_kv_pool = (int)f[13];
         fprintf(stderr, "gdec-api: engine INFO: %s\n", line.c_str());
     } else {
         fprintf(stderr, "gdec-api: engine INFO unavailable (%s); continuing with "
@@ -2884,8 +2888,10 @@ void probe_engine() {
         g_pool.push_back(std::make_unique<gdec::EngineClient>());
         g_pool_free.push_back(g_pool.back().get());
     }
-    fprintf(stderr, "gdec-api: %d concurrent generation slot%s (shared context %d)\n",
-            g_slots, g_slots > 1 ? "s" : "", g_cfg.context);
+    fprintf(stderr, "gdec-api: %d concurrent generation slot%s (per-slot context %d,"
+            " shared KV pool %d)\n",
+            g_slots, g_slots > 1 ? "s" : "", g_cfg.context,
+            g_kv_pool > 0 ? g_kv_pool : g_cfg.context);
 }
 
 }  // namespace

@@ -18,6 +18,7 @@ def send_line(conn, line):
 
 
 SLOTS = 1
+POOL = 0
 TRACE = []
 TRACE_LOCK = threading.Lock()
 
@@ -84,7 +85,8 @@ def handle(conn):
                 send_line(conn, "PONG")
                 continue
             if line == "INFO":
-                send_line(conn, f"I 1 0 262144 8 1 1 0 0 0 {SLOTS} 262144 0 1")
+                pool = f" {POOL}" if POOL > 0 else ""
+                send_line(conn, f"I 1 0 262144 8 1 1 0 0 0 {SLOTS} 262144 0 1{pool}")
                 continue
             if line == "MEM":
                 send_line(conn, "M 1 100 120 200 10 20 310 900 1000 100 400 50")
@@ -188,9 +190,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=18730)
     parser.add_argument("--slots", type=int, default=1, help="INFO kv_slots")
+    parser.add_argument("--pool", type=int, default=0,
+                        help="INFO kv_pool_tokens; 0 = omit (old engine)")
     args = parser.parse_args()
-    global SLOTS
+    global SLOTS, POOL
     SLOTS = args.slots
+    POOL = args.pool
     with socket.socket() as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind(("127.0.0.1", args.port))

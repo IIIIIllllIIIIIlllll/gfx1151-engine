@@ -2847,14 +2847,20 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
       char ib[160];
       // fields: mtp draft_head ctx spec_rows default drafter_weights dflash2
       //         cache_mb cache_align kv_slots slot_ctx cache_mode sampling
+      //         kv_pool_tokens
       // The default drafter is the chain (ngram first, MTP fallback) unless
       // GDEC_DRAFTER overrides; draft_head is a separate shortlist readout
       // and is not part of this checkpoint. kv_slots: concurrent sequences.
-      snprintf(ib, sizeof ib, "I %d 0 %d 8 %d %d 0 0 0 %d %d 1 1\n",
+      // kv_pool_tokens: KV total shared by all slots (paged mode); without
+      // paging each sequence owns slot_ctx, so report nslots * slot_ctx.
+      const long long kv_pool_tokens =
+          m.kv_paged ? (long long)m.kv_pool_pages * KV_PAGE
+                     : (long long)m.nslots * m.maxctx;
+      snprintf(ib, sizeof ib, "I %d 0 %d 8 %d %d 0 0 0 %d %d 1 1 %lld\n",
                m.mtp_avail ? 1 : 0, m.maxctx,
                env_default_drafter() >= 0 ? env_default_drafter()
                                           : (m.mtp_avail ? 1 : 0),
-               m.mtp_avail ? 1 : 0, m.nslots, m.maxctx);
+               m.mtp_avail ? 1 : 0, m.nslots, m.maxctx, kv_pool_tokens);
       alive = c.send(ib);
     } else if (verb == "MEM") {
       EngineMemStats ms = memstats_snapshot();

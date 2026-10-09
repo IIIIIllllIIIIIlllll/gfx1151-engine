@@ -29,6 +29,7 @@ const I18N = {
     "health.busy_yes": "推理中", "health.busy_no": "空闲",
     "health.inflight": "在途请求", "health.model": "模型",
     "health.context": "上下文", "health.slots": "并发槽位",
+    "health.slots_shared": "（共享池 ",
     "health.rope_off": "未启用", "health.tool": "工具调用",
     "health.tool_on": "解析已启用", "health.tool_off": "透传",
     "health.vision": "视觉输入", "health.vision_on": "接受", "health.vision_off": "拒绝",
@@ -95,6 +96,7 @@ const I18N = {
     "health.busy_yes": "generating", "health.busy_no": "idle",
     "health.inflight": "In flight", "health.model": "Model",
     "health.context": "Context", "health.slots": "Slots",
+    "health.slots_shared": " (shared pool ",
     "health.rope_off": "off", "health.tool": "Tool calls",
     "health.tool_on": "parsing enabled", "health.tool_off": "passthrough",
     "health.vision": "Vision input", "health.vision_on": "accepted", "health.vision_off": "rejected",
@@ -347,7 +349,10 @@ async function refreshHealth() {
     const rows = [
       [t("health.model"), h.model || "—"],
       [t("health.context"), fmtInt(h.context)],
-      [t("health.slots"), fmtInt(h.slots) + " × " + fmtInt(h.slot_ctx)],
+      [t("health.slots"), fmtInt(h.slots) + " × " + fmtInt(h.slot_ctx) +
+        (h.kv_pool > 0 && h.kv_pool < h.slots * h.slot_ctx
+          ? t("health.slots_shared") + fmtInt(h.kv_pool) + (LANG === "zh" ? "）" : ")")
+          : "")],
     ];
     if (h.rope_scaling) {
       rows.push(["RoPE", h.rope_scaling.type + " × " + h.rope_scaling.factor]);
