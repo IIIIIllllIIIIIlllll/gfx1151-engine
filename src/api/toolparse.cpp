@@ -28,6 +28,42 @@ bool ascii_space(char c) {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v';
 }
 
+// gufo b722a61：模型在结构化参数里有时会吐 Python 字面量（True/False/None）。
+// json::parse 失败时，把双引号字符串之外的这些词改写成 JSON 字面量再试一次。
+std::string python_literals_to_json(std::string_view value) {
+    std::string out;
+    out.reserve(value.size());
+    bool in_string = false;
+    for (size_t i = 0; i < value.size();) {
+        const char c = value[i];
+        if (in_string) {
+            const size_t len = c == '\\' && i + 1 < value.size() ? 2 : 1;
+            out.append(value.substr(i, len));
+            in_string = c != '"';
+            i += len;
+            continue;
+        }
+        if (!std::isalpha(static_cast<unsigned char>(c))) {
+            out += c;
+            in_string = c == '"';
+            ++i;
+            continue;
+        }
+        size_t end = i;
+        while (end < value.size() &&
+               (std::isalnum(static_cast<unsigned char>(value[end])) != 0 ||
+                value[end] == '_'))
+            ++end;
+        const std::string_view word = value.substr(i, end - i);
+        out += word == "True" ? std::string_view("true")
+             : word == "False" ? std::string_view("false")
+             : word == "None" ? std::string_view("null")
+                              : word;
+        i = end;
+    }
+    return out;
+}
+
 void trim_ascii(std::string* value) {
     size_t begin = 0;
     while (begin < value->size() && ascii_space((*value)[begin])) ++begin;
@@ -106,13 +142,12 @@ json coerce_value(const std::string& raw, const std::vector<std::string>& types)
         } else if (type == "null") {
             if (raw == "null" || raw == "None") return nullptr;
         } else if (type == "object" || type == "array") {
-            try {
-                json value = json::parse(raw);
-                if ((type == "object" && value.is_object()) ||
-                    (type == "array" && value.is_array()))
-                    return value;
-            } catch (...) {
-            }
+            json value = json::parse(raw, nullptr, false);
+            if (value.is_discarded())
+                value = json::parse(python_literals_to_json(raw), nullptr, false);
+            if ((type == "object" && value.is_object()) ||
+                (type == "array" && value.is_array()))
+                return value;
         }
     }
     return raw;
@@ -200,18 +235,24 @@ std::string message_role(const json& message) {
 
 }  // namespace
 
-std::string ToolChoice::parser_prefix() const {
+std::string ToolChoice::parser_prefix(const std::string& format) const {
     if (!forced()) return {};
+    if (format == "json") {
+        // 只预填块框：实测任何 {"name" 脚手架都会让模型立即吐 <|im_end|>
+        //（该模型是 XML 工具格式训练的，JSON 续写位置不自然）。函数名由
+        // StreamParser 的 forced_name_ 校验兜底。
+        return "<tool_call>\n";
+    }
     std::string result = "<tool_call>\n<function=";
     if (!name.empty()) result += name + ">\n";
     return result;
 }
 
-std::string ToolChoice::prompt_suffix(bool thinking_enabled) const {
+std::string ToolChoice::prompt_suffix(bool thinking_enabled, const std::string& format) const {
     if (!forced()) return {};
     std::string result;
     if (thinking_enabled) result = "</think>\n\n";
-    result += parser_prefix();
+    result += parser_prefix(format);
     return result;
 }
 
@@ -366,8 +407,10 @@ bool normalize_messages(json* messages, std::string* error) {
     return true;
 }
 
-StreamParser::StreamParser(json tools, IdFactory make_id, bool enabled)
-    : tools_(std::move(tools)), make_id_(std::move(make_id)), enabled_(enabled) {}
+StreamParser::StreamParser(json tools, IdFactory make_id, bool enabled, std::string format,
+                           std::string forced_name)
+    : tools_(std::move(tools)), make_id_(std::move(make_id)), enabled_(enabled),
+      format_(std::move(format)), forced_name_(std::move(forced_name)) {}
 
 std::vector<Event> StreamParser::feed(std::string_view piece) {
     buffer_.append(piece.data(), piece.size());
@@ -504,7 +547,81 @@ std::vector<Event> StreamParser::pump(bool final) {
             break;
         }
 
+        if (state_ == State::JsonCall) {
+            const size_t close = buffer_.find(kToolClose);
+            if (close == std::string::npos) {
+                if (!final) break;
+                state_ = State::Broken;
+                continue;
+            }
+            std::string segment = buffer_.substr(0, close);
+            buffer_.erase(0, close + std::char_traits<char>::length(kToolClose));
+            auto try_parse = [this](const std::string& text, json* out) {
+                *out = json::parse(text, nullptr, false);
+                if (out->is_discarded())
+                    *out = json::parse(python_literals_to_json(text), nullptr, false);
+                return out->is_object() && out->contains("name") &&
+                       (*out)["name"].is_string() &&
+                       function_exists(tools_, (*out)["name"].get<std::string>()) &&
+                       (forced_name_.empty() ||
+                        (*out)["name"].get<std::string>() == forced_name_);
+            };
+            json call;
+            bool parsed = try_parse(segment, &call);
+            // 强制前缀之后模型有时会不续写、而是从头重写整个 {"name": ...}
+            // 对象：从后往前逐个 {"name" 出现处重新锚定。
+            for (size_t at = segment.rfind("{\"name\"");
+                 !parsed && at != std::string::npos;
+                 at = at ? segment.rfind("{\"name\"", at - 1) : std::string::npos)
+                parsed = try_parse(segment.substr(at), &call);
+            if (!parsed) {
+                state_ = State::Broken;
+                continue;
+            }
+            start_call(call["name"].get<std::string>(), &events);
+            const std::string arguments = call.contains("arguments")
+                                               ? (call["arguments"].is_string()
+                                                      ? call["arguments"].get<std::string>()
+                                                      : json_py::dumps(call["arguments"], false))
+                                               : "{}";
+            current_.arguments = arguments;
+            calls_.push_back(current_);
+            const std::string emitted = current_.arguments;
+            current_.arguments.clear();
+            emit_arguments(emitted, &events);
+            current_.arguments = arguments;
+            events.push_back(Event{EventType::CallEnd, current_.index, current_.id,
+                                   current_.name, current_.arguments});
+            current_ = ToolCall{};
+            state_ = State::Text;
+            continue;
+        }
+
         if (state_ == State::Text) {
+            if (format_ == "json") {
+                const size_t marker = buffer_.find(kToolOpen);
+                if (marker == std::string::npos) {
+                    if (final) {
+                        emit_content(std::move(buffer_), &events);
+                        buffer_.clear();
+                    } else {
+                        const size_t partial = suffix_prefix_len(buffer_, kToolOpen);
+                        const size_t keep_at = buffer_.size() - partial;
+                        if (keep_at) {
+                            emit_content(buffer_.substr(0, keep_at), &events);
+                            buffer_.erase(0, keep_at);
+                        }
+                    }
+                    break;
+                }
+                size_t content_end = marker;
+                while (content_end > 0 && ascii_space(buffer_[content_end - 1]))
+                    --content_end;
+                emit_content(buffer_.substr(0, content_end), &events);
+                buffer_.erase(0, marker + std::char_traits<char>::length(kToolOpen));
+                state_ = State::JsonCall;
+                continue;
+            }
             const size_t marker = buffer_.find(kToolOpen);
             if (marker == std::string::npos) {
                 if (final) {
