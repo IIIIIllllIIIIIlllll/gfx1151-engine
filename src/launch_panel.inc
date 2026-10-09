@@ -148,6 +148,7 @@ const char* kManagedKeys[] = {
     "GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE",
     "TOKENIZER_DIR", "MAX_CONTEXT", "PARALLEL", "KV_POOL_TOKENS", "KV_PAGED",
     "PREFILL_CHUNK", "ROPE_FACTOR",
+    "KVSNAP_MAX_GB",
     "ENGINE_HOST", "ENGINE_PORT", "API_HOST", "API_PORT",
 };
 // 可选文件键：写回时用 ${KEY-值}（无冒号，允许显式置空禁用），与 service.conf 现状一致。
@@ -163,7 +164,7 @@ bool is_optional_file_key(const std::string& key) {
 // 环境变量覆盖提示归属的页：0 权重 / 1 上下文 / 2 端口。
 int page_of_key(const std::string& k) {
     if (k == "MAX_CONTEXT" || k == "PARALLEL" || k == "KV_POOL_TOKENS" || k == "KV_PAGED" ||
-        k == "PREFILL_CHUNK" || k == "ROPE_FACTOR")
+        k == "PREFILL_CHUNK" || k == "ROPE_FACTOR" || k == "KVSNAP_MAX_GB")
         return 1;
     if (k == "ENGINE_HOST" || k == "ENGINE_PORT" || k == "API_HOST" || k == "API_PORT")
         return 2;
@@ -309,6 +310,7 @@ struct PanelVals {
     std::string max_context, parallel, kv_pool, prefill_chunk;
     bool kv_paged = true;
     std::string rope_factor, rope_original;  // rope_original 无 UI 行，从 conf/环境读
+    std::string kvsnap_max_gb;
     std::string engine_host, engine_port, api_host, api_port;
 };
 
@@ -340,6 +342,7 @@ PanelVals panel_vals_from_conf() {
     v.prefill_chunk = cfg("PREFILL_CHUNK", "0");
     v.rope_factor = cfg("ROPE_FACTOR", "1");
     v.rope_original = cfg("ROPE_ORIGINAL_CTX", "262144");
+    v.kvsnap_max_gb = cfg("KVSNAP_MAX_GB", "20");
     v.engine_host = cfg("ENGINE_HOST", "127.0.0.1");
     v.engine_port = cfg("ENGINE_PORT", "8730");
     v.api_host = cfg("API_HOST", "0.0.0.0");
@@ -384,6 +387,7 @@ std::map<std::string, std::string> panel_vals_to_conf(const PanelVals& v) {
     m["KV_PAGED"] = v.kv_paged ? "1" : "0";
     m["PREFILL_CHUNK"] = v.prefill_chunk;
     m["ROPE_FACTOR"] = v.rope_factor;
+    m["KVSNAP_MAX_GB"] = v.kvsnap_max_gb;
     m["ENGINE_HOST"] = v.engine_host;
     m["ENGINE_PORT"] = v.engine_port;
     m["API_HOST"] = v.api_host;
@@ -566,6 +570,8 @@ void check_context_page(CheckLines& c, const PanelVals& v) {
     need_int("PARALLEL", v.parallel, 1, 8, &parallel);
     need_int("KV_POOL_TOKENS", v.kv_pool, 0, 1 << 24, &kv_pool);
     need_int("PREFILL_CHUNK", v.prefill_chunk, 0, 1 << 20, &prefill);
+    long kvsnap = 20;
+    need_int("KVSNAP_MAX_GB", v.kvsnap_max_gb, 0, 1 << 16, &kvsnap);
     // ROPE_ORIGINAL_CTX 无 UI 行，但校验照做（conf 里填坏时启动器同样会拒）
     need_int("ROPE_ORIGINAL_CTX", v.rope_original, 1, 1 << 30, &rope_orig);
     if (!pn_double(v.rope_factor, &factor) || factor < 1) {
@@ -899,7 +905,7 @@ enum PanelId : int {
     kBrGguf, kBrGgufMtp, kBrGgufVision,
     kOffOverlay, kOffMtp, kOffVision, kOffGgufMtp, kOffGgufVision,
     kEdMaxctx, kCbParallel, kEdKvPool, kCkKvPaged, kEdPrefill,
-    kCkYarn,
+    kCkYarn, kEdKvsnap,
     kEdEHost, kEdEPort, kEdAHost, kEdAPort,
     kEdOut1, kEdOut2, kEdOut3, kEdReport, kEdSummary, kBtnLang,
 };
@@ -917,6 +923,7 @@ struct PanelCtl {
     HWND maxctx = nullptr, parallel = nullptr, kv_pool = nullptr, kv_paged = nullptr,
          prefill = nullptr;
     HWND yarn = nullptr;  // "YaRN 长上下文扩展" 勾选框（ROPE_FACTOR 自动推导，无编辑行）
+    HWND kvsnap = nullptr;
     HWND ehost = nullptr, eport = nullptr, ahost = nullptr, aport = nullptr;
     HWND out1 = nullptr, out2 = nullptr, out3 = nullptr, report = nullptr, summary = nullptr;
     HWND start = nullptr;
@@ -1028,6 +1035,7 @@ PanelVals panel_collect() {
     v.prefill_chunk = get_edit(g_pc.prefill);
     v.rope_original = cfg("ROPE_ORIGINAL_CTX", "262144");  // 无 UI 行，conf/环境原样读
     v.rope_factor = derive_rope_factor(get_check(g_pc.yarn), v.max_context, v.rope_original);
+    v.kvsnap_max_gb = get_edit(g_pc.kvsnap);
     v.engine_host = get_edit(g_pc.ehost);
     v.engine_port = get_edit(g_pc.eport);
     v.api_host = get_edit(g_pc.ahost);
@@ -1488,6 +1496,12 @@ PanelResult panel_run(bool allow_start) {
                          TR(L"YaRN 长上下文扩展", L"YaRN long-context scaling"), kCkYarn);
         SendMessageW(g_pc.yarn, BM_SETCHECK, rope_init > 1 ? BST_CHECKED : BST_UNCHECKED, 0);
     }
+    y2 += 26;
+    plabel(1, h, kLblX, y2, L"KV 快照上限 (GiB)");
+    g_pc.kvsnap = pctl(1, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y2, 120,
+                       22, L"", kEdKvsnap);
+    set_edit(g_pc.kvsnap, init.kvsnap_max_gb);
+    plabel(1, h, kHintX, y2, L"RAM 检查点容量，0 = 关闭", kHintW);
     y2 += 26;
     g_pc.out2 = pctl(1, h, L"Edit",
                      WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
