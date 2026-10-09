@@ -26,20 +26,21 @@
 //
 // 入口：panel_run(allow_start)
 //   allow_start=true  ：首次启动 / --setup，按钮为 启动服务 / 仅保存 / 取消
-//   allow_start=false ：服务运行中从托盘"设置…"打开，启动按钮禁用（重启生效）
-// 返回 kPanelStart（已保存，继续启动）/ kPanelSave（仅保存）/ kPanelCancel /
-// kPanelRelang（切换了界面语言，调用方重开面板）。
+//   allow_start=false ：启动按钮禁用（重启生效）；当前无调用方（托盘"设置…"
+//     入口已移除），仅保留给将来运行中改配置的场景
+// 返回 kPanelStart（已保存，继续启动）/ kPanelCancel / kPanelRelang（切换了
+// 界面语言，调用方重开面板）。"仅保存"写盘后弹提示，面板保持打开。
 //
 // 界面语言：中英双语，文案处用 TR(中文, English) 就地双语。优先级：
 //   service.conf 的 "# start_win: lang=zh|en" 标记 > 环境变量 UI_LANG >
 //   GetUserDefaultUILanguage()（中文→zh，其它→en）。
 // 面板右下角语言按钮写 lang 标记并返回 kPanelRelang。
 // 检查级别前缀本地化为 [通过]/[失败]/[警告]/[提示] 与 [PASS]/[FAIL]/[WARN]/[HINT]，
-// 判定用 Lv 枚举（不再字符串比较）。托盘菜单 / 控制台输出暂未翻译。
+// 判定用 Lv 枚举（不再字符串比较）。控制台模式的诊断输出未翻译。
 //
-// 单次显示标记：service.conf 里的一行 "# start_win: configured"。首次服务就绪
-// （report(kReady)）时由 conf_write_marker() 写入；存在则双击不再弹面板。
-// 权重版本选择持久化为另一行注释 "# start_win: weights=v1|v2|gguf"（存在则改写、
+// 面板每次双击启动都会显示（曾经用 "# start_win: configured" 标记只在首次
+// 显示，已废弃；旧 conf 里的该行残留无害）。
+// 权重版本选择持久化为注释行 "# start_win: weights=v1|v2|gguf"（存在则改写、
 // 不存在则追加）；无标记时按 NGRAM_FILE 是否与 MODEL_FILE 同文件推断 V1/V2。
 
 #include <commdlg.h>
@@ -49,14 +50,13 @@ namespace {
 
 // ---- service.conf 读写 -------------------------------------------------------
 
-const char* kPanelMarker = "# start_win: configured";
 const char* kWeightsMarker = "# start_win: weights=";
 const char* kLangMarker = "# start_win: lang=";
 
 // 界面语言开关：panel_run 每次打开时按 lang 标记 > UI_LANG > 系统 UI 语言解析。
-// TR 宏就地双语（两个分支必须一个窄串对窄串、一个宽串对宽串）。
+// TR 宏在 launch_win.cpp 顶部定义（托盘文案也用），就地双语
+//（两个分支必须一个窄串对窄串、一个宽串对宽串）。
 bool g_lang_en = false;
-#define TR(zh, en) (g_lang_en ? (en) : (zh))
 
 std::string conf_path() { return g_root + "\\service.conf"; }
 
@@ -68,21 +68,6 @@ bool read_text_file(const std::string& path, std::string* out) {
     while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out->append(buf, n);
     fclose(f);
     return true;
-}
-
-bool conf_has_marker() {
-    std::string text;
-    return read_text_file(conf_path(), &text) && text.find(kPanelMarker) != std::string::npos;
-}
-
-// 首次服务就绪后调用：写入"面板已配置"标记（幂等）。
-void conf_write_marker() {
-    if (conf_has_marker()) return;
-    FILE* f = fopen(conf_path().c_str(), "ab");
-    if (!f) return;  // conf 缺失时面板必然会出现，不用补标记
-    const std::string marker_line = std::string("\n") + kPanelMarker + "\n";
-    fwrite(marker_line.data(), 1, marker_line.size(), f);
-    fclose(f);
 }
 
 // 读 "# start_win: <prefix><value>" 行的值；没有返回空串。
@@ -955,8 +940,8 @@ AllChecks panel_checks(const PanelVals& v, bool service_running) {
 
 // ---- 面板窗口 -----------------------------------------------------------------
 
-// PanelResult（kPanelStart/kPanelSave/kPanelCancel）在 launch_win.cpp 前向声明
-// 段中完整定义（report()/on_menu() 在本文件之前就要用到枚举值）。
+// PanelResult（kPanelStart/kPanelCancel/kPanelRelang）在 launch_win.cpp 前向
+// 声明段中完整定义（report()/on_menu() 在本文件之前就要用到枚举值）。
 
 enum PanelId : int {
     kBtnStart = 100, kBtnSave, kBtnCancel, kBtnRecheck,
@@ -1528,8 +1513,12 @@ LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                            MB_OK | MB_ICONERROR);
                     return 0;
                 }
-                g_panel_result = kPanelSave;
-                g_panel_done = true;
+                // 仅保存：写盘后弹提示，面板保持打开（不退出程序）。
+                msgbox(g_panel_running
+                           ? TR("配置已保存，将在下次启动服务时生效。",
+                                "Configuration saved; it takes effect on the next service start.")
+                           : TR("配置已保存。", "Configuration saved."),
+                       MB_OK | MB_ICONINFORMATION);
                 return 0;
             }
             case kBtnCancel:

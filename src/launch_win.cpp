@@ -47,10 +47,16 @@
 // PanelResult 的完整定义放在这里（枚举值的可见性要求），.inc 直接使用。
 namespace {
 // kPanelRelang：面板内切换了界面语言（已写回 service.conf 标记），调用方重开面板。
-enum PanelResult : int { kPanelStart, kPanelSave, kPanelCancel, kPanelRelang };
-void conf_write_marker();
+enum PanelResult : int { kPanelStart, kPanelCancel, kPanelRelang };
 PanelResult panel_run(bool allow_start);
+// 界面语言（托盘与面板共用）：定义与解析都在 launch_panel.inc；
+// 解析顺序 = service.conf lang 标记 > UI_LANG > 系统 UI 语言（非中文→英文）。
+extern bool g_lang_en;
+void panel_lang_resolve();
 }
+
+// 双语文案：TR(中文, English)，按 g_lang_en 选择。
+#define TR(zh, en) (g_lang_en ? (en) : (zh))
 
 namespace {
 
@@ -98,18 +104,19 @@ void pause_if_own_console() {
 
 [[noreturn]] void fail(const std::string& msg) {
     console_drain(2000);  // 先让子进程最后的输出上屏，错误信息排在其后
-    fprintf(stderr, "错误：%s\n", msg.c_str());
+    fprintf(stderr, "%s%s\n", TR("错误：", "Error: "), msg.c_str());
     fflush(stderr);
     for (HANDLE h : g_children)
         if (h) TerminateProcess(h, 1);
     if (g_tray) {
         tray_remove();
         if (g_logs_started) {
-            if (msgbox("错误：" + msg + "\n\n是否打开日志文件夹？",
+            if (msgbox(TR("错误：", "Error: ") + msg +
+                           TR("\n\n是否打开日志文件夹？", "\n\nOpen the logs folder?"),
                        MB_YESNO | MB_ICONERROR) == IDYES)
                 shell_open(g_root + "\\logs");
         } else {
-            msgbox("错误：" + msg, MB_OK | MB_ICONERROR);
+            msgbox(TR("错误：", "Error: ") + msg, MB_OK | MB_ICONERROR);
         }
     } else {
         pause_if_own_console();
@@ -620,7 +627,6 @@ int run_service(DWORD* code) {
            g_tray ? "" : "；Ctrl+C 同时停止 API 和引擎。");
     fflush(stdout);
     report(kReady);
-    conf_write_marker();  // 首次就绪：service.conf 写入"面板已配置"标记（幂等）
 
     HANDLE both[2] = {engine.proc, api.proc};
     const DWORD who = WaitForMultipleObjects(2, both, FALSE, INFINITE) - WAIT_OBJECT_0;
@@ -641,14 +647,14 @@ volatile LONG g_tray_added = 0;
 UINT g_wm_taskbar_created = 0;  // 资源管理器重启后广播，需重新加图标
 
 enum MenuId : UINT {
-    kIdDashboard = 1, kIdCopyUrl, kIdEngineLog, kIdApiLog, kIdLogDir, kIdSetup, kIdQuit
+    kIdDashboard = 1, kIdCopyUrl, kIdEngineLog, kIdApiLog, kIdLogDir, kIdQuit
 };
 
 std::wstring status_text() {
     switch (g_state) {
-        case kReady: return L"已就绪：" + to_w(local_base()) + L"/v1";
-        case kApiStarting: return L"模型已加载，正在启动 API…";
-        default: return L"正在加载模型…";
+        case kReady: return TR(L"已就绪：", L"Ready: ") + to_w(local_base()) + L"/v1";
+        case kApiStarting: return TR(L"模型已加载，正在启动 API…", L"Model loaded, starting API…");
+        default: return TR(L"正在加载模型…", L"Loading model…");
     }
 }
 
@@ -742,21 +748,15 @@ void on_menu(UINT id) {
         case kIdDashboard: shell_open(local_base() + "/"); break;
         case kIdCopyUrl:
             copy_text(to_w(local_base() + "/v1"));
-            tray_balloon(L"已复制", to_w(local_base() + "/v1"));
+            tray_balloon(TR(L"已复制", L"Copied"), to_w(local_base() + "/v1"));
             break;
         case kIdEngineLog: shell_open(g_root + "\\" + g_plan.engine_log); break;
         case kIdApiLog: shell_open(g_root + "\\" + g_plan.api_log); break;
         case kIdLogDir: shell_open(g_root + "\\logs"); break;
-        case kIdSetup: {
-            // 服务运行中打开：面板里"启动服务"禁用，保存后重启生效。
-            PanelResult pr;
-            do pr = panel_run(false); while (pr == kPanelRelang);
-            if (pr != kPanelCancel)
-                tray_balloon(L"配置已保存", L"新的启动参数将在下次启动服务时生效。");
-            break;
-        }
         case kIdQuit:
-            if (msgbox("退出会同时停止引擎和 API，正在进行的生成会中断。\n确定退出？",
+            if (msgbox(TR("退出会同时停止引擎和 API，正在进行的生成会中断。\n确定退出？",
+                          "Quitting stops the engine and the API; any ongoing generation "
+                          "will be interrupted.\nQuit now?"),
                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES)
                 quit_all(0);
             break;
@@ -771,17 +771,15 @@ void show_menu() {
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, status_text().c_str());
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (st == kReady ? 0 : MF_GRAYED), kIdDashboard,
-                L"打开面板（浏览器）");
-    AppendMenuW(m, MF_STRING, kIdCopyUrl, L"复制 API 地址");
+                TR(L"打开控制台", L"Open console"));
+    AppendMenuW(m, MF_STRING, kIdCopyUrl, TR(L"复制 API 地址", L"Copy API URL"));
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, kIdEngineLog, L"查看引擎日志");
+    AppendMenuW(m, MF_STRING, kIdEngineLog, TR(L"查看引擎日志", L"View engine log"));
     AppendMenuW(m, MF_STRING | (st >= kApiStarting ? 0 : MF_GRAYED), kIdApiLog,
-                L"查看 API 日志");
-    AppendMenuW(m, MF_STRING, kIdLogDir, L"打开日志文件夹");
+                TR(L"查看 API 日志", L"View API log"));
+    AppendMenuW(m, MF_STRING, kIdLogDir, TR(L"打开日志文件夹", L"Open logs folder"));
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, kIdSetup, L"设置…");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, kIdQuit, L"退出（停止引擎和 API）");
+    AppendMenuW(m, MF_STRING, kIdQuit, TR(L"退出", L"Quit"));
     POINT pt;
     GetCursorPos(&pt);
     SetForegroundWindow(g_hwnd);  // 否则点菜单外面菜单不消失
@@ -807,17 +805,26 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_SVC_STATE) {
         tray_update_tip();
         if (wp == static_cast<WPARAM>(kReady))
-            tray_balloon(L"服务已就绪",
-                         to_w(local_base() + "/v1\n双击图标打开面板，右键查看更多"));
+            tray_balloon(TR(L"服务已就绪", L"Service ready"),
+                         to_w(local_base() + "/v1") + L"\n" +
+                             TR(L"双击图标打开控制台，右键查看更多",
+                                L"Double-click the icon to open the console; "
+                                L"right-click for more"));
         return 0;
     }
     if (msg == WM_SVC_EXIT) {
         tray_remove();
         const bool is_api = wp == 1;
+        const std::string log = is_api ? g_plan.api_log : g_plan.engine_log;
+        const std::string code = std::to_string(static_cast<DWORD>(lp));
         const std::string text =
-            std::string(is_api ? "API" : "引擎") + "进程已退出（退出码 " +
-            std::to_string(static_cast<DWORD>(lp)) + "），服务已停止。\n\n日志：" +
-            (is_api ? g_plan.api_log : g_plan.engine_log) + "\n是否打开日志文件夹？";
+            g_lang_en
+                ? "The " + std::string(is_api ? "API" : "engine") +
+                      " process exited (code " + code +
+                      "); the service has stopped.\n\nLog: " + log +
+                      "\nOpen the logs folder?"
+                : std::string(is_api ? "API" : "引擎") + "进程已退出（退出码 " + code +
+                      "），服务已停止。\n\n日志：" + log + "\n是否打开日志文件夹？";
         if (msgbox(text, MB_YESNO | MB_ICONWARNING) == IDYES) shell_open(g_root + "\\logs");
         ExitProcess(static_cast<UINT>(lp));
     }
@@ -851,8 +858,10 @@ int tray_main() {
     if (!g_hwnd) fail("无法创建托盘窗口，错误码 " + std::to_string(GetLastError()));
     g_wm_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
     tray_add();
-    tray_balloon(L"正在加载模型",
-                 L"冷启动可能要几分钟。就绪后会再提示；右键托盘图标可查看日志或退出。");
+    tray_balloon(TR(L"正在加载模型", L"Loading model"),
+                 TR(L"冷启动可能要几分钟。就绪后会再提示；右键托盘图标可查看日志或退出。",
+                    L"A cold start can take a few minutes. You'll be notified when it's "
+                    L"ready; right-click the tray icon to view logs or quit."));
 
     HANDLE t = CreateThread(nullptr, 0, service_thread, nullptr, 0, nullptr);
     if (!t) fail("无法创建服务线程");
@@ -868,16 +877,16 @@ int tray_main() {
 
 }  // namespace
 
-// 启动配置面板（含 save_conf / conf_write_marker / panel_run）。
+// 启动配置面板（含 save_conf / panel_lang_resolve / panel_run）。
 // 必须放在匿名命名空间之外：面板内部要 include <set> 等标准头。
 #include "launch_panel.inc"
 
 int main(int argc, char** argv) {
-    bool check_only = false, want_console = false, want_setup = false;
+    bool check_only = false, want_console = false;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--check") == 0) check_only = true;
         else if (strcmp(argv[i], "--console") == 0) want_console = true;
-        else if (strcmp(argv[i], "--setup") == 0) want_setup = true;
+        // --setup 已废弃（面板现在总是显示），忽略不报错
     }
     g_tray = !check_only && !want_console;
     // 高 DPI 屏上托盘图标取对应尺寸、弹框/菜单文字不发糊
@@ -894,6 +903,10 @@ int main(int argc, char** argv) {
     const size_t wslash = g_root_w.find_last_of(L"\\/");
     if (wslash != std::wstring::npos) g_root_w.resize(wslash);
     SetCurrentDirectoryW(g_root_w.empty() ? L"." : g_root_w.c_str());
+
+    // 界面语言（托盘与面板共用）：service.conf lang 标记 > UI_LANG > 系统
+    // UI 语言（非中文→英文）。标记读文件不依赖 load_conf，尽早解析。
+    panel_lang_resolve();
 
     {
         SYSTEMTIME st;
@@ -923,15 +936,14 @@ int main(int argc, char** argv) {
 
     load_conf(g_root + "\\service.conf");
 
-    // 启动配置面板：--setup 强制显示；否则只在 service.conf 没有
-    // "# start_win: configured" 标记（首次启动）时显示。面板在"启动服务"时
-    // 已把新值写进 g_conf 和 service.conf，下面的 cfg() 会读到新配置。
-    // --check / --console 不显示面板，行为与之前完全一致。
-    if (!check_only && !want_console && (want_setup || !conf_has_marker())) {
+    // 启动配置面板：双击（托盘模式）启动时总是显示，点"启动服务"才继续。
+    // 面板在"启动服务"时已把新值写进 g_conf 和 service.conf，下面的 cfg()
+    // 会读到新配置。--check / --console 不显示面板，行为与之前完全一致。
+    if (!check_only && !want_console) {
         // kPanelRelang：语言切换后重开面板（新语言在 panel_run 里重新解析）
         PanelResult pr;
         do pr = panel_run(true); while (pr == kPanelRelang);
-        if (pr != kPanelStart) return 0;  // 取消 / 仅保存：直接退出
+        if (pr != kPanelStart) return 0;  // 取消：直接退出（仅保存不关面板）
     }
 
     const std::string model_dir = cfg("MODEL_DIR", "models");
