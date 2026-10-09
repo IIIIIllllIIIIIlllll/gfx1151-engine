@@ -1003,7 +1003,10 @@ bool g_pool_guard = false;          // 程序自己在写总池框（防 EN_CHAN
 AllChecks g_last_checks;
 std::vector<HWND> g_page_ctls[4];   // 每页的控件句柄（切页时整体 ShowWindow）
 Gdiplus::Image* g_art = nullptr;    // 左侧立绘（media/qwen-charactor-alpha.png）
+Gdiplus::Image* g_bg_img = nullptr; // 全窗背景（media/panel-bg.png，banner 派生）
 int g_art_w = 0;                    // 立绘条宽度；图片缺失时为 0，退回经典紧凑布局
+HDC g_bg_dc = nullptr;              // 烘焙好的全窗背景（背景图+立绘），erase 时 BitBlt
+HBITMAP g_bg_bmp = nullptr;
 HBRUSH g_panel_bg = nullptr;        // 面板底色刷（淡蓝紫白，替代系统 BTNFACE 灰）
 constexpr COLORREF kPanelBg = RGB(236, 239, 247);
 
@@ -1247,8 +1250,11 @@ void show_page(int idx) {
     if (idx == 0) layout_page1(g_weights_ver);  // 重新隐藏非当前版本的文件行
 }
 
-// 立绘加载：GDI+ 惰性初始化（进程一次）。图片缺失时 g_art_w=0，
+// 立绘/背景加载：GDI+ 惰性初始化（进程一次）。立绘缺失时 g_art_w=0，
 // 窗口退回经典 644 宽紧凑布局，功能不受影响。
+// 背景图存在时把「背景 + 立绘」烘焙成一张全客户区缓存位图：WM_ERASEBKGND
+// 直接 BitBlt 它来完成擦除 —— 透明文字标签下方永远是真实背景像素，
+// 既不闪烁也不会残影。
 void load_panel_art() {
     static ULONG_PTR gdip_token = 0;
     if (!gdip_token) {
@@ -1264,6 +1270,35 @@ void load_panel_art() {
         g_art = nullptr;
         g_art_w = 0;
     }
+    delete g_bg_img;
+    g_bg_img = Gdiplus::Image::FromFile(to_w(g_root + "\\media\\panel-bg.png").c_str());
+    if (g_bg_img && g_bg_img->GetLastStatus() != Gdiplus::Ok) {
+        delete g_bg_img;
+        g_bg_img = nullptr;
+    }
+    if (g_bg_dc) { DeleteDC(g_bg_dc); g_bg_dc = nullptr; }
+    if (g_bg_bmp) { DeleteObject(g_bg_bmp); g_bg_bmp = nullptr; }
+    if (!g_bg_img) return;
+    const int cw = kCliW + g_art_w;
+    HDC scr = GetDC(nullptr);
+    g_bg_dc = CreateCompatibleDC(scr);
+    g_bg_bmp = CreateCompatibleBitmap(scr, cw, kCliH);
+    ReleaseDC(nullptr, scr);
+    HGDIOBJ old = SelectObject(g_bg_dc, g_bg_bmp);
+    Gdiplus::Graphics g(g_bg_dc);
+    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+    g.DrawImage(g_bg_img, 0, 0, cw, kCliH);
+    if (g_art) {  // 立绘居中烘焙进背景
+        const int iw = static_cast<int>(g_art->GetWidth()),
+                  ih = static_cast<int>(g_art->GetHeight());
+        int dw = g_art_w - 8, dh = static_cast<int>((double)dw * ih / iw);
+        if (dh > kCliH) {
+            dh = kCliH;
+            dw = static_cast<int>((double)dh * iw / ih);
+        }
+        g.DrawImage(g_art, (g_art_w - dw) / 2, (kCliH - dh) / 2, dw, dh);
+    }
+    SelectObject(g_bg_dc, old);
 }
 
 LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1272,19 +1307,27 @@ LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         SetBkMode(reinterpret_cast<HDC>(wp), TRANSPARENT);
         return reinterpret_cast<LRESULT>(g_panel_bg);
     }
-    if (msg == WM_ERASEBKGND && g_art_w > 0) {
-        // 只擦控件区；立绘条由 WM_PAINT 完整重绘，避免切版本/翻页时闪烁
-        HDC dc = reinterpret_cast<HDC>(wp);
-        RECT rc;
-        GetClientRect(h, &rc);
-        RECT r{g_art_w, 0, rc.right, rc.bottom};
-        FillRect(dc, &r, g_panel_bg);
-        return 1;
+    if (msg == WM_ERASEBKGND) {
+        if (g_bg_dc) {  // 擦除 = 贴回烘焙背景（透明标签下方永远是真实背景像素）
+            HDC dc = reinterpret_cast<HDC>(wp);
+            BitBlt(dc, 0, 0, kCliW + g_art_w, kCliH, g_bg_dc, 0, 0, SRCCOPY);
+            return 1;
+        }
+        if (g_art_w > 0) {  // 无背景图只有立绘：只擦控件区，立绘条由 WM_PAINT 画
+            HDC dc = reinterpret_cast<HDC>(wp);
+            RECT rc;
+            GetClientRect(h, &rc);
+            RECT r{g_art_w, 0, rc.right, rc.bottom};
+            FillRect(dc, &r, g_panel_bg);
+            return 1;
+        }
     }
     if (msg == WM_PAINT) {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
-        if (g_art && g_art_w > 0) {
+        if (g_bg_dc) {
+            BitBlt(dc, 0, 0, kCliW + g_art_w, kCliH, g_bg_dc, 0, 0, SRCCOPY);
+        } else if (g_art && g_art_w > 0) {
             Gdiplus::Graphics g(dc);
             g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
             Gdiplus::SolidBrush bg(Gdiplus::Color(255, GetRValue(kPanelBg), GetGValue(kPanelBg),
