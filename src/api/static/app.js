@@ -44,7 +44,7 @@ const I18N = {
     "usage.empty": "范围内没有请求记录",
     "usage.note": "v1 数据来自 /reqstat/tail 最近 1000 条记录，更早的历史需要后端按天聚合端点后接入。",
     "req.from": "起", "req.to": "止", "req.size": "每页", "req.clear": "清除筛选",
-    "req.time": "时间", "req.seq": "序号", "req.cache": "缓存", "req.accept": "接受率",
+    "req.time": "时间", "req.cache": "缓存", "req.accept": "接受率",
     "req.prev_page": "上一页", "req.next_page": "下一页",
     "req.note_server": "服务端分页（/reqstat/page），可翻阅全部历史；日期与 finish/drafter 为前端过滤（过滤时仅覆盖最近 1000 条）。",
     "req.note_filtered": "已设筛选：后端不支持按条件检索，仅在 /reqstat/tail 最近 1000 条内过滤分页。",
@@ -110,7 +110,7 @@ const I18N = {
     "usage.empty": "no requests in range",
     "usage.note": "v1: newest 1000 records via /reqstat/tail; older history needs a backend per-day aggregation endpoint.",
     "req.from": "From", "req.to": "To", "req.size": "Per page", "req.clear": "Clear filters",
-    "req.time": "Time", "req.seq": "#", "req.cache": "Cache", "req.accept": "Acceptance",
+    "req.time": "Time", "req.cache": "Cache", "req.accept": "Acceptance",
     "req.prev_page": "Prev", "req.next_page": "Next",
     "req.note_server": "Server-side paging (/reqstat/page) over the full history; date and finish/drafter filters are client-side (newest 1000 records only).",
     "req.note_filtered": "Filters active: the backend has no conditional search, so filtering covers only the newest 1000 records from /reqstat/tail.",
@@ -817,7 +817,7 @@ function fillRequestRows(rows) {
   for (const r of rows) {
     const tr = document.createElement("tr");
     const cells = [
-      fmtTime(r.ts_ms), fmtInt(r.req_seq), fmtInt(r.prompt_tokens), fmtInt(r.cached_tokens),
+      fmtTime(r.ts_ms), fmtInt(r.prompt_tokens), fmtInt(r.cached_tokens),
       fmtInt(r.output_tokens), fmtMs(r.ttft_ms), fmtMs(r.prefill_ms), fmtMs(r.decode_ms),
       tokPerS(r.prompt_tokens - r.cached_tokens, r.prefill_ms),
       tokPerS(r.output_tokens, r.decode_ms),
@@ -826,7 +826,7 @@ function fillRequestRows(rows) {
     ];
     cells.forEach((v, i) => {
       const td = document.createElement("td");
-      if (i > 0 && i !== 10 && i !== 11) td.className = "r";
+      if (i > 0 && i !== 9 && i !== 10) td.className = "r";
       td.textContent = String(v);
       tr.appendChild(td);
     });
