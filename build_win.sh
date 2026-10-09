@@ -114,7 +114,7 @@ build_api() {
       src/api/http.cpp src/api/engine_client.cpp src/api/tokenizer.cpp \
       src/api/chat_template.cpp src/api/json_py.cpp src/api/toolparse.cpp \
       src/api/vision.cpp src/api/reqstat.cpp src/api/reqstat_read.cpp \
-      src/api/main.cpp -lws2_32 -o build/gdec-api-win.exe
+      src/api/power.cpp src/api/main.cpp -lws2_32 -o build/gdec-api-win.exe
 }
 
 build_launcher() {

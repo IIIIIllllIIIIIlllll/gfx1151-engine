@@ -3,7 +3,7 @@
  * - 四个页面（总览/用量/请求/采样），hash 路由，左侧按钮分页。
  * - 文案双语：静态文本在 index.html 挂 data-i18n 键，动态文案走 t()；
  *   语言存 localStorage，首次按浏览器语言自动选择，侧栏 EN/中文 按钮切换。
- * - 数据源：/health /memory /admin/overrides /reqstat/page /reqstat/tail。
+ * - 数据源：/health /memory /power /admin/overrides /reqstat/page /reqstat/tail。
  *   请求页无筛选条件时走 /reqstat/page 服务端分页（可翻阅全部历史）；
  *   设了筛选条件回退到 tail 最近 1000 条内存过滤。用量页仍按 tail 聚合，
  *   按天聚合端点落地后再切换（见 usage-note）。
@@ -17,19 +17,17 @@ const I18N = {
     "hint.busy": "引擎忙闲",
     "hint.theme": "切换明暗主题",
     "nav.overview": "总览", "nav.usage": "用量", "nav.requests": "请求",
-    "common.loading": "加载中…", "common.pending": "待接入",
+    "common.loading": "加载中…",
     "common.refresh": "刷新", "common.all": "全部", "common.read_failed": "读取失败",
     "common.requests": "请求数",
     "stamp.updated": "更新", "stamp.failed": "请求失败",
     "ov.status": "服务状态", "ov.model": "模型配置",
-    "ov.mem": "显存与内存", "ov.overrides": "采样与服务端覆盖",
-    "ov.sys": "系统信息", "ov.sys_soon": "后端待建",
-    "ov.sys_cpu": "CPU", "ov.sys_hostmem": "主机内存",
-    "ov.sys_disk": "磁盘", "ov.sys_uptime": "进程运行时长",
+    "ov.mem": "显存与内存", "ov.power": "功耗",
+    "power.socket": "整机封装", "power.gfx": "GPU 功耗", "power.cpu": "CPU 功耗",
+    "power.na": "功耗读数不可用",
     "health.status": "状态", "health.busy_field": "忙闲",
     "health.busy_yes": "推理中", "health.busy_no": "空闲",
-    "health.inflight": "在途请求", "health.busy_for": "本轮已持续",
-    "health.endpoints": "接口数", "health.model": "模型",
+    "health.inflight": "在途请求", "health.model": "模型",
     "health.context": "上下文", "health.slots": "并发槽位",
     "health.rope_off": "未启用", "health.tool": "工具调用",
     "health.tool_on": "解析已启用", "health.tool_off": "透传",
@@ -38,7 +36,6 @@ const I18N = {
     "mem.vram_peak": "引擎显存峰值", "mem.rss": "常驻主机内存 RSS",
     "mem.pinned": "锁页内存", "mem.accessible": "可访问已提交",
     "mem.offline": "引擎未连接（/memory 不可用）",
-    "ovr.field": "覆盖项", "ovr.none": "无（按请求参数）",
     "ovr.on": "开", "ovr.off": "关",
     "usage.range": "范围", "usage.d7": "近 7 天", "usage.d14": "近 14 天",
     "usage.d30": "近 30 天", "usage.daily": "按天明细", "usage.day": "日期",
@@ -86,19 +83,17 @@ const I18N = {
     "hint.busy": "engine busy/idle",
     "hint.theme": "toggle light/dark theme",
     "nav.overview": "Overview", "nav.usage": "Usage", "nav.requests": "Requests",
-    "common.loading": "Loading…", "common.pending": "pending",
+    "common.loading": "Loading…",
     "common.refresh": "Refresh", "common.all": "All", "common.read_failed": "read failed",
     "common.requests": "Requests",
     "stamp.updated": "Updated", "stamp.failed": "request failed",
     "ov.status": "Service status", "ov.model": "Model config",
-    "ov.mem": "VRAM & memory", "ov.overrides": "Sampling & server overrides",
-    "ov.sys": "System info", "ov.sys_soon": "backend TBD",
-    "ov.sys_cpu": "CPU", "ov.sys_hostmem": "Host memory",
-    "ov.sys_disk": "Disk", "ov.sys_uptime": "Process uptime",
+    "ov.mem": "VRAM & memory", "ov.power": "Power",
+    "power.socket": "Package", "power.gfx": "GPU", "power.cpu": "CPU",
+    "power.na": "power reading unavailable",
     "health.status": "Status", "health.busy_field": "Busy",
     "health.busy_yes": "generating", "health.busy_no": "idle",
-    "health.inflight": "In flight", "health.busy_for": "Current burst",
-    "health.endpoints": "Endpoints", "health.model": "Model",
+    "health.inflight": "In flight", "health.model": "Model",
     "health.context": "Context", "health.slots": "Slots",
     "health.rope_off": "off", "health.tool": "Tool calls",
     "health.tool_on": "parsing enabled", "health.tool_off": "passthrough",
@@ -107,7 +102,6 @@ const I18N = {
     "mem.vram_peak": "Engine VRAM peak", "mem.rss": "RSS (host)",
     "mem.pinned": "Pinned memory", "mem.accessible": "Accessible committed",
     "mem.offline": "engine offline (/memory unavailable)",
-    "ovr.field": "Overrides", "ovr.none": "none (per request params)",
     "ovr.on": "on", "ovr.off": "off",
     "usage.range": "Range", "usage.d7": "7 days", "usage.d14": "14 days",
     "usage.d30": "30 days", "usage.daily": "Per day", "usage.day": "Date",
@@ -183,7 +177,7 @@ document.getElementById("lang-btn").addEventListener("click", () => {
   try { localStorage.setItem("gdec-lang", LANG); } catch (e) { /* 同上 */ }
   applyLang();
   // 动态文案（徽章/表格外新增文本/时间戳）随当前页面重渲染，不重新发请求
-  if (currentPage === "overview") { refreshHealth(); refreshMemory(); refreshOverrides(); }
+  if (currentPage === "overview") { refreshHealth(); refreshMemory(); refreshPower(); }
   else if (currentPage === "usage") { if (reqCache.records.length) renderUsage(); }
   else if (currentPage === "requests") renderRequests();
   else if (currentPage === "sample") syncSampleLang();
@@ -319,13 +313,14 @@ let ovTimer = null;
 function enterOverview() {
   refreshHealth();
   refreshMemory();
-  refreshOverrides();
+  refreshPower();
   if (ovTimer) clearInterval(ovTimer);
   let tick = 0;
   ovTimer = setInterval(() => {
     if (currentPage !== "overview" || document.hidden) return;
     refreshHealth();
-    if (++tick % 5 === 0) { refreshMemory(); refreshOverrides(); }
+    refreshPower();
+    if (++tick % 5 === 0) refreshMemory();
   }, 2000);
   // 离开页面时停掉轮询
   const stop = () => { if (ovTimer) { clearInterval(ovTimer); ovTimer = null; } };
@@ -348,8 +343,6 @@ async function refreshHealth() {
       [t("health.busy_field"), busy],
       [t("health.inflight"), fmtInt(h.in_flight ?? 0) +
         (h.queued ? (LANG === "zh" ? "（排队 " : " (queued ") + fmtInt(h.queued) + (LANG === "zh" ? "）" : ")") : "")],
-      [t("health.busy_for"), h.busy ? fmtMs((h.busy_for_s ?? 0) * 1000) : "—"],
-      [t("health.endpoints"), fmtInt((h.endpoints || []).length)],
     ]);
     const rows = [
       [t("health.model"), h.model || "—"],
@@ -406,23 +399,24 @@ async function refreshMemory() {
   }
 }
 
-async function refreshOverrides() {
-  const el = document.getElementById("ov-overrides");
+async function refreshPower() {
+  const el = document.getElementById("ov-power");
+  const stamp = document.getElementById("power-stamp");
   try {
-    const o = await getJSON("/admin/overrides");
-    const table = o.overrides || {};   // 响应体是 {overrides, persist_path, admin_key_required}
-    const keys = Object.keys(table).sort();
-    if (!keys.length) {
-      fillKv(el, [[t("ovr.field"), t("ovr.none")]]);
-      return;
+    const p = await getJSON("/power");
+    if (!p.available) {
+      fillKv(el, [[t("ov.power"), t("power.na")]]);
+    } else {
+      const rows = [];
+      if (p.socket_watts != null) rows.push([t("power.socket"), p.socket_watts + " W"]);
+      if (p.gfx_watts != null) rows.push([t("power.gfx"), p.gfx_watts + " W"]);
+      if (p.cpu_watts != null) rows.push([t("power.cpu"), p.cpu_watts + " W"]);
+      fillKv(el, rows);
     }
-    fillKv(el, keys.map((k) => {
-      const e = table[k] || {};
-      const v = typeof e.value === "boolean" ? (e.value ? t("ovr.on") : t("ovr.off")) : String(e.value);
-      return [k, v + " · " + t(e.mode === "force" ? "ovr.mode_force" : "ovr.mode_default")];
-    }));
+    stampNow(stamp);
   } catch (e) {
-    fillKv(el, [[t("ovr.field"), t("common.read_failed")]]);
+    fillKv(el, [[t("ov.power"), t("common.read_failed")]]);
+    stamp.textContent = "";
   }
 }
 

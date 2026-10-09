@@ -45,6 +45,7 @@
 #include "engine_client.h"
 #include "http.h"
 #include "json_py.h"
+#include "power.h"
 #include "reqstat.h"
 #include "reqstat_read.h"
 #include "tokenizer.h"
@@ -1599,6 +1600,21 @@ void handle_memory(const http::Request&, http::Response* r, http::Stream*) {
     r->body = json_py::dumps(j, /*spaced=*/false);
 }
 
+// GET /power — APU 功耗瞬时值（Windows ADL PMLog / Linux amdgpu hwmon），
+// 读不到的字段为 null，完全不可用时 available=false。
+void handle_power(const http::Request&, http::Response* r, http::Stream*) {
+    const power::Reading p = power::read();
+    json j;
+    j["available"] = p.available;
+    if (p.socket_watts >= 0) j["socket_watts"] = p.socket_watts;
+    else j["socket_watts"] = nullptr;
+    if (p.gfx_watts >= 0) j["gfx_watts"] = p.gfx_watts;
+    else j["gfx_watts"] = nullptr;
+    if (p.cpu_watts >= 0) j["cpu_watts"] = p.cpu_watts;
+    else j["cpu_watts"] = nullptr;
+    r->body = json_py::dumps(j, /*spaced=*/false);
+}
+
 // --------------------------------------------------------- request stats --
 
 // GET /reqstat/summary?from=YYYY-MM-DD&to=YYYY-MM-DD — aggregates over the
@@ -2945,6 +2961,7 @@ int main(int argc, char** argv) {
     srv.on("GET", "/v1/models", handle_models);
     srv.on("GET", "/health", handle_health);
     srv.on("GET", "/memory", handle_memory);
+    srv.on("GET", "/power", handle_power);
     srv.on("GET", "/cache", handle_cache);
     srv.on("GET", "/reqstat/summary", handle_reqstat_summary);
     srv.on("GET", "/reqstat/tail", handle_reqstat_tail);
