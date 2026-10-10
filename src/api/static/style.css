@@ -83,10 +83,13 @@ body {
 }
 :focus-visible { outline: 2px solid #ff9a3c; outline-offset: 3px; }
 
+/* 机身固定一屏高，CRT 内部滚动；视口矮于 min-height 时才整页滚动 */
 .chassis {
   height: 100vh;
+  height: 100dvh;
+  min-height: 500px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 280px;
+  grid-template-columns: minmax(0, 1fr) clamp(200px, 19vw, 280px);
   grid-template-rows: minmax(0, 1fr) auto auto;
   grid-template-areas:
     "crt     deck"
@@ -206,6 +209,43 @@ body {
 .head-tools { display: flex; align-items: center; gap: 10px 14px; flex-wrap: wrap; }
 .page { animation: page-in .2s steps(3) both; }
 @keyframes page-in { from { opacity: .25; } }
+
+/* 撑满屏幕的数据页（用量 / 请求）：页高 = 屏幕内容高，页头、筛选、分页固定，
+   只有 .table-wrap / .chart-box 伸缩；屏幕实在太矮时 min-height 兜底，退回整屏滚动 */
+.page.fill {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 340px;
+}
+.page.fill .page-head { flex: none; position: static; }
+.fill-card {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.fill-card > * { flex: none; }
+.fill-card > .table-wrap,
+.fill-card > .chart-box { flex: 1; min-height: 120px; }
+.card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 20px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+/* 口径说明单行截断，全文在 title 悬停提示里（app.js 填写时同步 title） */
+.card-foot .note {
+  flex: 1 1 200px;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  cursor: help;
+}
 
 .hidden { display: none !important; }
 .muted { color: var(--p-mid); }
@@ -355,6 +395,11 @@ input:disabled, select:disabled { opacity: .35; }
   scrollbar-width: thin;
   scrollbar-color: var(--p-dim) transparent;
 }
+/* fill 页里表格区自己双向滚动：表头吸顶、横向滚动条始终在可见处 */
+.fill-card > .table-wrap { overflow: auto; }
+.table-wrap::-webkit-scrollbar { width: 8px; height: 8px; }
+.table-wrap::-webkit-scrollbar-thumb { background: var(--p-dim); }
+.table-wrap::-webkit-scrollbar-track, .table-wrap::-webkit-scrollbar-corner { background: transparent; }
 .table {
   width: 100%;
   border-collapse: collapse;
@@ -366,10 +411,11 @@ input:disabled, select:disabled { opacity: .35; }
   white-space: nowrap;
 }
 .table td { border-bottom: 1px dashed rgba(134, 245, 168, .13); }
-/* .table-wrap 是 overflow-x 滚动容器，sticky 只能相对它生效；
-   若 top 非 0，表头会被顶出原位压到数据行，故固定 top: 0（不吸顶） */
+/* sticky 相对 .table-wrap 生效：fill 页里它是纵向滚动容器，表头吸顶；
+   其它页它只横向滚动，top: 0 等于不动（top 非 0 会把表头压到数据行上） */
 .table th {
   position: sticky; top: 0;
+  z-index: 2;
   background: var(--scr-bg);
   color: var(--p-mid);
   font-weight: 600;
@@ -381,13 +427,17 @@ input:disabled, select:disabled { opacity: .35; }
 .table tbody tr:last-child td { border-bottom: 0; }
 .table tbody tr:hover { background: rgba(134, 245, 168, .07); }
 
-.pager {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 14px;
-  margin-top: 16px;
+/* 请求表时间列横向滚动时钉在左侧 */
+#req-table th:first-child, #req-table td:first-child {
+  position: sticky; left: 0;
+  background: var(--scr-bg);
+  box-shadow: inset -1px 0 0 var(--p-dim);
 }
+#req-table th:first-child { z-index: 3; }
+#req-table tbody tr:hover td:first-child { background: #0c1f14; }
+
+.pager { padding-top: 10px; border-top: 1px solid var(--p-dim); }
+.pager-ctl { display: flex; align-items: center; gap: 14px; margin-left: auto; white-space: nowrap; }
 
 /* ---- 采样（服务端覆盖）页 ---- */
 .ovr-hint { margin: 0 0 16px; line-height: 1.75; }
@@ -519,8 +569,10 @@ input:disabled, select:disabled { opacity: .35; }
 .total-item { display: flex; flex-direction: column; gap: 2px; }
 .total-item b { font-size: 26px; line-height: 1.15; }
 .total-item span { color: var(--p-mid); font-size: 12px; }
-#usage-chart { display: block; width: 100%; }
-.legend { margin-top: 10px; font-size: 12px; color: var(--p-mid); }
+.chart-box { position: relative; }
+#usage-chart { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
+.legend { font-size: 12px; color: var(--p-mid); white-space: nowrap; }
+#usage-note { text-align: right; }
 .lg { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; }
 .lg-prompt { background: var(--chart-prompt); }
 .lg-gen { background: var(--chart-gen); margin-left: 18px; }
@@ -565,6 +617,7 @@ body:has(#busy-dot.busy) .reel { animation: reel-spin 1.6s linear infinite; }
   color: var(--key-ink);
   font-size: 12px;
   letter-spacing: -.12em;
+  white-space: nowrap;
   box-shadow: 0 4px 0 var(--key-depth), inset 0 1px 0 rgba(255, 255, 255, .6);
   user-select: none;
 }
@@ -751,27 +804,88 @@ body:has(#busy-dot.down, #busy-dot.exited) .lamp-warn {
     #cf5229 13px 17px);
 }
 
-/* ================= 窄屏：控制条置顶，CRT 随页面滚动 ================= */
+/* ================= 小分辨率 =================
+ * 三档可叠加：≤1280 宽收窄屏内留白；≤800 高（笔记本 + 浏览器栏）压缩竖向尺寸、去铭牌；
+ * ≤980 宽控制条置顶、去走带模块，CRT 仍占满剩余高度并在屏内滚动（数据页筛选/分页始终可见）；
+ * ≤600 宽为手机档。 */
+@media (max-width: 1280px) {
+  .main { padding: 0 26px 26px; }
+  .page-head { padding: 20px 0 10px; margin-bottom: 24px; }
+  .table th, .table td { padding: 5px 9px; }
+  .sidebar { padding: 16px; }
+  .brand { gap: 16px; }
+  .reel-window { padding: 14px 10px; }
+  .deck-label { padding-top: 14px; }
+  .console { gap: 14px 26px; }
+}
+
+@media (max-height: 800px) {
+  .chassis { gap: 12px 18px; padding: 12px 18px 10px; }
+  .plate { display: none; }
+  .crt { padding: 14px; border-radius: 22px; }
+  .crt-glass { border-radius: 16px; }
+  .main { padding-bottom: 20px; }
+  .page-head { padding: 16px 0 8px; margin-bottom: 20px; }
+  .page-head h1 { font-size: 19px; }
+  .card { padding: 18px 14px 12px; }
+  .card + .card { margin-top: 28px; }
+  .grid { gap: 28px 20px; }
+  .kv-row { padding: 2px 0; }
+  .filters { margin-bottom: 10px; }
+  .totals { padding-bottom: 10px; margin-bottom: 10px; }
+  .total-item b { font-size: 22px; }
+  .card-foot { margin-top: 8px; }
+  .pager { padding-top: 8px; }
+  .nav-btn { height: 48px; padding: 6px 9px 7px; }
+  .led { gap: 9px; }
+  .hw-switch-slot { height: 40px; }
+  .hw-switch.on .hw-switch-knob { transform: translateY(14px); }
+  .sidebar { padding: 14px; }
+  .transport { gap: 8px; }
+  .tk { height: 30px; }
+}
+
 @media (max-width: 980px) {
   .chassis {
-    height: auto;
-    min-height: 100vh;
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto auto auto;
-    grid-template-areas: "console" "crt" "plate";
-    padding: 14px 12px;
-    gap: 16px;
+    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-areas: "console" "crt";
+    padding: 12px;
+    gap: 12px;
   }
-  .sidebar { display: none; }
-  .crt { padding: 12px; border-radius: 20px; }
-  .crt-glass { border-radius: 14px; min-height: 70vh; }
-  .main { position: relative; inset: auto; overflow: visible; padding: 0 18px 24px; }
-  .page-head { position: static; }
-  .console { gap: 18px 22px; }
+  .sidebar, .plate { display: none; }
+  .crt { padding: 10px; border-radius: 18px; }
+  .crt-glass { border-radius: 12px; }
+  .crt-glass::after { inset: 8px; }
+  .main { padding: 0 18px 18px; }
+  .page-head { padding: 14px 0 8px; margin-bottom: 18px; }
+  .console { gap: 12px 22px; }
   .nav { flex: 1 0 100%; gap: 8px; }
-  .nav-btn { flex: 1; width: auto; min-width: 0; height: 52px; }
+  .nav-btn { flex: 1; width: auto; min-width: 0; height: 46px; }
   .leds { gap: 20px; }
   .grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 600px) {
+  .chassis { padding: 8px; gap: 10px; }
+  .crt { padding: 7px; border-radius: 14px; }
+  .main { padding: 0 10px 12px; font-size: 13px; }
+  .page-head { gap: 8px 12px; padding-top: 12px; }
+  .page-head h1 { font-size: 17px; }
+  .card { padding: 16px 8px 10px; }
+  .filters { gap: 8px 12px; font-size: 12px; }
+  .filters label { gap: 5px; }
+  input[type=date] { width: 132px; }
+  .totals { gap: 8px 22px; }
+  .total-item b { font-size: 19px; }
+  .table th, .table td { padding: 4px 7px; }
+  .pager-ctl { flex: 1 0 100%; justify-content: space-between; gap: 6px; margin-left: 0; }
+  .pager-ctl .btn { padding: 0 6px; }
+  #req-pageinfo { font-size: 11px; }
+  .nav { gap: 5px; }
+  .nav-btn { height: 42px; padding: 5px 6px; font-size: 13px; }
+  .leds { gap: 14px; }
+  .sidebar-foot { gap: 16px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

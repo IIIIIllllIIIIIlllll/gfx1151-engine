@@ -42,7 +42,8 @@
   </section>
 
   <!-- ======================= 用量 ======================= -->
-  <section class="page hidden" id="page-usage">
+  <!-- .fill 页撑满屏幕高度：页头/筛选/分页固定，只有表格或图表区域伸缩（见 style.css .page.fill） -->
+  <section class="page fill hidden" id="page-usage">
     <header class="page-head">
       <h1 data-i18n="nav.usage">用量</h1>
       <div class="head-tools">
@@ -57,28 +58,19 @@
         <span class="muted" id="usage-stamp"></span>
       </div>
     </header>
-    <div class="card">
+    <div class="card fill-card">
       <div class="totals" id="usage-totals"></div>
-      <canvas id="usage-chart" height="260"></canvas>
-      <div class="legend"><span class="lg lg-prompt"></span>prompt
-        <span class="lg lg-gen"></span>output</div>
-    </div>
-    <div class="card">
-      <h2 data-i18n="usage.daily">按天明细</h2>
-      <div class="table-wrap">
-      <table class="table" id="usage-table">
-        <thead><tr><th data-i18n="usage.day">日期</th><th class="r" data-i18n="common.requests">请求数</th>
-          <th class="r">prompt</th>
-          <th class="r" data-i18n="usage.cached">缓存命中</th><th class="r">output</th></tr></thead>
-        <tbody></tbody>
-      </table>
+      <div class="chart-box"><canvas id="usage-chart"></canvas></div>
+      <div class="card-foot">
+        <div class="legend"><span class="lg lg-prompt"></span>prompt
+          <span class="lg lg-gen"></span>output</div>
+        <p class="note muted" id="usage-note"></p>
       </div>
     </div>
-    <p class="note muted" id="usage-note"></p>
   </section>
 
   <!-- ======================= 请求 ======================= -->
-  <section class="page hidden" id="page-requests">
+  <section class="page fill hidden" id="page-requests">
     <header class="page-head">
       <h1 data-i18n="nav.requests">请求</h1>
       <div class="head-tools">
@@ -86,7 +78,7 @@
         <span class="muted" id="req-stamp"></span>
       </div>
     </header>
-    <div class="card">
+    <div class="card fill-card">
       <div class="filters">
         <label><span data-i18n="req.from">起</span> <input type="date" id="req-from"></label>
         <label><span data-i18n="req.to">止</span> <input type="date" id="req-to"></label>
@@ -113,13 +105,15 @@
         <tbody></tbody>
       </table>
       </div>
-      <div class="pager">
-        <button class="btn" id="req-prev" data-i18n="req.prev_page">上一页</button>
-        <span id="req-pageinfo" class="muted"></span>
-        <button class="btn" id="req-next" data-i18n="req.next_page">下一页</button>
+      <div class="card-foot pager">
+        <p class="note muted" id="req-note"></p>
+        <div class="pager-ctl">
+          <button class="btn" id="req-prev" data-i18n="req.prev_page">上一页</button>
+          <span id="req-pageinfo" class="muted"></span>
+          <button class="btn" id="req-next" data-i18n="req.next_page">下一页</button>
+        </div>
       </div>
     </div>
-    <p class="note muted" id="req-note"></p>
   </section>
 
   <!-- ======================= 采样 ======================= -->

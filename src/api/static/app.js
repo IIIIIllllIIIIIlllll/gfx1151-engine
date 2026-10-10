@@ -50,7 +50,7 @@ const I18N = {
     "mem.offline": "引擎未连接（/memory 不可用）",
     "ovr.on": "开", "ovr.off": "关",
     "usage.range": "范围", "usage.d7": "近 7 天", "usage.d14": "近 14 天",
-    "usage.d30": "近 30 天", "usage.daily": "按天明细", "usage.day": "日期",
+    "usage.d30": "近 30 天",
     "usage.cached": "缓存命中",
     "usage.prompt_tokens": "prompt tokens", "usage.output_tokens": "output tokens",
     "usage.empty": "范围内没有请求记录",
@@ -152,7 +152,7 @@ const I18N = {
     "mem.offline": "engine offline (/memory unavailable)",
     "ovr.on": "on", "ovr.off": "off",
     "usage.range": "Range", "usage.d7": "7 days", "usage.d14": "14 days",
-    "usage.d30": "30 days", "usage.daily": "Per day", "usage.day": "Date",
+    "usage.d30": "30 days",
     "usage.cached": "Cache hit",
     "usage.prompt_tokens": "prompt tokens", "usage.output_tokens": "output tokens",
     "usage.empty": "no requests in range",
@@ -794,30 +794,18 @@ function renderUsage() {
     totals.appendChild(it);
   }
 
-  const tbody = document.querySelector("#usage-table tbody");
-  tbody.textContent = "";
-  for (const g of usageAgg.slice().reverse()) {
-    const tr = document.createElement("tr");
-    for (const [v, right] of [[g.day, false], [fmtInt(g.requests), true], [fmtInt(g.prompt), true],
-        [fmtInt(g.cached), true], [fmtInt(g.gen), true]]) {
-      const td = document.createElement("td");
-      if (right) td.className = "r";
-      td.textContent = v;
-      tr.appendChild(td);
-    }
-    tbody.appendChild(tr);
-  }
-
   drawUsageChart();
   stampNow(document.getElementById("usage-stamp"));
-  document.getElementById("usage-note").textContent = t("usage.note");
+  const note = document.getElementById("usage-note");
+  note.textContent = note.title = t("usage.note");
 }
 
 function drawUsageChart() {
   const cv = document.getElementById("usage-chart");
   if (document.getElementById("page-usage").classList.contains("hidden")) return;
   const dpr = window.devicePixelRatio || 1;
-  const W = cv.clientWidth, H = 260;
+  const W = cv.clientWidth, H = cv.clientHeight;  // 画布尺寸跟随 .chart-box（撑满屏幕剩余高度）
+  if (!W || !H) return;
   cv.width = W * dpr; cv.height = H * dpr;
   const g = cv.getContext("2d");
   g.scale(dpr, dpr);
@@ -867,11 +855,12 @@ function niceCeil(v) {
   const m = v / p;
   return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p;
 }
+// 图表盒子随窗口/布局伸缩（含切页时从隐藏变可见），观察盒子本身而不是 window
 let resizeT = null;
-window.addEventListener("resize", () => {
+new ResizeObserver(() => {
   clearTimeout(resizeT);
-  resizeT = setTimeout(() => { if (currentPage === "usage") drawUsageChart(); }, 150);
-});
+  resizeT = setTimeout(() => { if (currentPage === "usage") drawUsageChart(); }, 100);
+}).observe(document.querySelector("#page-usage .chart-box"));
 
 // ---------------- 请求 ----------------
 // 无筛选条件时：/reqstat/page 服务端分页，按服务端 total 翻阅全部历史。
@@ -954,7 +943,7 @@ async function renderRequests(force) {
       pages = Math.max(1, Math.ceil(total / size));
       if (reqState.offset >= total) reqState.offset = (pages - 1) * size;
       rows = all.slice(reqState.offset, reqState.offset + size);
-      note.textContent = t("req.note_filtered");
+      note.textContent = note.title = t("req.note_filtered");
     } else {
       for (let attempt = 0; attempt < 2; attempt++) {
         const seq = ++reqState.seq;
@@ -967,7 +956,7 @@ async function renderRequests(force) {
         rows = (j.records || []).slice().reverse();  // 服务端页内 oldest-first，表格新→旧
         break;
       }
-      note.textContent = t("req.note_server");
+      note.textContent = note.title = t("req.note_server");
     }
     fillRequestRows(rows);
     const page = Math.floor(reqState.offset / size) + 1;
