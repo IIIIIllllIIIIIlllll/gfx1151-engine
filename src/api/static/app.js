@@ -170,7 +170,8 @@ function applyLang() {
   for (const el of document.querySelectorAll("[data-i18n-placeholder]"))
     el.placeholder = t(el.dataset.i18nPlaceholder);
   const btn = document.getElementById("lang-btn");
-  btn.textContent = LANG === "zh" ? "EN" : "中文";
+  btn.querySelector(".hw-switch-label").textContent = LANG === "zh" ? "中文" : "EN";
+  btn.classList.toggle("on", LANG === "zh");
   btn.title = LANG === "zh" ? "Switch to English" : "切换到中文";
 }
 
@@ -189,7 +190,9 @@ document.getElementById("lang-btn").addEventListener("click", () => {
 
 function applyTheme(t) {
   document.documentElement.dataset.theme = t;
-  document.getElementById("theme-btn").textContent = t === "dark" ? "☾" : "☀";
+  const btn = document.getElementById("theme-btn");
+  btn.querySelector(".hw-switch-label").textContent = t === "dark" ? "☾" : "☀";
+  btn.classList.toggle("on", t === "dark");
   try { localStorage.setItem("gdec-theme", t); } catch (e) { /* 隐私模式 */ }
 }
 function initTheme() {
@@ -369,7 +372,6 @@ async function refreshHealth() {
 
 async function refreshMemory() {
   const bars = document.getElementById("mem-bars");
-  const stamp = document.getElementById("mem-stamp");
   try {
     const m = await getJSON("/memory");
     const hipUsed = (m.hip_total_bytes ?? 0) - (m.hip_free_bytes ?? 0);
@@ -396,17 +398,14 @@ async function refreshMemory() {
       [t("mem.pinned"), fmtBytes(m.process_locked_bytes)],
       [t("mem.accessible"), fmtBytes(m.gpu_accessible_committed_bytes)],
     ]);
-    stampNow(stamp);
   } catch (e) {
     bars.textContent = t("mem.offline");
     bars.classList.add("muted");
-    stamp.textContent = "";
   }
 }
 
 async function refreshPower() {
   const el = document.getElementById("ov-power");
-  const stamp = document.getElementById("power-stamp");
   try {
     const p = await getJSON("/power");
     if (!p.available) {
@@ -418,10 +417,8 @@ async function refreshPower() {
       if (p.cpu_watts != null) rows.push([t("power.cpu"), p.cpu_watts + " W"]);
       fillKv(el, rows);
     }
-    stampNow(stamp);
   } catch (e) {
     fillKv(el, [[t("ov.power"), t("common.read_failed")]]);
-    stamp.textContent = "";
   }
 }
 

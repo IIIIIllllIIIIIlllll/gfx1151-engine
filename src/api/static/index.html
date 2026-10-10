@@ -7,23 +7,12 @@
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<aside class="sidebar">
-  <div class="brand">
-    <span class="brand-dot" id="busy-dot" data-i18n-title="hint.busy" title="引擎忙闲"></span>
-    <span class="brand-name">Qwen-Flash-Server</span>
-  </div>
-  <nav class="nav" id="nav">
-    <button class="nav-btn" data-route="overview" data-i18n="nav.overview">总览</button>
-    <button class="nav-btn" data-route="usage" data-i18n="nav.usage">用量</button>
-    <button class="nav-btn" data-route="requests" data-i18n="nav.requests">请求</button>
-    <button class="nav-btn" data-route="sample" data-i18n="nav.sample">采样</button>
-  </nav>
-  <div class="sidebar-foot">
-    <button class="icon-btn" id="lang-btn">EN</button>
-    <button class="icon-btn" id="theme-btn" data-i18n-title="hint.theme" title="切换明暗主题">☀</button>
-  </div>
-</aside>
+<!-- 整页是一台卡带终端：左 CRT（全部页面内容）、右走带模块、底部按键/指示灯条、铭牌。
+     app.js 只按 id / class 取元素，这里的外壳结构纯展示。 -->
+<div class="chassis">
 
+<div class="crt">
+<div class="crt-glass">
 <main class="main">
   <!-- ======================= 总览 ======================= -->
   <section class="page" id="page-overview">
@@ -41,12 +30,12 @@
         <dl class="kv" id="ov-model"><div class="kv-row muted" data-i18n="common.loading">加载中…</div></dl>
       </div>
       <div class="card">
-        <h2><span data-i18n="ov.mem">显存与内存</span> <span class="muted small" id="mem-stamp"></span></h2>
+        <h2 data-i18n="ov.mem">显存与内存</h2>
         <div id="mem-bars" class="bars"><span class="muted" data-i18n="common.loading">加载中…</span></div>
         <dl class="kv" id="ov-memory"></dl>
       </div>
       <div class="card">
-        <h2><span data-i18n="ov.power">功耗</span> <span class="muted small" id="power-stamp"></span></h2>
+        <h2 data-i18n="ov.power">功耗</h2>
         <dl class="kv" id="ov-power"><div class="kv-row muted" data-i18n="common.loading">加载中…</div></dl>
       </div>
     </div>
@@ -76,12 +65,14 @@
     </div>
     <div class="card">
       <h2 data-i18n="usage.daily">按天明细</h2>
+      <div class="table-wrap">
       <table class="table" id="usage-table">
         <thead><tr><th data-i18n="usage.day">日期</th><th class="r" data-i18n="common.requests">请求数</th>
           <th class="r">prompt</th>
           <th class="r" data-i18n="usage.cached">缓存命中</th><th class="r">output</th></tr></thead>
         <tbody></tbody>
       </table>
+      </div>
     </div>
     <p class="note muted" id="usage-note"></p>
   </section>
@@ -149,8 +140,8 @@
         <tbody id="ovr-body"></tbody>
       </table>
       </div>
-      <div class="head-tools" style="margin-top:14px">
-        <input id="ovr-key" type="password" class="hidden" style="width:240px"
+      <div class="head-tools ovr-actions">
+        <input id="ovr-key" type="password" class="hidden"
                placeholder="管理密钥 (GDEC_API_ADMIN_KEY)" data-i18n-placeholder="ovr.key_ph">
         <button class="btn primary" id="ovr-save" data-i18n="ovr.save">保存并生效</button>
         <button class="btn" id="ovr-reload" data-i18n="ovr.reload">从服务端重新读取</button>
@@ -161,6 +152,60 @@
     </div>
   </section>
 </main>
+</div>
+</div>
+
+<!-- 走带模块：引擎推理中时磁带轮转动，▶ / ■ 键随忙闲自动按下（纯指示，不可点） -->
+<aside class="sidebar">
+  <div class="brand">
+    <div class="reel-window" aria-hidden="true">
+      <svg class="reel reel-l" viewBox="-50 -50 100 100"><circle r="46" fill="#151513"/><circle r="38" fill="#3a2a20"/><circle r="45" fill="none" stroke="currentColor" stroke-width="5"/><g stroke="currentColor" stroke-width="7" stroke-linecap="round"><line x2="0" y2="-42"/><line x2="36.4" y2="21"/><line x2="-36.4" y2="21"/></g><circle r="11" fill="currentColor"/><circle r="4" fill="#151513"/></svg>
+      <span class="tape-bridge"></span>
+      <svg class="reel reel-r" viewBox="-50 -50 100 100"><circle r="46" fill="#151513"/><circle r="22" fill="#3a2a20"/><circle r="45" fill="none" stroke="currentColor" stroke-width="5"/><g stroke="currentColor" stroke-width="7" stroke-linecap="round"><line x2="0" y2="-42"/><line x2="36.4" y2="21"/><line x2="-36.4" y2="21"/></g><circle r="11" fill="currentColor"/><circle r="4" fill="#151513"/></svg>
+    </div>
+    <div class="transport" aria-hidden="true">
+      <span class="tk">◀◀</span><span class="tk tk-play">▶</span><span class="tk tk-stop">■</span><span class="tk">▶▶</span>
+    </div>
+    <div class="deck-label">
+      <span class="brand-name">Qwen-Flash-Server</span>
+      <span class="deck-sub" aria-hidden="true">gdec-api / gfx1151</span>
+    </div>
+  </div>
+</aside>
+
+<!-- 底部控制条：F 键 = 页面导航；指示灯排；两个拨杆开关 = 语言 / 明暗主题 -->
+<div class="console">
+  <nav class="nav" id="nav">
+    <button class="nav-btn" data-route="overview" data-i18n="nav.overview">总览</button>
+    <button class="nav-btn" data-route="usage" data-i18n="nav.usage">用量</button>
+    <button class="nav-btn" data-route="requests" data-i18n="nav.requests">请求</button>
+    <button class="nav-btn" data-route="sample" data-i18n="nav.sample">采样</button>
+  </nav>
+  <div class="leds">
+    <span class="led"><i class="lamp lamp-pwr"></i>PWR</span>
+    <span class="led"><i class="lamp lamp-link"></i>LINK</span>
+    <span class="led"><span class="brand-dot" id="busy-dot" data-i18n-title="hint.busy" title="引擎忙闲"></span>ENG</span>
+    <span class="led"><i class="lamp lamp-warn"></i>WARN</span>
+  </div>
+  <div class="sidebar-foot">
+    <button class="hw-switch" id="lang-btn">
+      <span class="hw-switch-slot"><span class="hw-switch-knob"></span></span>
+      <span class="hw-switch-label">EN</span>
+    </button>
+    <button class="hw-switch" id="theme-btn" data-i18n-title="hint.theme" title="切换明暗主题">
+      <span class="hw-switch-slot"><span class="hw-switch-knob"></span></span>
+      <span class="hw-switch-label">☀</span>
+    </button>
+  </div>
+</div>
+
+<div class="plate" aria-hidden="true">
+  <span class="plate-tag">GFX-1151</span>
+  <span class="plate-stripes"></span>
+</div>
+
+</div>
+
 
 <script src="/app.js"></script>
 </body>

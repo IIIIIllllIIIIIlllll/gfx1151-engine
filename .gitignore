@@ -1,4 +1,5 @@
 build/
+src/api/static_gen.inc
 logs/
 models/
 dev-docs/

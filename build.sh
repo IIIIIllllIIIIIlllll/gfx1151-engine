@@ -232,7 +232,7 @@ build_bench() {
 API_FLAGS=(-O2 -std=c++17 -Isrc/api -Ithird_party -Wall -Wextra -Wpedantic
            -Werror "${BUNDLE_RPATH[@]}")
 # 静态页嵌入:编译生成器并重新生成 src/api/static_gen.inc。生成器输出是确定性的,
-# 内容未变不会重写文件;static_gen.inc 随仓库提交,此处仅保持与 static/ 目录同步。
+# 内容未变不会重写文件;static_gen.inc 是生成物,不入库(.gitignore),此处按需重新生成。
 gen_static_inc() {
   if [ ! -x build/gen_static_inc ] || [ tools/gen_static_inc.cpp -nt build/gen_static_inc ]; then
     echo "[生成] build/gen_static_inc"

@@ -91,8 +91,8 @@ build_bench() {
 }
 
 # 静态页嵌入：编译生成器并重新生成 src/api/static_gen.inc（复用调用方设好的 CXX）。
-# 生成器输出是确定性的，内容未变不会重写文件；static_gen.inc 随仓库提交，
-# 此处仅保持与 static/ 目录同步。
+# 生成器输出是确定性的，内容未变不会重写文件；static_gen.inc 是生成物，
+# 不入库（.gitignore），此处按需重新生成。
 gen_static_inc() {
     [[ -x build/gen_static_inc.exe && ! tools/gen_static_inc.cpp -nt build/gen_static_inc.exe ]] || {
         echo "[编译] build/gen_static_inc.exe"
