@@ -1321,6 +1321,17 @@ LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
     }
     if (msg == WM_CTLCOLORSTATIC && g_panel_bg) {
+        // 只读 Edit（各页检查输出框）：透明底会让 SetWindowText 重绘时旧文字
+        // 不被擦除、新旧叠印；改用与输入框一致的深色卡片实心画刷。
+        HWND ctl = reinterpret_cast<HWND>(lp);
+        wchar_t cls[16];
+        if (GetClassNameW(ctl, cls, 16) && wcscmp(cls, L"Edit") == 0 &&
+            (GetWindowLongW(ctl, GWL_STYLE) & ES_READONLY) && g_edit_bg) {
+            HDC dc = reinterpret_cast<HDC>(wp);
+            SetTextColor(dc, kPanelFg);
+            SetBkColor(dc, kEditBg);
+            return reinterpret_cast<LRESULT>(g_edit_bg);
+        }
         // 标签/勾选框/单选钮：浅色文字 + HOLLOW_BRUSH 不填底（实心画刷会填满
         // 整个控件矩形，SetBkMode 只管字符格），夜空背景完整透出
         SetTextColor(reinterpret_cast<HDC>(wp), kPanelFg);
@@ -1328,8 +1339,7 @@ LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return reinterpret_cast<LRESULT>(GetStockObject(HOLLOW_BRUSH));
     }
     if (msg == WM_CTLCOLOREDIT && g_edit_bg) {
-        // 可编辑输入框：深色卡片 + 浅色文字（只读编辑框走 WM_CTLCOLORSTATIC，
-        // 保持透明不受影响）
+        // 可编辑输入框：深色卡片 + 浅色文字
         HDC dc = reinterpret_cast<HDC>(wp);
         SetTextColor(dc, kPanelFg);
         SetBkColor(dc, kEditBg);
