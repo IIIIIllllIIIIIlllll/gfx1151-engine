@@ -33,6 +33,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -3189,45 +3190,101 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
 
 // -------------------------------------------------------------------- main --
 
-void probe_engine() {
+// INFO 行：I mtp draft_head ctx spec_rows default drafter_weights dflash2
+//   cache_mb cache_align kv_slots slot_ctx cache_mode sampling kv_pool_tokens
+struct EngineInfo {
+    int context = 0;
+    int kv_slots = 0;  // 0 = 老引擎未上报（按单槽处理）
+    int kv_pool = 0;
+};
+
+bool parse_engine_info(const std::string& line, EngineInfo* ei) {
+    std::vector<long long> f;
+    std::istringstream ss(line);
+    std::string tok;
+    ss >> tok;  // "I"
+    long long v;
+    while (ss >> v) f.push_back(v);
+    if (f.size() < 3) return false;
+    ei->context = (int)f[2];
+    if (f.size() >= 10 && f[9] >= 1 && f[9] <= 64) ei->kv_slots = (int)f[9];
+    if (f.size() >= 14 && f[13] > 0) ei->kv_pool = (int)f[13];
+    return true;
+}
+
+// 初始探测失败（GUI/监管路径下 API 先于引擎监听）时由后台线程调用：
+// 引擎就绪后应用 INFO 并把连接池扩到引擎的槽位数。只增不缩——运行中的
+// SlotGuard 持有池内对象指针，缩减需要排空在途请求；引擎重启改 PARALLEL
+// 的场景请重启 API。
+void apply_engine_info(const EngineInfo& ei) {
+    {
+        std::lock_guard<std::mutex> lk(g_slot_mtx);
+        if (ei.context > 0) g_cfg.context = ei.context;
+        if (ei.kv_pool > 0) g_kv_pool = ei.kv_pool;
+        if (ei.kv_slots > g_slots) g_slots = ei.kv_slots;
+        // 池以 g_pool.size() 为基线补齐到 g_slots：启动时为空全量建，
+        // 重探测时只补差额；kv_slots=0（老引擎）也保证至少有 1 条连接。
+        for (int i = (int)g_pool.size(); i < g_slots; ++i) {
+            g_pool.push_back(std::make_unique<qwenox::EngineClient>());
+            g_pool_free.push_back(g_pool.back().get());
+        }
+    }
+    g_slot_cv.notify_all();  // 排队中的请求重新评估 g_in_flight < g_slots
+}
+
+void log_slots() {
+    fprintf(stderr, "qwenox-api: %d concurrent generation slot%s (per-slot context %d,"
+            " shared KV pool %d)\n",
+            g_slots, g_slots > 1 ? "s" : "", g_cfg.context,
+            g_kv_pool > 0 ? g_kv_pool : g_cfg.context);
+}
+
+void reprobe_engine_loop() {
+    // 引擎冷加载可达分钟级：前 5 分钟每 2s 一探，之后降到 15s（覆盖用户
+    // 稍后在面板上手动启动引擎的场景）。connect 失败是廉价的本机拒绝。
+    for (int attempt = 0;; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::seconds(attempt < 150 ? 2 : 15));
+        qwenox::EngineClient c;  // 独立连接：不与 g_ctl 的控制查询竞争
+        c.set_timeouts(5.0, 5.0);
+        std::string line, err;
+        if (!c.connect(g_cfg.engine_addr, &err, 0.3)) continue;
+        if (!c.info(&line, &err)) continue;
+        EngineInfo ei;
+        if (!parse_engine_info(line, &ei)) continue;
+        apply_engine_info(ei);
+        fprintf(stderr, "qwenox-api: engine INFO (re-probe): %s\n", line.c_str());
+        log_slots();
+        return;
+    }
+}
+
+bool probe_engine() {
     std::string err, line;
     // Startup must not stall for the generation budget: an unreachable or
     // wedged engine falls back to the configured defaults (and one slot)
-    // instead of blocking the listen socket for minutes. The control
-    // connection keeps the short timeouts: MEM/CSTAT answer at once.
-    // The connect itself is bounded too: on some machines a refused loopback
-    // connect takes ~2s to come back (filter driver), delaying startup.
+    // instead of blocking the listen socket for minutes; the caller then
+    // retries in reprobe_engine_loop so the pool still reaches full width
+    // once the engine is up. The control connection keeps the short
+    // timeouts: MEM/CSTAT answer at once. The connect itself is bounded
+    // too: on some machines a refused loopback connect takes ~2s to come
+    // back (filter driver), delaying startup.
     g_ctl.set_timeouts(5.0, 5.0);
+    bool ok = false;
     if (!g_ctl.connect(g_cfg.engine_addr, &err, 0.3)) {
         fprintf(stderr, "qwenox-api: engine connect failed: %s\n", err.c_str());
     } else if (g_ctl.info(&line, &err)) {
-        // I mtp draft_head ctx spec_rows default drafter_weights dflash2
-        //   cache_mb cache_align kv_slots slot_ctx cache_mode sampling
-        //   kv_pool_tokens
-        std::vector<long long> f;
-        std::istringstream ss(line);
-        std::string tok;
-        ss >> tok;  // "I"
-        long long v;
-        while (ss >> v) f.push_back(v);
-        if (f.size() >= 3) {
-            g_cfg.context = (int)f[2];
+        EngineInfo ei;
+        if (parse_engine_info(line, &ei)) {
+            apply_engine_info(ei);
+            ok = true;
         }
-        if (f.size() >= 10 && f[9] >= 1 && f[9] <= 64) g_slots = (int)f[9];
-        if (f.size() >= 14 && f[13] > 0) g_kv_pool = (int)f[13];
         fprintf(stderr, "qwenox-api: engine INFO: %s\n", line.c_str());
     } else {
         fprintf(stderr, "qwenox-api: engine INFO unavailable (%s); continuing with "
                         "ctx=%d\n", err.c_str(), g_cfg.context);
     }
-    for (int i = 0; i < g_slots; ++i) {
-        g_pool.push_back(std::make_unique<qwenox::EngineClient>());
-        g_pool_free.push_back(g_pool.back().get());
-    }
-    fprintf(stderr, "qwenox-api: %d concurrent generation slot%s (per-slot context %d,"
-            " shared KV pool %d)\n",
-            g_slots, g_slots > 1 ? "s" : "", g_cfg.context,
-            g_kv_pool > 0 ? g_kv_pool : g_cfg.context);
+    log_slots();
+    return ok;
 }
 
 }  // namespace
@@ -3499,7 +3556,7 @@ int main(int argc, char** argv) {
                 err.c_str());
     g_tcache.load_file();
     g_ckpt_ids = default_ckpt_tokens();
-    probe_engine();
+    if (!probe_engine()) std::thread(reprobe_engine_loop).detach();
 
     http::Server srv;
     if (!srv.listen(g_cfg.listen, &err)) {
