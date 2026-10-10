@@ -85,14 +85,14 @@ cp logs/a1-prod.log logs/a1-prodp1.log logs/a1-prodp2.log logs/a2-mid/ 2>/dev/nu
 
 echo
 echo "================ 5/6 kvsnap 跨布局保存/恢复 ================"
-echo "---- 5a: 不分页保存 → GDEC_KV_PAGED=2 恢复 ----"
+echo "---- 5a: 不分页保存 → QWENOX_KV_PAGED=2 恢复 ----"
 RESTORE_KVP=2 bash tools/btv_kvsnap_verify.sh 2>&1 | tee logs/a2-kvsnap-a.txt
 rc=${PIPESTATUS[0]}
 step "kvsnap save=off restore=p2" "$([[ $rc == 0 ]] && echo PASS || echo FAIL)"
 # btv 脚本每轮都写 logs/btv-{save,restore}.log，每轮留一份给最后的守卫页检查
 rm -rf logs/a2-btv; mkdir -p logs/a2-btv
 for f in logs/btv-*.log; do [[ -f $f ]] && cp "$f" "logs/a2-btv/a-${f#logs/}"; done
-echo "---- 5b: GDEC_KV_PAGED=2 保存 → 不分页恢复 ----"
+echo "---- 5b: QWENOX_KV_PAGED=2 保存 → 不分页恢复 ----"
 SAVE_KVP=2 bash tools/btv_kvsnap_verify.sh 2>&1 | tee logs/a2-kvsnap-b.txt
 rc=${PIPESTATUS[0]}
 step "kvsnap save=p2 restore=off" "$([[ $rc == 0 ]] && echo PASS || echo FAIL)"

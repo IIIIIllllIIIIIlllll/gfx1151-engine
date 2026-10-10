@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Concurrent serving (GDEC_PARALLEL) checks against the engine on 127.0.0.1:8732.
+"""Concurrent serving (QWENOX_PARALLEL) checks against the engine on 127.0.0.1:8732.
 tools/conc_verify.sh drives it; every subcommand exits 0 on PASS.
 
   seq  --tag T   run FLOWS one after another on ONE connection  -> logs/conc/T.json
@@ -272,7 +272,7 @@ def cmd_ctl(slots):
 
 
 def cmd_ovf():
-    """Engine: GDEC_PARALLEL=2, --maxctx 16384 (pool = 16384 tokens), rckpt off."""
+    """Engine: QWENOX_PARALLEL=2, --maxctx 16384 (pool = 16384 tokens), rckpt off."""
     tk = Tokenizer()
     o8, o32 = prompts(tk)[:2]
     ok = True

@@ -3,13 +3,13 @@
 #   1. tools/g3_vision_check.cpp：333 个 visual.* 张量逐位相同 + 覆盖完整（CPU）
 #   2. 引擎离线 --vision-test：同一份随机 patches 分别用 hgn / GGUF 视觉塔跑前向，
 #      所有层 dump 逐字节相同
-# 用法：[BIN=build/gdec-gguf] [VISION_HGN=...] [MMPROJ=...] bash tools/g3_vision_verify.sh
+# 用法：[BIN=build/qwenox-gguf] [VISION_HGN=...] [MMPROJ=...] bash tools/g3_vision_verify.sh
 set -u
 cd "$(dirname "$0")/.."
 D=${GGUF_DIR:-$HOME/App/llama.cpp/models/Qwen3.8-Flash-Next-UD-Q4_K_XL}
 MMPROJ=${MMPROJ:-$D/mmproj-BF16.gguf}
 VISION_HGN=${VISION_HGN:-models/qwen38-flash-next-vision.hgn}
-BIN=${BIN:-build/gdec-gguf}
+BIN=${BIN:-build/qwenox-gguf}
 W=${W:-/tmp/g3_vision}
 fail=0
 rm -rf "$W"; mkdir -p "$W"

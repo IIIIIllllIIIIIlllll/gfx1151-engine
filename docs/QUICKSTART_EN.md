@@ -10,7 +10,7 @@ bash start_hgn.sh    # hgn weights (converted with tools/flashnext2hgn.py)
 bash start_gguf.sh   # or GGUF weights (Unsloth UD-Q4_K_XL, the same files llama.cpp uses)
 ```
 
-`build.sh` compiles the GPU engine and the native API in one pass, producing `build/gdec` and `build/gdec-api`.
+`build.sh` compiles the GPU engine and the native API in one pass, producing `build/qwenox-engine` and `build/qwenox-api`.
 Apart from which weights they read, the two launchers are identical: they load the engine first, then start the
 API once it is ready. Defaults: 256K context, MTP gamma 3. Press **Ctrl+C** to stop both the API and the engine
 started this time. Startup does not exit the terminal; keep the SSH session open, or run it in tmux. The old
@@ -77,7 +77,7 @@ GGUF_VISION_FILE="" bash start_gguf.sh
 
 The default drafter is chain (ngram first, MTP as fallback); it is enabled by default on the engine side with no
 arguments needed; both greedy and sampling requests go through chain. The HTTP API does not expose drafter selection — sending
-a `drafter` field in the request body is silently ignored. Environment variable `GDEC_DRAFTER=ngram` selects pure ngram,
+a `drafter` field in the request body is silently ignored. Environment variable `QWENOX_DRAFTER=ngram` selects pure ngram,
 `=mtp` pure MTP, `=serial` the serial baseline.
 
 `MTP_GAMMA=1 bash start_hgn.sh` (or `start_gguf.sh`) tries a draft length of 1 per round; the range is 1–8, default 3;

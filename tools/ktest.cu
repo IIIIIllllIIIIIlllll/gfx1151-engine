@@ -1,7 +1,7 @@
-// Unit tests for the Phase-3a batched kernels in gdec.cpp.
-// gdec.cpp's main() is renamed via macro so we can link our own.
-#define main gdec_real_main
-#include "gdec.cpp"
+// Unit tests for the Phase-3a batched kernels in qwenox.cpp.
+// qwenox.cpp's main() is renamed via macro so we can link our own.
+#define main qwenox_real_main
+#include "qwenox.cpp"
 #undef main
 
 #include <cmath>
@@ -1118,7 +1118,7 @@ int main() {
       TCK(hipFree(dy));
     }
 
-    // ri_f32_gemv_mr：iproj GEMV（GDEC_IPROJ_GEMV 默认开的路径）
+    // ri_f32_gemv_mr：iproj GEMV（QWENOX_IPROJ_GEMV 默认开的路径）
     {
       const uint64_t rows = 640, cols = 2560;
       std::vector<float> w(rows * cols);
@@ -2308,7 +2308,7 @@ int main() {
     TCK(hipFree(dout7));
   }
 
-  // ---- 9h. k_qsa_wmma_u（4-token 块并集, GDEC_QSA_UNION）vs 9g 基线 + CPU ref ----
+  // ---- 9h. k_qsa_wmma_u（4-token 块并集, QWENOX_QSA_UNION）vs 9g 基线 + CPU ref ----
   // Same sparse setup as 9g with P=2064: tokens 2052..2063 form three aligned
   // groups that go through k_qsa_union_merge + k_qsa_wmma_u. Group 1's last
   // token list deliberately excludes its own block to exercise the merge

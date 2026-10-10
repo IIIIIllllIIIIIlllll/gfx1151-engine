@@ -129,8 +129,8 @@ int main(int argc, char** argv) {
     out << "// static_gen.inc —— 由 tools/gen_static_inc.cpp 生成,请勿手工编辑!\n"
            "// 来源目录 src/api/static/,HTML 文件路由去 .html 后缀(index 对应根路径)。\n"
            "// main.cpp include 本文件后按 kStaticAssets 逐条注册 GET 路由。\n"
-           "#ifndef GDEC_STATIC_GEN_INC_\n"
-           "#define GDEC_STATIC_GEN_INC_\n"
+           "#ifndef QWENOX_STATIC_GEN_INC_\n"
+           "#define QWENOX_STATIC_GEN_INC_\n"
            "#include <cstddef>\n"
            "\n"
            "struct StaticAsset {\n"
@@ -160,7 +160,7 @@ int main(int argc, char** argv) {
         out << "    {\"" << a.url << "\", \"" << a.mime << "\", " << a.symbol << ", "
             << a.data.size() << "},\n";
     out << "};\n"
-           "#endif  // GDEC_STATIC_GEN_INC_\n";
+           "#endif  // QWENOX_STATIC_GEN_INC_\n";
 
     // 与现有内容逐字节一致则不重写,避免无意义的 git diff / 重编。
     std::string text = out.str();

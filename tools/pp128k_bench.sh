@@ -2,13 +2,13 @@
 # 128K prefill 基准：hgn 与 GGUF 权重，生产 env（start_hgn.sh / start_gguf.sh --check），
 # 另跑一轮 hgn chunk 8192 与旧基线（tools/pp.sh 口径 1345 tok/s）对照。
 #   bash tools/pp128k_bench.sh            （约 8-10 分钟，末行 PASS/FAIL）
-#     BIN=build/gdec-epi   换二进制（默认 build/gdec）
+#     BIN=build/qwenox-epi   换二进制（默认 build/qwenox-engine）
 #     TOK=<file>           token 文件（默认 data/qsa-oracle/131072.tokens）
 #     SKIP8K=1             不跑 hgn chunk 8192 那一轮
 # 每轮之间把另一种格式的权重逐出 page cache（防 amdgpu SVM 死锁），跑完查 journalctl。
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-BIN=${BIN:-build/gdec}
+BIN=${BIN:-build/qwenox-engine}
 TOK=${TOK:-data/qsa-oracle/131072.tokens}
 T0="$(date '+%Y-%m-%d %H:%M:%S')"
 [[ -x $BIN ]] || { echo "没有 $BIN"; echo FAIL; exit 1; }
@@ -63,7 +63,7 @@ run() {  # 名称 启动器 [K=V...]
 echo "bin=$BIN tok=$TOK ($(wc -w <"$TOK") token)"
 run hgn start_hgn.sh
 run gguf start_gguf.sh
-[[ ${SKIP8K:-0} == 1 ]] || run hgn_c8192 start_hgn.sh GDEC_PREFILL_CHUNK=8192
+[[ ${SKIP8K:-0} == 1 ]] || run hgn_c8192 start_hgn.sh QWENOX_PREFILL_CHUNK=8192
 
 echo
 printf '%-11s %7s %5s %7s %8s %6s %6s %6s\n' 配置 token chunk 秒 整体tok/s 首块 末块 最低

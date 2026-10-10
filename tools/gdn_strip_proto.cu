@@ -1,5 +1,5 @@
 // gdn_strip_proto.cu — ablation replica of k_gdn_inter_strip
-// (src/gpu/gdec.cpp:6085): grid (4,48), NT=256, serial 128-chunk scan per
+// (src/gpu/qwenox.cpp:6085): grid (4,48), NT=256, serial 128-chunk scan per
 // block. Variants:
 //   V0: full (verbatim fp32 code)
 //   V2: null-compute — identical global/LDS traffic and barriers, MAC loops

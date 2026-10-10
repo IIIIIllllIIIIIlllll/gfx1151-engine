@@ -4,15 +4,15 @@
 # 用法:
 #   bash build.sh                 # all:引擎 + benchmark + API(服务器+CLI工具),并行
 #   bash build.sh --bundle        # 同上，并打包分发所需的全部运行库
-#   bash build.sh engine [名字]   # 只编引擎 → build/<名字>(默认 gdec)
-#   bash build.sh bench           # 编译独立性能测试工具 → build/gdec-bench
+#   bash build.sh engine [名字]   # 只编引擎 → build/<名字>(默认 qwenox)
+#   bash build.sh bench           # 编译独立性能测试工具 → build/qwenox-bench
 #   bash build.sh api             # 只编 API 服务器 + CLI 工具
 #   bash build.sh test            # 编 ktest 并运行
 #
 # 产物:
-#   build/gdec    引擎(src/gpu/gdec.cpp)
-#   build/gdec-bench    独立性能测试工具(src/gpu/bench_main.cpp)
-#   build/gdec-api      API 服务器(src/api/*.cpp)
+#   build/qwenox-engine    引擎(src/gpu/qwenox.cpp)
+#   build/qwenox-bench    独立性能测试工具(src/gpu/bench_main.cpp)
+#   build/qwenox-api      API 服务器(src/api/*.cpp)
 #   build/{tok_cli,tpl_cli,eng_cli,http_selftest,toolparse_test,vision_test}
 #   build/ktest         引擎内核测试
 #   build/lib/          --bundle 时生成的运行库与 gfx1151 kernel db
@@ -34,13 +34,13 @@ done
 set -- "${POSITIONAL[@]}"
 [[ $# -le 2 ]] || { usage >&2; exit 2; }
 TARGET="${1:-all}"
-ENGINE_NAME="${2:-gdec}"
+ENGINE_NAME="${2:-qwenox}"
 case "$TARGET" in
   all|engine|api|bench|test) ;;
   *) usage >&2; exit 2 ;;
 esac
 command -v flock >/dev/null || { echo '缺少 flock，请安装 util-linux' >&2; exit 1; }
-if processes="$(pgrep -af '(^|/)(gdec[^/[:space:]]*|flash_serve|serve_api\.py)([[:space:]]|$)')"; then
+if processes="$(pgrep -af '(^|/)(qwenox[^/[:space:]]*|flash_serve|serve_api\.py)([[:space:]]|$)')"; then
   echo "已有引擎或 API 在运行，请先在原终端停止服务：$processes" >&2
   exit 1
 fi
@@ -219,12 +219,12 @@ bundle_api_runtime() {
 
 build_engine() {
   compile "build/$ENGINE_NAME" 8 600 "$HIPCC" -O3 -Werror \
-    --offload-arch="$GPU_ARCH" src/gpu/gdec.cpp -lrocblas -lhipblaslt \
+    --offload-arch="$GPU_ARCH" src/gpu/qwenox.cpp -lrocblas -lhipblaslt \
     "${BUNDLE_RPATH[@]}"
 }
 
 build_bench() {
-  compile build/gdec-bench 8 600 "$HIPCC" -O3 -Werror -std=c++17 \
+  compile build/qwenox-bench 8 600 "$HIPCC" -O3 -Werror -std=c++17 \
     --offload-arch="$GPU_ARCH" -Ithird_party src/gpu/bench_main.cpp \
     -lrocblas -lhipblaslt "${BUNDLE_RPATH[@]}"
 }
@@ -245,11 +245,11 @@ gen_static_inc() {
 # (否则 main.cpp 会与 CLI 的 main 冲突)。
 build_api() {
   gen_static_inc || return 1
-  compile build/gdec-api 8 120 "$CXX" "${API_FLAGS[@]}" \
+  compile build/qwenox-api 8 120 "$CXX" "${API_FLAGS[@]}" \
     src/api/http.cpp src/api/engine_client.cpp src/api/tokenizer.cpp \
     src/api/chat_template.cpp src/api/json_py.cpp src/api/toolparse.cpp \
     src/api/vision.cpp src/api/reqstat.cpp src/api/reqstat_read.cpp \
-    src/api/power.cpp src/api/main.cpp -lpng -ljpeg -lwebp -lpthread || return 1
+    src/api/power.cpp src/api/engine_sup.cpp src/api/main.cpp -lpng -ljpeg -lwebp -lpthread || return 1
   compile build/tok_cli 8 120 "$CXX" "${API_FLAGS[@]}" \
     src/api/tokenizer.cpp src/api/tok_cli.cpp || return 1
   compile build/tpl_cli 8 120 "$CXX" "${API_FLAGS[@]}" \
@@ -281,11 +281,11 @@ case "$TARGET" in
     ;;
   bench)
     build_bench
-    (( ! BUNDLE_RUNTIME )) || bundle_gpu_runtime build/gdec-bench
+    (( ! BUNDLE_RUNTIME )) || bundle_gpu_runtime build/qwenox-bench
     ;;
   api)
     build_api
-    (( ! BUNDLE_RUNTIME )) || bundle_api_runtime build/gdec-api
+    (( ! BUNDLE_RUNTIME )) || bundle_api_runtime build/qwenox-api
     ;;
   test)
     build_test
@@ -310,7 +310,7 @@ case "$TARGET" in
     [[ "$fail" == 0 ]] || { echo '[失败] 见上方编译输出' >&2; exit 1; }
     if (( BUNDLE_RUNTIME )); then
       bundle_gpu_runtime "build/$ENGINE_NAME"
-      bundle_api_runtime build/gdec-api
+      bundle_api_runtime build/qwenox-api
     fi
     ;;
 esac

@@ -3,13 +3,13 @@
 #   bash tools/pp_opt_verify.sh [32k|8k|...]      默认 32k
 # 同一二进制、同一生产 env 下对比：
 #   new = 默认（k64 GEMM 分流 + iproj rocBLAS solution + MTP 索引 tiled）
-#   old = GDEC_GEMM_NO_K64=1 GDEC_IPROJ_SGEMM=1 GDEC_MTP_INDEX_SGEMM=1（旧路径）
+#   old = QWENOX_GEMM_NO_K64=1 QWENOX_IPROJ_SGEMM=1 QWENOX_MTP_INDEX_SGEMM=1（旧路径）
 # 判据：GEN=48 贪心 ids 一致、SPEC=256 投机生成 ids 一致；打印两边 prefill tok/s
 # 与 MTP depth acc 供参考（速度不作为 PASS 条件）。需先 bash build.sh engine。
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 L=${1:-32k}
-OLD=(GDEC_GEMM_NO_K64=1 GDEC_IPROJ_SGEMM=1 GDEC_MTP_INDEX_SGEMM=1)
+OLD=(QWENOX_GEMM_NO_K64=1 QWENOX_IPROJ_SGEMM=1 QWENOX_MTP_INDEX_SGEMM=1)
 fail=0
 ids() { grep '^ids:' "$1" | tr ' ' '\n' | grep -E '^[0-9]+$' | head -n -3; }
 speed() { tr '\r' '\n' <"$1" | grep -o 'prefill: .*tok/s' | sed 's/.*= //' | paste -sd' '; }

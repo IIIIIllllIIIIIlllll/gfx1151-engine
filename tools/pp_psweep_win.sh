@@ -2,11 +2,11 @@
 # pp_psweep_win.sh — M1 小 P 扫描（HANDOFF-PREFILL-ALL.md §2 M1）
 # 固定 maxctx 139264，对 P ∈ {256 512 1024 2048 4096 16384}：prompt = 3×P（取
 # data/qsa-oracle/131072.tokens 前缀），PREFILL_CHUNK=P，剔除预热 dummy 与第 1 个
-# chunk（PLE 冷读），取第 2、3 个 chunk 均值。每档开 GDEC_KPROF=1 + GDEC_PROF=1。
+# chunk（PLE 冷读），取第 2、3 个 chunk 均值。每档开 QWENOX_KPROF=1 + QWENOX_PROF=1。
 # 引擎参数是启动期的，只能一档一进程。v2 模型（MODEL_FILE/NGRAM_FILE 可覆盖）。
 # 用法: bash tools/pp_psweep_win.sh [P ...]   （默认六档全跑）
 #
-# MODE=ttft（§11.2 M1b）：单 chunk TTFT 基线。走 --serve + gdec-api 同进程多请求：
+# MODE=ttft（§11.2 M1b）：单 chunk TTFT 基线。走 --serve + qwenox-api 同进程多请求：
 # 每档每 rep 先发 64 token dummy 暖 PLE（一次性表加载，不计时），再发正式 prompt
 # （yarn_ladder filler，rung 唯一化防 TokenCache 前缀命中），只计正式请求墙钟
 # （max_tokens=1）。每档 3 次取中位数。引擎开 KPROF，按 kprof 行的 P 匹配正式请求
@@ -43,13 +43,13 @@ if [[ "${MODE:-}" == "incr" ]]; then
   ENGINE_LOG="logs/incr_engine_${TTAG}.log"
   API_LOG="logs/incr_api_${TTAG}.log"
   mkdir -p logs
-  env GDEC_KPROF=1 GDEC_PROF=1 \
-      GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1 \
-      GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1 \
-      GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 \
-      GDEC_PREFILL_CHUNK=16384 GDEC_GEMM_WMMA=1 GDEC_GDN_FUSED=1 \
-      GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1 \
-      build/gdec-win "${MODEL_ARGS[@]}" \
+  env QWENOX_KPROF=1 QWENOX_PROF=1 \
+      QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1 \
+      QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1 \
+      QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 \
+      QWENOX_PREFILL_CHUNK=16384 QWENOX_GEMM_WMMA=1 QWENOX_GDN_FUSED=1 \
+      QWENOX_INDEX_FUSED2=1 QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1 \
+      build/qwenox-engine-win "${MODEL_ARGS[@]}" \
       --serve --host 127.0.0.1 --port 8730 --maxctx $IMAXCTX >"$ENGINE_LOG" 2>&1 &
   EPID=$!
   incr_cleanup() {
@@ -65,7 +65,7 @@ if [[ "${MODE:-}" == "incr" ]]; then
     (( SECONDS - begin < 300 )) || { echo "引擎启动超时" >&2; exit 1; }
     sleep 2
   done
-  build/gdec-api-win.exe --tokenizer models/tokenizer \
+  build/qwenox-win.exe --tokenizer models/tokenizer \
       --engine 127.0.0.1:8730 --host 127.0.0.1 \
       --port 8731 --context $IMAXCTX >"$API_LOG" 2>&1 &
   APID=$!
@@ -86,7 +86,7 @@ ibase = int(os.environ["IBASE"])
 tag = os.environ["TTAG"]
 
 def chat_msgs(msgs, max_tokens):
-    body = {"model": "gdec", "messages": msgs, "temperature": 0.0,
+    body = {"model": "qwenox", "messages": msgs, "temperature": 0.0,
             "max_tokens": max_tokens, "stream": False}
     req = urllib.request.Request(
         base + "/v1/chat/completions", data=json.dumps(body).encode(),
@@ -140,13 +140,13 @@ if [[ "${MODE:-}" == "ttft" ]]; then
   ENGINE_LOG="logs/ttft_engine_${TTAG}.log"
   API_LOG="logs/ttft_api_${TTAG}.log"
   mkdir -p logs
-  env GDEC_KPROF=1 GDEC_PROF=1 \
-      GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1 \
-      GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1 \
-      GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 \
-      GDEC_PREFILL_CHUNK=16384 GDEC_GEMM_WMMA=1 GDEC_GDN_FUSED=1 \
-      GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1 \
-      build/gdec-win "${MODEL_ARGS[@]}" \
+  env QWENOX_KPROF=1 QWENOX_PROF=1 \
+      QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1 \
+      QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1 \
+      QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 \
+      QWENOX_PREFILL_CHUNK=16384 QWENOX_GEMM_WMMA=1 QWENOX_GDN_FUSED=1 \
+      QWENOX_INDEX_FUSED2=1 QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1 \
+      build/qwenox-engine-win "${MODEL_ARGS[@]}" \
       --serve --host 127.0.0.1 --port 8730 --maxctx $TMAXCTX >"$ENGINE_LOG" 2>&1 &
   EPID=$!
   ttft_cleanup() {
@@ -162,7 +162,7 @@ if [[ "${MODE:-}" == "ttft" ]]; then
     (( SECONDS - begin < 300 )) || { echo "引擎启动超时" >&2; exit 1; }
     sleep 2
   done
-  build/gdec-api-win.exe --tokenizer models/tokenizer \
+  build/qwenox-win.exe --tokenizer models/tokenizer \
       --engine 127.0.0.1:8730 --host 127.0.0.1 \
       --port 8731 --context $TMAXCTX >"$API_LOG" 2>&1 &
   APID=$!
@@ -250,14 +250,14 @@ for P in $PS; do
   TOK=/tmp/psweep_${NTOK}.tokens
   [ -f "$TOK" ] || head -n "$NTOK" "$TOKENS_SRC" > "$TOK"
   LOG="logs/m1_${TAG:-v2}_p${P}.log"
-  env GDEC_KPROF=1 GDEC_PROF=1 \
-      GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1 \
-      GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1 \
-      GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 \
-      GDEC_PREFILL_CHUNK=$P GDEC_GEMM_WMMA=1 GDEC_GDN_FUSED=1 \
-      GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1 \
-      GDEC_KVSNAP=1 GDEC_KVSNAP_MAX_GB=20 \
-      build/gdec-win "${MODEL_ARGS[@]}" \
+  env QWENOX_KPROF=1 QWENOX_PROF=1 \
+      QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1 \
+      QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1 \
+      QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 \
+      QWENOX_PREFILL_CHUNK=$P QWENOX_GEMM_WMMA=1 QWENOX_GDN_FUSED=1 \
+      QWENOX_INDEX_FUSED2=1 QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1 \
+      QWENOX_KVSNAP=1 QWENOX_KVSNAP_MAX_GB=20 \
+      build/qwenox-engine-win "${MODEL_ARGS[@]}" \
       --tokens-file "$TOK" --gen 1 --maxctx $MAXCTX >"$LOG" 2>&1
   rc=$?
   echo "== P=$P rc=$rc log=$LOG =="

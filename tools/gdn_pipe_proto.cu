@@ -1,5 +1,5 @@
 // gdn_pipe_proto.cu — staging-overlap restructure prototypes for k_gdn_intra
-// (src/gpu/gdec.cpp:5586), after the WMMA rejection (nullc ablation proved
+// (src/gpu/qwenox.cpp:5586), after the WMMA rejection (nullc ablation proved
 // matrix compute is ~2% of wall; the kernel is staging-latency bound).
 // Variants (same geometry: grid (nchunks,48), NT=1024, CH=64, DK=128):
 //   V0 : fp32 verbatim reference (production code)
@@ -299,7 +299,7 @@ __global__ void __launch_bounds__(NT) k_gdn_pipe(
   __syncthreads();
   if (upto == 2) return;
 
-  // ---- phase 2: Ut5 solve (verbatim fp32 copy from gdec.cpp:5657) ----
+  // ---- phase 2: Ut5 solve (verbatim fp32 copy from qwenox.cpp:5657) ----
   {
     const int g = tid >> 8, el = tid & 255;
     const int er = el >> 4, ec = el & 15;

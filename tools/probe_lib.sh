@@ -2,11 +2,11 @@
 #   probe_precheck                 # 没有其它引擎/API、8732 空闲
 #   probe_start <tag> <cmd...>     # 后台起引擎，前台等 "serve: listening"，每 10s 打印进度
 #   probe_stop                     # 停掉本次引擎（含 systemd scope），等进程退净
-# 调用方负责先 export 好 GDEC_* 环境变量，并在 repo 根目录运行。
+# 调用方负责先 export 好 QWENOX_* 环境变量，并在 repo 根目录运行。
 PROBE_PID=''
 PROBE_SCOPE=''
 PROBE_LOG=''
-PROBE_PAT='(^|/)(gdec[^/[:space:]]*|flash_serve|serve_api\.py)([[:space:]]|$)'
+PROBE_PAT='(^|/)(qwenox[^/[:space:]]*|flash_serve|serve_api\.py)([[:space:]]|$)'
 
 probe_precheck() {
   local p
@@ -19,7 +19,7 @@ probe_precheck() {
     echo "端口 8732 已被占用" >&2
     return 1
   fi
-  [[ -x "${PROBE_BINARY:-build/gdec}" ]] || { echo "找不到 ${PROBE_BINARY:-build/gdec}，先 bash build.sh engine" >&2; return 1; }
+  [[ -x "${PROBE_BINARY:-build/qwenox-engine}" ]] || { echo "找不到 ${PROBE_BINARY:-build/qwenox-engine}，先 bash build.sh engine" >&2; return 1; }
   mkdir -p logs
 }
 

@@ -156,19 +156,19 @@ struct PleUring {
 // aggr 10-05: several rings pumped by parallel workers. One pump thread did
 // all 16*P preads (16K prompt: 262K reads ≈ 276 ms on a warm page cache — the
 // per-op syscall/copy cost, not the disk), while L0 on the GPU takes ~210 ms,
-// so the GPU idled at the PLE join. GDEC_PLE_RINGS (default 8, 1 = old).
+// so the GPU idled at the PLE join. QWENOX_PLE_RINGS (default 8, 1 = old).
 static constexpr int kPleRingsMax = 16;
 static PleUring g_ple_rings[kPleRingsMax];
 static int g_ple_nrings = 0;
 static bool g_ple_ring_tried = false;
 
 static bool ple_uring_ready() {
-  if (!getenv("GDEC_PLE_URING")) return false;
+  if (!getenv("QWENOX_PLE_URING")) return false;
   if (g_ple_fd < 0 || !g_ple_off_ok) return false;
   if (!g_ple_ring_tried) {
     g_ple_ring_tried = true;
     int want = 8;
-    if (const char* e = getenv("GDEC_PLE_RINGS")) want = atoi(e);
+    if (const char* e = getenv("QWENOX_PLE_RINGS")) want = atoi(e);
     want = std::max(1, std::min(kPleRingsMax, want));
     for (int i = 0; i < want; i++) {
       if (!g_ple_rings[i].setup(256)) {  // fixed depth: one structural decision
@@ -523,10 +523,10 @@ struct KvSeqTable {
 
 // A3: physical pool size in pages. Default: one full-length sequence — pinned
 // RAM checkpoints share it and are LRU-evicted when the live sequence needs
-// pages. GDEC_KV_POOL_TOKENS=<n> enlarges it (never below one sequence).
+// pages. QWENOX_KV_POOL_TOKENS=<n> enlarges it (never below one sequence).
 static inline int kv_pool_pages_for(int maxctx) {
   const long long lp = (maxctx + KV_PAGE - 1) / KV_PAGE;
-  const char* v = getenv("GDEC_KV_POOL_TOKENS");
+  const char* v = getenv("QWENOX_KV_POOL_TOKENS");
   const long long t = v ? atoll(v) : 0;
   return (int)std::max(lp, (t + KV_PAGE - 1) / KV_PAGE);
 }
@@ -767,7 +767,7 @@ __global__ void k_index_select(const float* scores, int stride, int* selected,
 static void index_select(const float* scores, int stride, int* selected,
                          int first, int count, const int* pos = nullptr) {
   int n = pos ? stride : min(stride, (first + count) / 4);
-  static bool old_sel = getenv("GDEC_INDEX_OLDSEL") != nullptr;
+  static bool old_sel = getenv("QWENOX_INDEX_OLDSEL") != nullptr;
   if (!old_sel && n > 512 && n <= 8192) {
     k_index_select_rs<<<count, 256, 0, g_str>>>(scores, stride, selected, first,
                                                 pos);

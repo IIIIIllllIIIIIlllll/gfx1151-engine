@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Direct token comparisons; run with the API stopped and GDEC_KVSNAP=0."""
+"""Direct token comparisons; run with the API stopped and QWENOX_KVSNAP=0."""
 import argparse
 import json
 import socket

@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# iproj_gemv_verify.sh — 验证 decode 档 iproj 走 k_f32_gemv_mr（默认开，GDEC_IPROJ_GEMV=0 回退）。
+# iproj_gemv_verify.sh — 验证 decode 档 iproj 走 k_f32_gemv_mr（默认开，QWENOX_IPROJ_GEMV=0 回退）。
 #   indexer 投影 fp32 N=640 K=2560：P<=8 时从 rocblas_sgemm（自选 MT32x32x8、20 块、
 #   P=4 实测 ~110us/次）改走 warp-per-row fp32 GEMV（流式读 6.5MB，~36us）。
 #   非逐 bit（fp32 累加顺序变）；ktest maxrel~1e-5（vs fp64，与 sgemm 自身误差同量级），
 #   实测 8K/32K greedy ids 与 BASE 逐 token 一致（indexer top-512 未发生边界翻转）。
 # 检查：
 #   1. ktest 单测：f32_gemv_mr PASS（vs fp64，tol 1e-4）+ P=1 与 P=4 第 0 行逐 bit
-#   2. GDEC_IPROJ_GEMV=0（回退旧 sgemm 路径）ids 必须与 BASE 一致
+#   2. QWENOX_IPROJ_GEMV=0（回退旧 sgemm 路径）ids 必须与 BASE 一致
 #   3. 默认开：8K/32K ids vs BASE（报告 SAME/DIFF；DIFF 不判 FAIL——
 #      top-512 边界翻转是已知良性机制，但须人工确认后更新本脚本预期）
 #   4. 默认开速度不慢于 BASE
 # 用法: bash tools/iproj_gemv_verify.sh   （约 8 分钟，结尾 PASS / FAIL）
-#   BIN=build/gdec（默认）  BASE=build/gdec.base（默认）  SKIP_KTEST=1 跳过单测
+#   BIN=build/qwenox-engine（默认）  BASE=build/qwenox.base（默认）  SKIP_KTEST=1 跳过单测
 # 日志: logs/igv_*.log，汇总 logs/iproj_gemv_verify.out
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
-BIN="${BIN:-build/gdec}"
-BASE="${BASE:-build/gdec.base}"
+BIN="${BIN:-build/qwenox-engine}"
+BASE="${BASE:-build/qwenox.base}"
 OUT=logs/iproj_gemv_verify.out
 mkdir -p logs
 exec > >(tee "$OUT") 2>&1
@@ -50,8 +50,8 @@ run() {  # run LABEL BIN PROMPT [K=V...]
 ids() { grep '^ids:' "logs/$1.log"; }
 toks() { grep -h 'spec: ' "logs/$1.log" | tail -1 | grep -o '[0-9.]* tok/s' | grep -o '^[0-9.]*'; }
 
-echo "-- 2. GDEC_IPROJ_GEMV=0（回退路径）ids 一致：8K MTP"
-if run igv_off8 "$BIN" 8k GDEC_IPROJ_GEMV=0 && run igv_bs8 "$BASE" 8k; then
+echo "-- 2. QWENOX_IPROJ_GEMV=0（回退路径）ids 一致：8K MTP"
+if run igv_off8 "$BIN" 8k QWENOX_IPROJ_GEMV=0 && run igv_bs8 "$BASE" 8k; then
   [[ "$(ids igv_off8)" == "$(ids igv_bs8)" ]] \
     && ok "回退路径 ids 一致" || bad "回退路径 ids 不一致（回退不应受影响）"
 else

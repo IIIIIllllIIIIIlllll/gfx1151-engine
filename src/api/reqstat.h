@@ -21,8 +21,8 @@
 // Rotation: when the next record would exceed rotate_bytes the current file
 // is renamed reqstat-<seq>.bin and a fresh reqstat.bin is started.
 //
-// Env: GDEC_REQSTAT=0 disables; GDEC_REQSTAT_DIR overrides the directory;
-// GDEC_REQSTAT_MAX_MB sets the rotation threshold (default 256, fractional
+// Env: QWENOX_REQSTAT=0 disables; QWENOX_REQSTAT_DIR overrides the directory;
+// QWENOX_REQSTAT_MAX_MB sets the rotation threshold (default 256, fractional
 // values allowed for testing).
 #pragma once
 #include <cstdint>

@@ -206,9 +206,9 @@ static void argmax_fast_rows(const float* x, int n, int rows,
   k_argmax_p2<<<dim3(1, rows), 32, 0, st>>>(d_cand, ARGMAX_B1, out);
 }
 
-// Default: two-stage. GDEC_ARGMAX_OLD restores the single-block kernel
+// Default: two-stage. QWENOX_ARGMAX_OLD restores the single-block kernel
 // (identical values except on exact fp32 ties; see k_argmax_p1).
-static const bool g_argmax_old = getenv("GDEC_ARGMAX_OLD") != nullptr;
+static const bool g_argmax_old = getenv("QWENOX_ARGMAX_OLD") != nullptr;
 static void argmax_rows(const float* x, int n, int rows,
                         unsigned long long* d_cand, int* out, hipStream_t st) {
   if (!g_argmax_old && rows <= 65) {

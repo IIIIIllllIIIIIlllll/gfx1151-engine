@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
 # tg_verify.sh — 一键验证 TG/MTP decode 改动（09-28）：
-#   D'  draft lm_head 用 4-bit q4cp 副本        关闭：GDEC_DRAFT_LM_Q4=0
-#   B2  两段 argmax（k_argmax_p1/p2）          关闭：GDEC_ARGMAX_OLD=1
-#   A   采样准备搬到 GPU（修正 + radix top-k） 关闭：GDEC_SMS_GPU=0
+#   D'  draft lm_head 用 4-bit q4cp 副本        关闭：QWENOX_DRAFT_LM_Q4=0
+#   B2  两段 argmax（k_argmax_p1/p2）          关闭：QWENOX_ARGMAX_OLD=1
+#   A   采样准备搬到 GPU（修正 + radix top-k） 关闭：QWENOX_SMS_GPU=0
 # 步骤：
 #   1. 单测 tools/tg_kernels_test.cu（kernel 从当前 21_kernels_ple.inc 现抽）：
 #      argmax / top-k / corr_apply 对 CPU 参考，含词表尾部最大值、并列、全 -inf、溢出回退
 #   2. greedy 逐 token：8K prompt，--spec-gen 256 γ=3，MTP 与 chain 两种 drafter，
 #      默认 vs 三个开关全关，ids 必须完全一致（BASE=旧二进制 时再和它比一次）
-#   3. 采样分布自检：GDEC_SMS_CHECK=1（每行把稀疏分布和 dense prepare() 比对），
+#   3. 采样分布自检：QWENOX_SMS_CHECK=1（每行把稀疏分布和 dense prepare() 比对），
 #      MTP、chain、chain+presence/frequency 各一次，bad 必须为 0
 #   4. 采样速度：chain drafter（API 默认），temp 1.0 / top_k 20 / top_p 0.95，
-#      3 个 seed，默认 vs GDEC_SMS_GPU=0，按 ms/轮 比较，默认需快 ≥5%
+#      3 个 seed，默认 vs QWENOX_SMS_GPU=0，按 ms/轮 比较，默认需快 ≥5%
 # 用法: bash tools/tg_verify.sh       （约 4 分钟，结尾输出 PASS / FAIL）
-#   BIN=build/gdec（默认）  BASE=build/gdec.base（可选，旧代码二进制）
+#   BIN=build/qwenox-engine（默认）  BASE=build/qwenox.base（可选，旧代码二进制）
 # 日志: logs/tgv_*.log，汇总 logs/tg_verify.out
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-BIN="${BIN:-build/gdec}"
+BIN="${BIN:-build/qwenox-engine}"
 BASE="${BASE:-}"
 HIPCC="${HIPCC:-/opt/rocm/bin/hipcc}"
 OUT=logs/tg_verify.out
@@ -27,7 +27,7 @@ exec > >(tee "$OUT") 2>&1
 fail=0
 bad() { echo "  FAIL: $*"; fail=1; }
 ok() { echo "  OK: $*"; }
-OFF="GDEC_ARGMAX_OLD=1 GDEC_DRAFT_LM_Q4=0 GDEC_SMS_GPU=0"
+OFF="QWENOX_ARGMAX_OLD=1 QWENOX_DRAFT_LM_Q4=0 QWENOX_SMS_GPU=0"
 SAMPLE="1.0,20,0.95"
 
 [[ -x "$BIN" ]] || { echo "缺二进制: $BIN（先 bash build.sh）"; echo FAIL; exit 1; }
@@ -62,7 +62,7 @@ rm -rf "$T"
 
 echo "-- 2. greedy 逐 token（默认 vs 开关全关）"
 for c in 0 1; do
-  if run tgv_g_new_c$c "$BIN" GDEC_SPEC_CHAIN=$c && run tgv_g_off_c$c "$BIN" GDEC_SPEC_CHAIN=$c $OFF; then
+  if run tgv_g_new_c$c "$BIN" QWENOX_SPEC_CHAIN=$c && run tgv_g_off_c$c "$BIN" QWENOX_SPEC_CHAIN=$c $OFF; then
     echo "  chain=$c 默认: $(specline tgv_g_new_c$c | sed 's/.*tokens in/in/' | cut -c1-80)"
     echo "  chain=$c 关闭: $(specline tgv_g_off_c$c | sed 's/.*tokens in/in/' | cut -c1-80)"
     [[ "$(ids tgv_g_new_c$c)" == "$(ids tgv_g_off_c$c)" ]] && ok "chain=$c ids 一致" || bad "chain=$c ids 不一致"
@@ -79,12 +79,12 @@ if [[ -n "$BASE" ]]; then
   fi
 fi
 
-echo "-- 3. 采样分布自检（GDEC_SMS_CHECK=1）"
+echo "-- 3. 采样分布自检（QWENOX_SMS_CHECK=1）"
 # 名称:chain:采样参数（第三项带 presence/frequency，走 k_corr_apply 与草稿前缀惩罚）
 for spec in "mtp:0:$SAMPLE,7" "chain:1:$SAMPLE,7" "chain_pen:1:0.8,40,0.9,5,0.5,0.3"; do
   IFS=: read nm c sp <<<"$spec"
   L=tgv_chk_$nm
-  if run $L "$BIN" GDEC_SPEC_CHAIN=$c GDEC_SMS_CHECK=1 GDEC_SPEC_SAMPLE=$sp; then
+  if run $L "$BIN" QWENOX_SPEC_CHAIN=$c QWENOX_SMS_CHECK=1 QWENOX_SPEC_SAMPLE=$sp; then
     last=$(grep -h '^\[sms-check\] n=' "logs/$L.log" | tail -1)
     nmis=$(grep -c 'MISMATCH' "logs/$L.log")
     n=$(sed -E 's/.* n=([0-9]+) .*/\1/' <<<"$last")
@@ -102,8 +102,8 @@ done
 echo "-- 4. 采样速度（chain drafter，3 个 seed）"
 tn=0; rn=0; to=0; ro=0; sok=1
 for s in 7 11 23; do
-  if run tgv_s_new_$s "$BIN" GDEC_SPEC_CHAIN=1 GDEC_SPEC_SAMPLE=$SAMPLE,$s &&
-     run tgv_s_off_$s "$BIN" GDEC_SPEC_CHAIN=1 GDEC_SPEC_SAMPLE=$SAMPLE,$s GDEC_SMS_GPU=0; then
+  if run tgv_s_new_$s "$BIN" QWENOX_SPEC_CHAIN=1 QWENOX_SPEC_SAMPLE=$SAMPLE,$s &&
+     run tgv_s_off_$s "$BIN" QWENOX_SPEC_CHAIN=1 QWENOX_SPEC_SAMPLE=$SAMPLE,$s QWENOX_SMS_GPU=0; then
     read a b <<<"$(t_r tgv_s_new_$s)"; read x y <<<"$(t_r tgv_s_off_$s)"
     echo "  seed $s: 默认 $(specline tgv_s_new_$s | sed -E 's/.*= ([0-9.]+ tok\/s).*/\1/')（${b} 轮）  SMS 关 $(specline tgv_s_off_$s | sed -E 's/.*= ([0-9.]+ tok\/s).*/\1/')（${y} 轮）"
     tn=$(awk "BEGIN{print $tn+$a}"); rn=$((rn + b)); to=$(awk "BEGIN{print $to+$x}"); ro=$((ro + y))
@@ -113,7 +113,7 @@ for s in 7 11 23; do
 done
 if (( sok && rn && ro )); then
   mn=$(awk "BEGIN{printf \"%.1f\", $tn*1000/$rn}"); mo=$(awk "BEGIN{printf \"%.1f\", $to*1000/$ro}")
-  echo "  ms/轮：默认 $mn  vs  GDEC_SMS_GPU=0 $mo"
+  echo "  ms/轮：默认 $mn  vs  QWENOX_SMS_GPU=0 $mo"
   awk "BEGIN{exit !($mn <= 0.95*$mo)}" && ok "GPU 采样每轮快 ≥5%" || bad "GPU 采样提速不足 5%"
 else
   bad "采样速度运行失败"

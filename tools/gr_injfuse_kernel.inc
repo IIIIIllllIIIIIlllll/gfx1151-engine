@@ -49,7 +49,7 @@ __global__ void k_gr_scatter_norm_b_hc_bf16(
   }
 }
 
-// HC inject fusion (GDEC_HC_INJ_FUSE). w4[t][k] = sum_c Winj[k][c] *
+// HC inject fusion (QWENOX_HC_INJ_FUSE). w4[t][k] = sum_c Winj[k][c] *
 // Rhat[t][c] over K = 4 * d is the next site's inject projection (an N=4
 // GEMM that re-reads the whole P x 10240 Rhat). Summed in a fixed order:
 // per-branch partials p[t][b][k], then b = 0..3 by inj_psum.

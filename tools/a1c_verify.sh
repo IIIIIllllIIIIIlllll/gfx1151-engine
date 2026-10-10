@@ -2,7 +2,7 @@
 # 一键 A1c 验证（生产配置 BF16 KV + WMMA + BTV 下的分页），前台运行，最后一行
 # A1C VERIFY: PASS/FAIL。约 20-30 分钟。
 #   bash tools/a1c_verify.sh
-#   OLD_BINARY=~/gdec-base/build/gdec bash tools/a1c_verify.sh   # 顺带做 A1b 的新旧二进制对照
+#   OLD_BINARY=~/qwenox-base/build/qwenox-engine bash tools/a1c_verify.sh   # 顺带做 A1b 的新旧二进制对照
 #   SKIP_BUILD=1 bash tools/a1c_verify.sh                         # 已经编译过，跳过编译
 # 步骤：
 #   1. bash build.sh test：ktest 全过，含新增 qsa_wmma_btv_paged_bits / qsa_wmma_rm_paged_bits
@@ -16,8 +16,8 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mkdir -p logs
 
-if [[ -z "${OLD_BINARY:-}" && -x "$HOME/gdec-base/build/gdec" ]]; then
-  OLD_BINARY="$HOME/gdec-base/build/gdec"
+if [[ -z "${OLD_BINARY:-}" && -x "$HOME/qwenox-base/build/qwenox-engine" ]]; then
+  OLD_BINARY="$HOME/qwenox-base/build/qwenox-engine"
   echo "发现 $OLD_BINARY，顺带跑 prodold（A1b 新旧二进制对照）"
 fi
 export OLD_BINARY="${OLD_BINARY:-}"
@@ -57,11 +57,11 @@ step "matrix ${cfgs[*]}" "$([[ $rc == 0 ]] && echo PASS || echo FAIL)"
 
 echo
 echo "================ 4/4 kvsnap 跨布局保存/恢复 ================"
-echo "---- 4a: 不分页保存 → GDEC_KV_PAGED=2 恢复 ----"
+echo "---- 4a: 不分页保存 → QWENOX_KV_PAGED=2 恢复 ----"
 RESTORE_KVP=2 bash tools/btv_kvsnap_verify.sh 2>&1 | tee logs/a1c-kvsnap-a.txt
 rc=${PIPESTATUS[0]}
 step "kvsnap save=off restore=p2" "$([[ $rc == 0 ]] && echo PASS || echo FAIL)"
-echo "---- 4b: GDEC_KV_PAGED=2 保存 → 不分页恢复 ----"
+echo "---- 4b: QWENOX_KV_PAGED=2 保存 → 不分页恢复 ----"
 SAVE_KVP=2 bash tools/btv_kvsnap_verify.sh 2>&1 | tee logs/a1c-kvsnap-b.txt
 rc=${PIPESTATUS[0]}
 step "kvsnap save=p2 restore=off" "$([[ $rc == 0 ]] && echo PASS || echo FAIL)"

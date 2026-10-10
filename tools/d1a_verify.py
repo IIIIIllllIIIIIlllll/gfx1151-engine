@@ -6,7 +6,7 @@
   gate --a 16K --b 8K   读两份结果，打印对比，最后一行 PASS/FAIL
 
 A = 短 prompt、chain drafter、greedy、A_TOKENS 个 token；B = 32K prompt（qsa-oracle），只要首 token。
-B 两次用不同的首 token（引擎开 GDEC_RCKPT=0），保证每次都从头 prefill；D 行 cached 必须为 0。
+B 两次用不同的首 token（引擎开 QWENOX_RCKPT=0），保证每次都从头 prefill；D 行 cached 必须为 0。
 停顿只统计 B 提交到 B 首 token 这段窗口内 A 的 token 间隔。
 """
 import argparse

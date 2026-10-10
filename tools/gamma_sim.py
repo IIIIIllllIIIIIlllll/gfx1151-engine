@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""gamma_sim.py — replay MTP acceptance traces (GDEC_SPEC_TRACE=1, tools/gamma_trace.sh)
+"""gamma_sim.py — replay MTP acceptance traces (QWENOX_SPEC_TRACE=1, tools/gamma_trace.sh)
 against γ controllers offline.
 
   python3 tools/gamma_sim.py [logs/gtr]            # validate + controller table

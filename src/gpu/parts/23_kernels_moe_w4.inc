@@ -22,9 +22,9 @@
 // still runs the full K-chunk loop, so x staging and barrier count per unit
 // output double — measured 2026-09-09 (tools/MOE_OCC.md): 32K up +12%, down
 // +30% slower; occupancy gain does not compensate. Rebuild with
-// -DGDEC_MOE_CT64 to rerun that experiment (compile-time switch; the GDEC_*
+// -DQWENOX_MOE_CT64 to rerun that experiment (compile-time switch; the QWENOX_*
 // runtime fallbacks are unaffected).
-#ifdef GDEC_MOE_CT64
+#ifdef QWENOX_MOE_CT64
 #define MOE_CT 64
 #else
 #define MOE_CT 128
@@ -36,13 +36,13 @@
 #define FD_RT 64
 #define FD_CT MOE_CT
 // K chunk. Default: 32-wide single-buffered dual-barrier loop. The 16-wide
-// double-buffered single-barrier variant (-DGDEC_MOE_KC16DB, stage of chunk
+// double-buffered single-barrier variant (-DQWENOX_MOE_KC16DB, stage of chunk
 // i+1 overlaps compute of chunk i, bit-identical 32-wide scale fold via
 // chunk partials living across two 16-chunks) was MEASURED A REGRESSION
 // (2026-09-09: packed up +13%, packed down +8% @32K — halving per-chunk
 // compute makes the per-chunk stage/loop overhead dominate, barrier parity
-// notwithstanding) and is kept opt-in, like GDEC_MOE_CT64.
-#ifndef GDEC_MOE_KC16DB
+// notwithstanding) and is kept opt-in, like QWENOX_MOE_CT64.
+#ifndef QWENOX_MOE_KC16DB
 #define FD_KC 32
 #define FD_XP 20              // xs2 row pitch in bf162 (80B, 16B-aligned)
 #else
@@ -51,20 +51,20 @@
 #endif
 #define FD_WP (FD_CT + 4)     // wf2 row pitch in bf162 (bank-rotating)
 #define FD_CPT (FD_CT / 32)   // output columns per thread
-// Down-only wide column tile experiment: -DGDEC_MOE_DOWN_CT256 (d=2560 is
+// Down-only wide column tile experiment: -DQWENOX_MOE_DOWN_CT256 (d=2560 is
 // divisible by 256; moe_mid=640 is not, so up always keeps FD_CT).
-#ifdef GDEC_MOE_DOWN_CT256
+#ifdef QWENOX_MOE_DOWN_CT256
 #define FD_CT_DN 256
 #else
 #define FD_CT_DN FD_CT
 #endif
 #define FD_WP_DN (FD_CT_DN + 4)
 #define FD_CPT_DN (FD_CT_DN / 32)
-#if defined(GDEC_MOE_DOWN_CT256) && !defined(GDEC_MOE_KC16DB)
-#error "GDEC_MOE_DOWN_CT256 requires the KC16 double-buffered loop (256 columns exceed the 256-thread KC32 staging layout)"
+#if defined(QWENOX_MOE_DOWN_CT256) && !defined(QWENOX_MOE_KC16DB)
+#error "QWENOX_MOE_DOWN_CT256 requires the KC16 double-buffered loop (256 columns exceed the 256-thread KC32 staging layout)"
 #endif
 // Min blocks/CU hint: CT=64 targets 4 resident blocks, CT=128 fits 2.
-#ifdef GDEC_MOE_LB2
+#ifdef QWENOX_MOE_LB2
 #define FD_MINB 2
 #else
 #define FD_MINB (FD_CPT == 2 ? 4 : 2)
@@ -96,7 +96,7 @@ __global__ void __launch_bounds__(256, FD_MINB)
   const int n0 = Tiled ? tiles[blockIdx.y].first : eoff[e];
   const int ne = Tiled ? tiles[blockIdx.y].count : eoff[e + 1] - n0;
   if (!ne) return;
-#ifndef GDEC_MOE_KC16DB
+#ifndef QWENOX_MOE_KC16DB
   // One byte selects two already-rounded codebook values. The first token-map
   // barrier below publishes the table before any weight tile consumes it.
   __shared__ __hip_bfloat162 cb_pairs[PairTable ? 256 : 1];
@@ -133,7 +133,7 @@ __global__ void __launch_bounds__(256, FD_MINB)
     if (threadIdx.x < FD_RT)
       tk[threadIdx.x] = threadIdx.x < nr ? tokidx[n0 + r0 + threadIdx.x] : 0;
     __syncthreads();
-#ifndef GDEC_MOE_KC16DB
+#ifndef QWENOX_MOE_KC16DB
     // staging slots: codes row tid/2, half tid%2 (8B = 16 nibbles);
     // with FD_CT=64 only the first 128 threads stage weights (sact).
     const int srow = threadIdx.x >> 1, sseg = threadIdx.x & 1;
@@ -157,8 +157,8 @@ __global__ void __launch_bounds__(256, FD_MINB)
     // Measured 2026-09-09 (KC32): pays off only on the fp32 path (2x16B
     // loads, up -3.5%); on the packed bf16 path the 16B gather is too cheap
     // to amortize the register live range (packed up +3%), so it is gated
-    // off there. -DGDEC_MOE_NO_XPREF disables it everywhere.
-#ifdef GDEC_MOE_NO_XPREF
+    // off there. -DQWENOX_MOE_NO_XPREF disables it everywhere.
+#ifdef QWENOX_MOE_NO_XPREF
     constexpr bool XPREF = false;
 #else
     constexpr bool XPREF = !Packed;
@@ -323,7 +323,7 @@ __global__ void __launch_bounds__(256, FD_MINB)
     auto x_store = [&](int buf, int k0) {
       __hip_bfloat162 v[2];
       bool got = xact;
-#ifdef GDEC_MOE_NO_XPREF
+#ifdef QWENOX_MOE_NO_XPREF
       if (got) {
         if (Packed) {
           *(uint2*)v = *(const uint2*)(packed_x + xoff + k0);
@@ -370,7 +370,7 @@ __global__ void __launch_bounds__(256, FD_MINB)
     // prologue: stage chunk 0 into buffer 0 (the tk barrier above is also
     // the WAR barrier against the previous row tile's compute reads)
     if (sact) stage_load(0);
-#ifndef GDEC_MOE_NO_XPREF
+#ifndef QWENOX_MOE_NO_XPREF
     x_load(0);
 #endif
     stage_w(0);
@@ -386,7 +386,7 @@ __global__ void __launch_bounds__(256, FD_MINB)
       // issue chunk ci+1's global loads; latency hides behind the compute
       if (ci + 1 < nchunk) {
         if (sact) stage_load(k0 + FD_KC);
-#ifndef GDEC_MOE_NO_XPREF
+#ifndef QWENOX_MOE_NO_XPREF
         x_load(k0 + FD_KC);
 #endif
       }
@@ -478,7 +478,7 @@ __global__ void __launch_bounds__(256, FD_MINB)
   const int n0 = Tiled ? tiles[blockIdx.y].first : eoff[e];
   const int ne = Tiled ? tiles[blockIdx.y].count : eoff[e + 1] - n0;
   if (!ne) return;
-#ifndef GDEC_MOE_KC16DB
+#ifndef QWENOX_MOE_KC16DB
   // The first K-loop barrier publishes the table before weight staging.
   __shared__ __hip_bfloat162 cb_pairs[PairTable ? 256 : 1];
   if (PairTable)
@@ -500,7 +500,7 @@ __global__ void __launch_bounds__(256, FD_MINB)
   for (int r0 = 0; r0 < ne; r0 += FD_RT) {
     const int nr = min(FD_RT, ne - r0);
     float accv[FD_CPT_DN][8] = {};  // [cc][r]
-#ifndef GDEC_MOE_KC16DB
+#ifndef QWENOX_MOE_KC16DB
     const int srow = threadIdx.x >> 1, sseg = threadIdx.x & 1;
     const bool sact = srow < FD_CT_DN;  // CT=64: only half the threads stage
     const uint8_t* rb = ec + (size_t)(c0 + srow) * rowb + sseg * 8;
@@ -515,8 +515,8 @@ __global__ void __launch_bounds__(256, FD_MINB)
     // x gather prefetch (see k_moe_w4_up): row xr, pairs xp4..xp4+3; loads
     // issued one chunk ahead beside stage_load. Bit-identical either way.
     // Gated to the fp32 path (packed gather is too cheap to amortize the
-    // register live range); -DGDEC_MOE_NO_XPREF disables it everywhere.
-#ifdef GDEC_MOE_NO_XPREF
+    // register live range); -DQWENOX_MOE_NO_XPREF disables it everywhere.
+#ifdef QWENOX_MOE_NO_XPREF
     constexpr bool XPREF = false;
 #else
     constexpr bool XPREF = !Packed;
@@ -641,7 +641,7 @@ __global__ void __launch_bounds__(256, FD_MINB)
     auto x_store = [&](int buf, int k0) {
       __hip_bfloat162 v[2];
       bool got = xact;
-#ifdef GDEC_MOE_NO_XPREF
+#ifdef QWENOX_MOE_NO_XPREF
       if (got) {
         if (Packed) {
           *(uint2*)v = *(const uint2*)(packed_hid + xoff + k0);
@@ -688,7 +688,7 @@ __global__ void __launch_bounds__(256, FD_MINB)
     // previous row tile's last compute, but chunk 0 reads nothing and the
     // previous tile ended with a barrier)
     if (sact) stage_load(0);
-#ifndef GDEC_MOE_NO_XPREF
+#ifndef QWENOX_MOE_NO_XPREF
     x_load(0);
 #endif
     stage_w(0);
@@ -702,7 +702,7 @@ __global__ void __launch_bounds__(256, FD_MINB)
       const int cur = ci & 1, nxt = cur ^ 1, k0 = ci * FD_KC;
       if (ci + 1 < nchunk) {
         if (sact) stage_load(k0 + FD_KC);
-#ifndef GDEC_MOE_NO_XPREF
+#ifndef QWENOX_MOE_NO_XPREF
         x_load(k0 + FD_KC);
 #endif
       }

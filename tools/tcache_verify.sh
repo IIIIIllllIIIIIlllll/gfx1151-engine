@@ -4,20 +4,20 @@
 #   ENGINE_BIN=build/x API_BIN=build/y bash tools/tcache_verify.sh
 #   MAX_TOKENS=3000 ONLY=text bash tools/tcache_verify.sh
 # 用生产环境变量（start_hgn.sh --check）起测试引擎 :8732，kvsnap 写临时目录；
-# API 起两份：:8733 token 缓存打开，:8734 GDEC_API_TOKCACHE=0 作对照。
+# API 起两份：:8733 token 缓存打开，:8734 QWENOX_API_TOKCACHE=0 作对照。
 # 文本：采样生成长回复后追问，要求整段复用；视觉：文本历史后发图、再加第二张图都要复用，
 # 换掉图 1 的像素则不能复用图片 KV。toolcall：float 参数的工具调用回填后追问，
 # 要求命中 <tool_call> 处的 mid-decode 检查点而非退回上轮 prompt 末尾。
 # agent：两轮工具调用（温度+气压），第三轮 cached 须越过第二轮 prompt 末尾、
 # 命中 <tool_call> #2 检查点（验证连续两轮的 mid-decode 检查点都生效）。
-# persist：种子轮后重启缓存 ON 的 API（同一 GDEC_API_TOKCACHE_FILE），追问仍须整段复用。
+# persist：种子轮后重启缓存 ON 的 API（同一 QWENOX_API_TOKCACHE_FILE），追问仍须整段复用。
 # 耗时约 5–10 分钟（加载 ~1 分钟 + 长回复解码）。
 # 最后一行：TCACHE VERIFY: PASS 或 FAIL。
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 source tools/probe_lib.sh
-ENGINE_BIN="${ENGINE_BIN:-build/gdec}"
-API_BIN="${API_BIN:-build/gdec-api}"
+ENGINE_BIN="${ENGINE_BIN:-build/qwenox-engine}"
+API_BIN="${API_BIN:-build/qwenox-api}"
 ON_PORT=8733
 OFF_PORT=8734
 
@@ -61,18 +61,18 @@ api_start() {  # $1 端口 $2 日志 tag；其余为额外环境变量 K=V
 trap 'apis_stop; probe_stop; rm -rf "$TMPD"' EXIT
 trap 'exit 130' INT TERM
 
-for e in $(compgen -e | grep '^GDEC_'); do unset "$e"; done
+for e in $(compgen -e | grep '^QWENOX_'); do unset "$e"; done
 for e in "${PENV[@]}"; do export "$e"; done
-export GDEC_KVSNAP_DIR="$TMPD/kvsnap"
+export QWENOX_KVSNAP_DIR="$TMPD/kvsnap"
 # 降低 rckpt 最小 token 门槛（默认 4096），让 toolcall 场景不用堆 4K+ prompt。
-export GDEC_RCKPT_MIN="${GDEC_RCKPT_MIN:-200}"
-mkdir -p "$GDEC_KVSNAP_DIR" logs
+export QWENOX_RCKPT_MIN="${QWENOX_RCKPT_MIN:-200}"
+mkdir -p "$QWENOX_KVSNAP_DIR" logs
 probe_start tcache-engine "${ENGINE[@]}" || { echo "TCACHE VERIFY: FAIL（引擎启动失败）"; exit 1; }
 api_start $ON_PORT tcache-api-on \
-  GDEC_API_TOKCACHE_FILE="$TMPD/tcache.bin" GDEC_API_TOKCACHE_SAVE_S=0 \
+  QWENOX_API_TOKCACHE_FILE="$TMPD/tcache.bin" QWENOX_API_TOKCACHE_SAVE_S=0 \
   || { echo "TCACHE VERIFY: FAIL（API 启动失败）"; exit 1; }
 ON_PID=$LAST_API_PID
-api_start $OFF_PORT tcache-api-off GDEC_API_TOKCACHE=0 GDEC_API_TOKCACHE_FILE= \
+api_start $OFF_PORT tcache-api-off QWENOX_API_TOKCACHE=0 QWENOX_API_TOKCACHE_FILE= \
   || { echo "TCACHE VERIFY: FAIL（API 启动失败）"; exit 1; }
 
 args=(--on $ON_PORT --off $OFF_PORT --max-tokens "${MAX_TOKENS:-6000}")
@@ -90,7 +90,7 @@ if [[ -z "${ONLY:-}" || "$ONLY" == persist ]]; then
     echo "[persist] tcache.bin 已落盘（$(stat -c%s "$TMPD/tcache.bin") 字节），重启 API ..."
     kill "$ON_PID" 2>/dev/null; wait "$ON_PID" 2>/dev/null
     api_start $ON_PORT tcache-api-on2 \
-      GDEC_API_TOKCACHE_FILE="$TMPD/tcache.bin" GDEC_API_TOKCACHE_SAVE_S=0 || rc=1
+      QWENOX_API_TOKCACHE_FILE="$TMPD/tcache.bin" QWENOX_API_TOKCACHE_SAVE_S=0 || rc=1
     if grep -q 'tcache: loaded' logs/tcache-api-on2.log; then
       echo "PASS persist-load: $(grep 'tcache: loaded' logs/tcache-api-on2.log | tail -1)"
     else
@@ -114,7 +114,7 @@ echo "引擎 未命中诊断 / 视觉 cont 否决 / 恢复 / ckpt："
 grep -E 'no live prefix|live prefix .* not reused|rckpt|kvsnap: restore|ckpt: saved' "$PROBE_LOG" | tail -n 12
 crash="$(grep -E 'hipError|Segmentation|Aborted|FATAL|GUARD PAGE' "$PROBE_LOG" | head -3)"
 [[ -z "$crash" ]] || { echo "引擎日志有错误："; echo "$crash"; rc=1; }
-[[ "$n_off" == 0 ]] || { echo "FAIL GDEC_API_TOKCACHE=0 没有关掉缓存"; rc=1; }
+[[ "$n_off" == 0 ]] || { echo "FAIL QWENOX_API_TOKCACHE=0 没有关掉缓存"; rc=1; }
 
 echo
 (( rc == 0 )) && echo "TCACHE VERIFY: PASS" || echo "TCACHE VERIFY: FAIL"

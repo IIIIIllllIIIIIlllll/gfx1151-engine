@@ -4,13 +4,13 @@
 #   bash tools/a5_verify.sh
 #   SKIP_BUILD=1 bash tools/a5_verify.sh     # 已经编译过，跳过 ktest + 编译
 #   A5_CTX=65536 bash tools/a5_verify.sh     # 用更小的 maxctx 快速跑（默认 = service.conf 的 MAX_CONTEXT）
-#   A5_BIN=build/gdec.conc SKIP_BUILD=1 bash tools/a5_verify.sh   # 测另一个引擎二进制
+#   A5_BIN=build/qwenox.conc SKIP_BUILD=1 bash tools/a5_verify.sh   # 测另一个引擎二进制
 # 之前 A1–A3 的分页测试全是串行解码。生产实际走的是 chain/MTP 投机 + 验证回滚、
 # 采样、多轮续写、SNAPS 切点、kvsnap + rckpt 同时开、MTP 权重和视觉塔都加载、
 # maxctx 256K。本脚本用 start_hgn.sh 的真实环境变量和命令行（只换端口 8732）跑三个引擎：
 #   off = KV_PAGED=0（不分页，基准）
-#   p1  = 生产默认（GDEC_KV_PAGED=1）
-#   p2  = GDEC_KV_PAGED=2（打乱物理页 + FIFO 自检）
+#   p1  = 生产默认（QWENOX_KV_PAGED=1）
+#   p2  = QWENOX_KV_PAGED=2（打乱物理页 + FIFO 自检）
 # 每个引擎：tools/a5_ab.py run（32 个请求：新 prompt × 串行/MTP/ngram/chain、采样、
 # 多轮对话 A→B→切回 A）+ tools/ngram_regress.py（投机回滚/EOS/取消/续写/采样回退）。
 # 判定：p1、p2 与 off 逐 token 一致、spec 统计一致（切回 A 的两轮只比较 p1 vs p2，
@@ -64,13 +64,13 @@ for f in start_hgn.sh start_gguf.sh tools/serve_common.sh start_win.sh service.c
     sed -i 's/\r$//' "$f" && echo "已把 $f 的 CRLF 换行转成 LF"
   fi
 done
-# start_hgn.sh 要求 build/gdec 和 build/gdec-api 都在；测试用的 checkout 往往只编过引擎。
+# start_hgn.sh 要求 build/qwenox-engine 和 build/qwenox-api 都在；测试用的 checkout 往往只编过引擎。
 # 本脚本不启动 API，这里只是为了让 --check 通过（SKIP_BUILD=1 时也会补编）。
-if [[ ! -x build/gdec-api ]]; then
-  echo "build/gdec-api 不存在（start_hgn.sh --check 需要），编译 API 中……"
+if [[ ! -x build/qwenox-api ]]; then
+  echo "build/qwenox-api 不存在（start_hgn.sh --check 需要），编译 API 中……"
   bash build.sh api 2>&1 | tail -n 5
   rc=${PIPESTATUS[0]}
-  [[ $rc == 0 && -x build/gdec-api ]] || die "build api" "API 编译失败，把上面的错误贴回来"
+  [[ $rc == 0 && -x build/qwenox-api ]] || die "build api" "API 编译失败，把上面的错误贴回来"
   step "build api（start_hgn.sh 需要）" PASS
 fi
 chk="$(bash start_hgn.sh --check 2>&1)"; rc=$?
@@ -80,13 +80,13 @@ mapfile -t PENV < <(sed -n 's/^ENV //p' <<<"$chk")
 CMDLINE="$(sed -n 's/^CMD //p' <<<"$chk")"
 [[ ${#PENV[@]} -gt 0 && -n "$CMDLINE" ]] || die "start_hgn.sh --check" "没有 ENV/CMD 输出（启动器是旧版？）"
 printf '  %s\n' "${PENV[@]}"
-if printf '%s\n' "${PENV[@]}" | grep -qx 'GDEC_KV_PAGED=1'; then
-  step "生产环境默认 GDEC_KV_PAGED=1" PASS
+if printf '%s\n' "${PENV[@]}" | grep -qx 'QWENOX_KV_PAGED=1'; then
+  step "生产环境默认 QWENOX_KV_PAGED=1" PASS
 else
-  die "生产环境默认 GDEC_KV_PAGED=1" "start_hgn.sh 没有导出 GDEC_KV_PAGED=1，检查 service.conf 里的 KV_PAGED"
+  die "生产环境默认 QWENOX_KV_PAGED=1" "start_hgn.sh 没有导出 QWENOX_KV_PAGED=1，检查 service.conf 里的 KV_PAGED"
 fi
 eval "ENGINE=($CMDLINE)"
-[[ -n "${A5_BIN:-}" ]] && ENGINE[0]="$A5_BIN"   # 测试其他引擎二进制（如 build/gdec.conc）
+[[ -n "${A5_BIN:-}" ]] && ENGINE[0]="$A5_BIN"   # 测试其他引擎二进制（如 build/qwenox.conc）
 CTX="${A5_CTX:-}"
 for i in "${!ENGINE[@]}"; do
   case "${ENGINE[$i]}" in
@@ -96,7 +96,7 @@ for i in "${!ENGINE[@]}"; do
 done
 [[ "$CTX" =~ ^[1-9][0-9]*$ ]] || die "engine 命令行" "取不到 maxctx"
 (( CTX >= 40960 )) || die "engine 命令行" "maxctx $CTX 太小，32K 用例需要至少 40960"
-POOL="$(printf '%s\n' "${PENV[@]}" | sed -n 's/^GDEC_KV_POOL_TOKENS=//p')"
+POOL="$(printf '%s\n' "${PENV[@]}" | sed -n 's/^QWENOX_KV_POOL_TOKENS=//p')"
 PAGES=$(( ((POOL > CTX ? POOL : CTX) + 255) / 256 ))
 PROBE_CAP_GB="$(source service.conf; echo "${MEMORY_CAP_GB:-86}")"
 export PROBE_CAP_GB
@@ -107,15 +107,15 @@ echo "maxctx $CTX，页池 ${POOL:-0} token → 期望 $PAGES 页；内存上限
 SNAPDIR="$PWD/data/kvsnap-a5"
 set_env() {  # <off|p1|p2>
   local v
-  for v in $(compgen -e | grep '^GDEC_'); do unset "$v"; done
+  for v in $(compgen -e | grep '^QWENOX_'); do unset "$v"; done
   for v in "${PENV[@]}"; do export "$v"; done
-  export GDEC_KVSNAP_DIR="$SNAPDIR"     # 不碰生产的 data/kvsnap
+  export QWENOX_KVSNAP_DIR="$SNAPDIR"     # 不碰生产的 data/kvsnap
   # 单槽：off（不分页）只能跑 1 个槽；多槽时切回对话 A 会被派到还留着 A 的槽（cont），
   # 不走 rckpt 恢复，缓存命中也和 off 不同。并发由 tools/conc_verify.sh 覆盖。
-  export GDEC_PARALLEL=1
+  export QWENOX_PARALLEL=1
   case "$1" in
-    off) unset GDEC_KV_PAGED GDEC_KV_POOL_TOKENS ;;
-    p2) export GDEC_KV_PAGED=2 ;;
+    off) unset QWENOX_KV_PAGED QWENOX_KV_POOL_TOKENS ;;
+    p2) export QWENOX_KV_PAGED=2 ;;
   esac
 }
 
@@ -131,7 +131,7 @@ for t in off p1 p2; do
   set_env "$t"
   rm -rf "$SNAPDIR"; mkdir -p "$SNAPDIR"
   echo
-  echo "---- $t（GDEC_KV_PAGED=${GDEC_KV_PAGED:-未设置}，已用 $(( (SECONDS - T0) / 60 )) 分钟）----"
+  echo "---- $t（QWENOX_KV_PAGED=${QWENOX_KV_PAGED:-未设置}，已用 $(( (SECONDS - T0) / 60 )) 分钟）----"
   if ! probe_start "a5-$t" "${ENGINE[@]}"; then
     step "$t 引擎启动" "FAIL（见 logs/a5-$t.log）"; continue
   fi
@@ -163,7 +163,7 @@ step "p1: 分页 $PAGES 页 lowest-first" \
 l="$(grep -m1 'paged QSA KV on' $L/a5-p2.log 2>/dev/null || true)"
 step "p2: 分页 $PAGES 页 scrambled" \
   "$([[ "$l" == *"on: $PAGES pages"*scrambled* ]] && echo PASS || echo "FAIL（${l:-无启动行}）")"
-l="$(grep -h -m1 'GDEC_KV_PAGED ignored' $L/a5-p1.log $L/a5-p2.log 2>/dev/null || true)"
+l="$(grep -h -m1 'QWENOX_KV_PAGED ignored' $L/a5-p1.log $L/a5-p2.log 2>/dev/null || true)"
 step "生产 kernel 组合支持分页（无 ignored）" "$([[ -z "$l" ]] && echo PASS || echo "FAIL（$l）")"
 for t in p1 p2; do
   n="$(cnt 'rckpt: restored' $L/a5-$t.log)"

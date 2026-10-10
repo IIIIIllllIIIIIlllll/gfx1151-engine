@@ -2,19 +2,19 @@
 # kld_aggr.sh — prefill-aggr 分支的 KLD 验收（v2 权重，一键，末行 PASS/FAIL）
 #   bash tools/kld_aggr.sh            约 15 分钟
 # 基准：BF16 logits（~/Workspace/gfx-1151-kvsnap/data/kld/ 下 bf16_c8192 / bf16_c512）。
-# 对比：BASE_BIN（分支起点 de0d650，默认 build/gdec.base） vs build/gdec（HEAD），同机背靠背。
-#   c8192：两者 + HEAD 的两个消融（GDEC_QSA_UNION=0 / GDEC_INDEX_F32=1，只报告不判定）
+# 对比：BASE_BIN（分支起点 de0d650，默认 build/qwenox.base） vs build/qwenox-engine（HEAD），同机背靠背。
+#   c8192：两者 + HEAD 的两个消融（QWENOX_QSA_UNION=0 / QWENOX_INDEX_F32=1，只报告不判定）
 #   c512 ：两者
 # 门槛：mean_kld(HEAD) <= mean_kld(BASE) + 0.002 且 same_top 下降 <= 0.5 个百分点。
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 KD=${KD:-$HOME/Workspace/gfx-1151-kvsnap/data/kld}
-BASE_BIN=${BASE_BIN:-build/gdec.base}
-for f in "$KD/bf16_c8192.kld" "$KD/bf16_c512.kld" "$BASE_BIN" build/gdec; do
+BASE_BIN=${BASE_BIN:-build/qwenox.base}
+for f in "$KD/bf16_c8192.kld" "$KD/bf16_c512.kld" "$BASE_BIN" build/qwenox-engine; do
   [[ -e "$f" ]] || { echo "缺少 $f"; echo "KLD AGGR: FAIL"; exit 1; }
 done
 bash tools/aggr_serve.sh stop >/dev/null 2>&1
-if pgrep -x gdec >/dev/null; then echo "已有 gdec 在跑"; echo "KLD AGGR: FAIL"; exit 1; fi
+if pgrep -x qwenox >/dev/null; then echo "已有 qwenox 在跑"; echo "KLD AGGR: FAIL"; exit 1; fi
 export MODEL_FILE=./models/qwen38-flash-next-v2.hgn NGRAM_FILE=./models/qwen38-flash-next-ngram.hgn
 export OVERLAY_FILE= VISION_FILE= PARALLEL=1
 
@@ -28,11 +28,11 @@ run() {  # tag ref maxctx bin [env...]
 }
 rm -f /tmp/kld_aggr_results.txt
 run c8192_base "$KD/bf16_c8192.kld" 8448 "$BASE_BIN"
-run c8192_head "$KD/bf16_c8192.kld" 8448 build/gdec
-run c8192_head_nounion "$KD/bf16_c8192.kld" 8448 build/gdec GDEC_QSA_UNION=0
-run c8192_head_idxf32 "$KD/bf16_c8192.kld" 8448 build/gdec GDEC_INDEX_F32=1
+run c8192_head "$KD/bf16_c8192.kld" 8448 build/qwenox-engine
+run c8192_head_nounion "$KD/bf16_c8192.kld" 8448 build/qwenox-engine QWENOX_QSA_UNION=0
+run c8192_head_idxf32 "$KD/bf16_c8192.kld" 8448 build/qwenox-engine QWENOX_INDEX_F32=1
 run c512_base "$KD/bf16_c512.kld" 4096 "$BASE_BIN"
-run c512_head "$KD/bf16_c512.kld" 4096 build/gdec
+run c512_head "$KD/bf16_c512.kld" 4096 build/qwenox-engine
 
 python3 - <<'PY'
 import re

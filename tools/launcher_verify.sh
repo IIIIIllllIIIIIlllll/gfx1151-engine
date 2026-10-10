@@ -2,22 +2,22 @@
 # 启动器一键验证：start_hgn.sh / start_gguf.sh（Linux）。最后打印 PASS / FAIL。
 #   bash tools/launcher_verify.sh
 #     GGDIR=<GGUF 目录>   默认 models/（有第 1 个分片时），否则 ~/App/llama.cpp/models/Qwen3.8-Flash-Next-UD-Q4_K_XL
-#     BIN=build/gdec      端到端用的引擎二进制（需支持纯 GGUF）
+#     BIN=build/qwenox-engine      端到端用的引擎二进制（需支持纯 GGUF）
 #     E2E=0               只做 --check 类检查，不起服务
 # 检查项：
-#   1. start_hgn.sh --check：命令行 = gdec w4b overlay mtp --serve ... --vision-tower vision，无 GDEC_GGUF*
-#   2. start_gguf.sh --check：命令行 = gdec 第 1 个分片 --serve ... --vision-tower mmproj，
-#      ENV 比 hgn 只多 GDEC_GGUF_MTP=<sidecar>；MTP/视觉置空时 GDEC_GGUF_MTP= 且无 --vision-tower
+#   1. start_hgn.sh --check：命令行 = qwenox w4b overlay mtp --serve ... --vision-tower vision，无 QWENOX_GGUF*
+#   2. start_gguf.sh --check：命令行 = qwenox 第 1 个分片 --serve ... --vision-tower mmproj，
+#      ENV 比 hgn 只多 QWENOX_GGUF_MTP=<sidecar>；MTP/视觉置空时 QWENOX_GGUF_MTP= 且无 --vision-tower
 #   3. 缺文件：MODEL_DIR 指向空目录时两个启动器都退出 1 并列出全部缺失文件；少一个分片时只报那一个
-#   4. 格式互斥：hgn 启动器拒绝 .gguf、GGUF 启动器拒绝 .hgn；外部残留 GDEC_GGUF* 被清掉；start.sh 只提示
-#   5. 端到端（E2E=1）：临时根目录（build/gdec -> BIN，其余软链）里真正启动 hgn / GGUF / GGUF 无 MTP 无视觉，
+#   4. 格式互斥：hgn 启动器拒绝 .gguf、GGUF 启动器拒绝 .hgn；外部残留 QWENOX_GGUF* 被清掉；start.sh 只提示
+#   5. 端到端（E2E=1）：临时根目录（build/qwenox-engine -> BIN，其余软链）里真正启动 hgn / GGUF / GGUF 无 MTP 无视觉，
 #      等"服务已就绪"，发一条 chat 请求，停止后引擎进程与端口都已释放（后台进程的 SIGINT 被 bash 忽略，
 #      用 SIGTERM，与 Ctrl+C 走同一个 cleanup）
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 ROOT=$PWD
 unset MODEL_DIR MODEL_FILE OVERLAY_FILE MTP_FILE VISION_FILE TOKENIZER_DIR GGUF_FILE GGUF_MTP_FILE GGUF_VISION_FILE
-for e in $(compgen -e | grep '^GDEC_'); do unset "$e"; done
+for e in $(compgen -e | grep '^QWENOX_'); do unset "$e"; done
 SHARD=Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
 if [[ -z ${GGDIR:-} ]]; then
   GGDIR=models; [[ -f models/$SHARD ]] || GGDIR=$HOME/App/llama.cpp/models/Qwen3.8-Flash-Next-UD-Q4_K_XL
@@ -26,7 +26,7 @@ GG=$GGDIR/$SHARD
 MTP=$GGDIR/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
 MMPROJ=$GGDIR/mmproj-BF16.gguf
 GGENV=(GGUF_FILE="$GG" GGUF_MTP_FILE="$MTP" GGUF_VISION_FILE="$MMPROJ")
-BIN=${BIN:-build/gdec}
+BIN=${BIN:-build/qwenox-engine}
 W=$(mktemp -d /tmp/launcher_verify.XXXXXX)
 fail=0
 note() { echo "== $*"; }
@@ -47,12 +47,12 @@ cmd_of() { sed -n 's/^CMD //p' "$W/$1.out"; }
 note "1. start_hgn.sh --check"
 if check hgn start_hgn.sh; then
   eval "C=($(cmd_of hgn))"
-  want=("$ROOT/build/gdec" ./models/qwen38-flash-next-w4b.hgn ./models/qwen38-flash-next-w4b.overlay.hgn
+  want=("$ROOT/build/qwenox-engine" ./models/qwen38-flash-next-w4b.hgn ./models/qwen38-flash-next-w4b.overlay.hgn
         ./models/qwen38-flash-next-mtp.hgn --serve --port 8730 --maxctx 262144
         --vision-tower ./models/qwen38-flash-next-vision.hgn)
   [[ "${C[*]}" == "${want[*]}" ]] && ok "CMD ${C[*]:1}" || bad "hgn CMD = ${C[*]}"
-  grep -q '^ENV GDEC_GGUF' "$W/hgn.out" && bad "hgn ENV 里有 GDEC_GGUF*" || ok "无 GDEC_GGUF*"
-  grep -qx 'ENV GDEC_KV_PAGED=1' "$W/hgn.out" && grep -qx 'ENV GDEC_PREFILL_CHUNK=16384' "$W/hgn.out" &&
+  grep -q '^ENV QWENOX_GGUF' "$W/hgn.out" && bad "hgn ENV 里有 QWENOX_GGUF*" || ok "无 QWENOX_GGUF*"
+  grep -qx 'ENV QWENOX_KV_PAGED=1' "$W/hgn.out" && grep -qx 'ENV QWENOX_PREFILL_CHUNK=16384' "$W/hgn.out" &&
     ok "生产 ENV（KV_PAGED、PREFILL_CHUNK …）" || bad "hgn 缺生产 ENV"
 else cat "$W/hgn.out"; bad "start_hgn.sh --check 失败"; fi
 
@@ -60,15 +60,15 @@ else cat "$W/hgn.out"; bad "start_hgn.sh --check 失败"; fi
 note "2. start_gguf.sh --check（GGDIR=$GGDIR）"
 if check gguf start_gguf.sh "${GGENV[@]}"; then
   eval "C=($(cmd_of gguf))"
-  want=("$ROOT/build/gdec" "$GG" --serve --port 8730 --maxctx 262144 --vision-tower "$MMPROJ")
+  want=("$ROOT/build/qwenox-engine" "$GG" --serve --port 8730 --maxctx 262144 --vision-tower "$MMPROJ")
   [[ "${C[*]}" == "${want[*]}" ]] && ok "CMD ${C[*]:1}" || bad "gguf CMD = ${C[*]}"
   d=$(diff <(grep '^ENV' "$W/hgn.out") <(grep '^ENV' "$W/gguf.out") | grep '^[<>]')
-  [[ "$d" == "> ENV GDEC_GGUF_MTP=$MTP" ]] && ok "ENV = hgn + GDEC_GGUF_MTP" || bad "ENV 差异：$d"
+  [[ "$d" == "> ENV QWENOX_GGUF_MTP=$MTP" ]] && ok "ENV = hgn + QWENOX_GGUF_MTP" || bad "ENV 差异：$d"
 else cat "$W/gguf.out"; bad "start_gguf.sh --check 失败"; fi
 if check gguf_nomtp start_gguf.sh GGUF_FILE="$GG" GGUF_MTP_FILE= GGUF_VISION_FILE=; then
   eval "C=($(cmd_of gguf_nomtp))"
-  grep -qx 'ENV GDEC_GGUF_MTP=' "$W/gguf_nomtp.out" && [[ "${C[*]}" != *--vision-tower* ]] &&
-    ok "MTP/视觉置空：GDEC_GGUF_MTP= 且无 --vision-tower" || bad "MTP/视觉置空时输出不对"
+  grep -qx 'ENV QWENOX_GGUF_MTP=' "$W/gguf_nomtp.out" && [[ "${C[*]}" != *--vision-tower* ]] &&
+    ok "MTP/视觉置空：QWENOX_GGUF_MTP= 且无 --vision-tower" || bad "MTP/视觉置空时输出不对"
 else cat "$W/gguf_nomtp.out"; bad "GGUF 无 MTP 无视觉 --check 失败"; fi
 
 # ---- 3. 缺文件 ---------------------------------------------------------------
@@ -89,19 +89,19 @@ check miss_shard start_gguf.sh MODEL_DIR="$W/part" TOKENIZER_DIR=./models/tokeni
   ok "少第 3 个分片：只报 分片 3/4" || { cat "$W/miss_shard.out"; bad "缺分片检测不对（rc=$rc）"; }
 
 # ---- 4. 格式互斥 / 残留变量 / start.sh --------------------------------------------
-note "4. 格式互斥、残留 GDEC_GGUF*、start.sh 提示"
+note "4. 格式互斥、残留 QWENOX_GGUF*、start.sh 提示"
 check x_hgn start_hgn.sh MODEL_FILE="$GG"; rc=$?
 [[ $rc == 1 ]] && grep -q 'start_gguf.sh' "$W/x_hgn.out" && ok "hgn 启动器拒绝 .gguf" || { cat "$W/x_hgn.out"; bad "hgn 启动器没拒绝 .gguf"; }
 check x_gguf start_gguf.sh GGUF_FILE=models/qwen38-flash-next-w4b.hgn; rc=$?
 [[ $rc == 1 ]] && grep -q 'start_hgn.sh' "$W/x_gguf.out" && ok "GGUF 启动器拒绝 .hgn" || { cat "$W/x_gguf.out"; bad "GGUF 启动器没拒绝 .hgn"; }
-check stale start_hgn.sh GDEC_GGUF="$GG" GDEC_GGUF_DENSE=1 GDEC_GGUF_PLE=1
-grep -q '^ENV GDEC_GGUF' "$W/stale.out" && bad "残留的 GDEC_GGUF* 进了 hgn 的 ENV" || ok "残留 GDEC_GGUF* 被清掉"
+check stale start_hgn.sh QWENOX_GGUF="$GG" QWENOX_GGUF_DENSE=1 QWENOX_GGUF_PLE=1
+grep -q '^ENV QWENOX_GGUF' "$W/stale.out" && bad "残留的 QWENOX_GGUF* 进了 hgn 的 ENV" || ok "残留 QWENOX_GGUF* 被清掉"
 bash start.sh --check >"$W/old.out" 2>&1; rc=$?
 [[ $rc == 1 ]] && grep -q start_hgn.sh "$W/old.out" && grep -q start_gguf.sh "$W/old.out" &&
   ok "start.sh 退出 1 并指向两个启动器" || { cat "$W/old.out"; bad "start.sh 提示不对"; }
 
 # ---- 5. 端到端 ---------------------------------------------------------------
-ENGINE_RE='(^|/)gdec[^/[:space:]]*([[:space:]]|$)'
+ENGINE_RE='(^|/)qwenox[^/[:space:]]*([[:space:]]|$)'
 evict() {  # 把另一种格式的权重逐出 page cache（不需要 root；只丢干净页），减少加载时的回收与碎片
   python3 - "$@" <<'PY'
 import os, sys
@@ -124,7 +124,7 @@ e2e() {  # 标签 启动器 [K=V ...]
   cp start_hgn.sh start_gguf.sh service.conf "$R/"
   ln -s "$ROOT/tools" "$ROOT/models" "$R/"
   for f in "$ROOT"/build/*; do ln -s "$f" "$R/build/"; done
-  rm -f "$R/build/gdec"; ln -s "$(realpath "$BIN")" "$R/build/gdec"
+  rm -f "$R/build/qwenox-engine"; ln -s "$(realpath "$BIN")" "$R/build/qwenox-engine"
   setsid env "$@" KVSNAP_MAX_GB=0 MAX_CONTEXT=32768 bash "$R/$launcher" >"$log" 2>&1 < /dev/null &
   pid=$!
   for ((t = 0; t < 420; t++)); do
@@ -156,7 +156,7 @@ e2e() {  # 标签 启动器 [K=V ...]
 }
 if [[ ${E2E:-1} == 1 ]]; then
   note "5. 端到端（BIN=$BIN，MAX_CONTEXT=32768，端口 8730/8731）"
-  if pgrep -af '(^|/)(gdec[^/[:space:]]*|flash_serve|serve_api\.py|llama-server|llama-perplexity|llama-cli)([[:space:]]|$)' >/dev/null; then
+  if pgrep -af '(^|/)(qwenox[^/[:space:]]*|flash_serve|serve_api\.py|llama-server|llama-perplexity|llama-cli)([[:space:]]|$)' >/dev/null; then
     bad "GPU 上已有引擎/llama.cpp 在跑，跳过端到端"
   else
     e2e hgn start_hgn.sh

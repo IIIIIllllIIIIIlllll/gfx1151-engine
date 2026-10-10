@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare per-position teacher-forced losses from two gdec --ppl runs."""
+"""Compare per-position teacher-forced losses from two qwenox --ppl runs."""
 
 import argparse
 import math

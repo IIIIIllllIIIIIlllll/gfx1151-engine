@@ -170,7 +170,7 @@ void read_records(const std::string& path, uint64_t index, uint64_t count,
 }  // namespace
 
 std::string stat_dir() {
-  if (const char* v = getenv("GDEC_REQSTAT_DIR")) return v;
+  if (const char* v = getenv("QWENOX_REQSTAT_DIR")) return v;
   return "data";
 }
 

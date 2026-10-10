@@ -11,7 +11,7 @@
 
 int main(int argc, char** argv) {
     std::string dir = argc > 1 ? argv[1] : "models/tokenizer";
-    gdec::Tokenizer tok;
+    qwenox::Tokenizer tok;
     std::string err;
     if (!tok.load(dir, &err)) {
         std::cerr << "load failed: " << err << "\n";

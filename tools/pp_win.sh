@@ -34,27 +34,27 @@ fi
 
 MAXCTX=$((LEN + 8192))
 
-# chunk 大小与下方 GDEC_PREFILL_CHUNK 保持一致；NCHUNK 是真实 chunk 数
+# chunk 大小与下方 QWENOX_PREFILL_CHUNK 保持一致；NCHUNK 是真实 chunk 数
 # （向上取整，tail slack 的余量并入上一个 chunk，不单独成行）。
 # 引擎默认先用全零 dummy 跑一轮预热（52_main.inc:460），打印一行 prefill。
-# 注意：GDEC_NOWARMUP / GDEC_PHASE 引擎判断的是变量“是否存在”，设 0 也生效，
+# 注意：QWENOX_NOWARMUP / QWENOX_PHASE 引擎判断的是变量“是否存在”，设 0 也生效，
 # 所以这里必须显式 unset，并从脚本自己的开关重新导出。
 CHUNK=${PREFILL_CHUNK:-8192}
 NCHUNK=$(( (LEN + CHUNK - 1) / CHUNK ))
 
-unset GDEC_NOWARMUP GDEC_PHASE
+unset QWENOX_NOWARMUP QWENOX_PHASE
 EXTRA_ENV=()
 if [[ "${PP_NOWARMUP:-}" == "1" ]]; then
-    EXTRA_ENV+=(GDEC_NOWARMUP=1); WARMUP="关（PP_NOWARMUP=1）"
+    EXTRA_ENV+=(QWENOX_NOWARMUP=1); WARMUP="关（PP_NOWARMUP=1）"
 else
     WARMUP="开（全零 dummy 一轮，不含真实 PLE 行）"
 fi
 if [[ "${PP_PHASE:-}" == "1" ]]; then
-    EXTRA_ENV+=(GDEC_PHASE=1); PHASE="开（同步 profiling，会打乱流水重叠，仅诊断用）"
+    EXTRA_ENV+=(QWENOX_PHASE=1); PHASE="开（同步 profiling，会打乱流水重叠，仅诊断用）"
 else
     PHASE="关"
 fi
-echo "预热: $WARMUP | GDEC_PHASE: $PHASE"
+echo "预热: $WARMUP | QWENOX_PHASE: $PHASE"
 
 LOG="$ROOT/logs/${LABEL}.log"
 # 默认 w4b + overlay；MODEL_FILE 覆盖底模（如 v2），此时用 NGRAM_FILE 作 overlay
@@ -65,13 +65,13 @@ elif [[ -n "${NGRAM_FILE:-}" ]]; then
     MODEL_ARGS+=("$NGRAM_FILE")
 fi
 env "${EXTRA_ENV[@]}" \
-    GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1 \
-    GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1 \
-    GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 \
-    GDEC_PREFILL_CHUNK=$CHUNK GDEC_GEMM_WMMA=1 GDEC_GDN_FUSED=1 \
-    GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1 \
-    GDEC_KVSNAP=1 GDEC_KVSNAP_MAX_GB=20 GDEC_PROF=1 \
-    build/gdec-win "${MODEL_ARGS[@]}" \
+    QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1 \
+    QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1 \
+    QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 \
+    QWENOX_PREFILL_CHUNK=$CHUNK QWENOX_GEMM_WMMA=1 QWENOX_GDN_FUSED=1 \
+    QWENOX_INDEX_FUSED2=1 QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1 \
+    QWENOX_KVSNAP=1 QWENOX_KVSNAP_MAX_GB=20 QWENOX_PROF=1 \
+    build/qwenox-engine-win "${MODEL_ARGS[@]}" \
     --tokens-file "$TOK" --gen 1 --maxctx "$MAXCTX" >"$LOG" 2>&1
 rc=$?
 echo "rc=$rc 日志: $LOG"

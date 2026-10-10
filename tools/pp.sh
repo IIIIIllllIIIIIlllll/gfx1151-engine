@@ -33,7 +33,7 @@ fi
 
 MAXCTX=$((LEN + 8192))
 
-# chunk 大小与下方 GDEC_PREFILL_CHUNK 保持一致；NCHUNK 是真实 chunk 数
+# chunk 大小与下方 QWENOX_PREFILL_CHUNK 保持一致；NCHUNK 是真实 chunk 数
 # （向上取整，tail slack 的余量并入上一个 chunk，不单独成行）。
 # warmup 的 dummy chunk 也会打印一行 prefill，最后只取末尾 NCHUNK 行，
 # 冷启动的那行就不会混进结果。
@@ -41,13 +41,13 @@ CHUNK=8192
 NCHUNK=$(( (LEN + CHUNK - 1) / CHUNK ))
 
 LOG="$ROOT/logs/${LABEL}.log"
-env GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1 \
-    GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1 \
-    GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 \
-    GDEC_PREFILL_CHUNK=$CHUNK GDEC_GEMM_WMMA=1 GDEC_GDN_FUSED=1 \
-    GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1 \
-    GDEC_KVSNAP=1 GDEC_KVSNAP_MAX_GB=20 GDEC_PROF=1 GDEC_PHASE=1 \
-    build/gdec models/qwen38-flash-next-w4b.hgn models/qwen38-flash-next-w4b.overlay.hgn \
+env QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1 \
+    QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1 \
+    QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 \
+    QWENOX_PREFILL_CHUNK=$CHUNK QWENOX_GEMM_WMMA=1 QWENOX_GDN_FUSED=1 \
+    QWENOX_INDEX_FUSED2=1 QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1 \
+    QWENOX_KVSNAP=1 QWENOX_KVSNAP_MAX_GB=20 QWENOX_PROF=1 QWENOX_PHASE=1 \
+    build/qwenox-engine models/qwen38-flash-next-w4b.hgn models/qwen38-flash-next-w4b.overlay.hgn \
     --tokens-file "$TOK" --gen 1 --maxctx "$MAXCTX" >"$LOG" 2>&1
 rc=$?
 echo "rc=$rc 日志: $LOG"

@@ -167,14 +167,14 @@
       <b>跟随客户端</b>：不干预。<b>默认值</b>：只在客户端没传该字段时使用。
       <b>强制</b>：不管客户端传什么都改成这个值（max_tokens 的"强制"是上限，超过才压到此值）。
       对 /v1/chat/completions、/v1/responses、/v1/completions 都生效，思考相关字段对 completions 不起作用。
-      被改写的字段会写进响应头 <span class="mono">X-Gdec-Overrides</span>。保存后立即生效，并持久化到服务端文件，重启后仍有效。
+      被改写的字段会写进响应头 <span class="mono">X-Qwenox-Overrides</span>。保存后立即生效，并持久化到服务端文件，重启后仍有效。
     </p>
     <table class="ovr">
       <thead><tr><th>参数</th><th>模式</th><th>值</th><th>说明</th></tr></thead>
       <tbody id="ovr-body"></tbody>
     </table>
     <div class="row">
-      <input id="ovr-key" type="password" placeholder="管理密钥 (GDEC_API_ADMIN_KEY)" style="display:none; width:240px">
+      <input id="ovr-key" type="password" placeholder="管理密钥 (QWENOX_API_ADMIN_KEY)" style="display:none; width:240px">
       <button id="ovr-save" class="btn primary" type="button">保存并生效</button>
       <button id="ovr-reload" class="btn" type="button">从服务端重新读取</button>
       <button id="ovr-clear" class="btn" type="button">全部改为跟随客户端</button>
@@ -537,7 +537,7 @@ async function sendChat() {
     const r = await fetch("/v1/chat/completions", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body), signal: chatAbort.signal });
-    const ov = r.headers.get("X-Gdec-Overrides");
+    const ov = r.headers.get("X-Qwenox-Overrides");
     note.textContent = ov ? ("服务端覆盖了：" + ov) : "";
     if (!r.ok) {
       let j = null; try { j = await r.json(); } catch (e) { /* 忽略 */ }

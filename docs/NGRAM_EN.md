@@ -21,7 +21,7 @@ distribution.
 - The draft is split into chunks of at most ng_cs rows and verified chunk by chunk; each chunk is emitted as soon as it is accepted (smooth streaming). A rejection inside a chunk only restores + replays that chunk's prefix (bounded by ng_cs rows), replacing the 65-row atomic verify + whole-prefix replay proportional to accepted count.
 - When a chunk is fully accepted, check whether the continuation token equals the next draft token (splice check): if equal, chain into the next chunk; if not, treat it as a boundary rejection — the state is clean, no replay needed, and the round ends immediately.
 - ng_cs starts at 16, doubles on fully accepted rounds (cap 64), and halves on rejected rounds (floor 8); it persists across requests as a Model member.
-- env `GDEC_NGRAM_CHUNK`: unset = adaptive (default); `0` = old single-pass path (the original code is kept for comparison/rollback); `N` = fixed chunk size.
+- env `QWENOX_NGRAM_CHUNK`: unset = adaptive (default); `0` = old single-pass path (the original code is kept for comparison/rollback); `N` = fixed chunk size.
 - Implemented for both the greedy and sampling chains. `CHUNK=64` (a fixed single chunk) reproduces all legacy numbers, proving the round rewrite itself does not change semantics.
 
 **A/B (heretic model, greedy, same prompt, byte-identical output)**:
@@ -83,7 +83,7 @@ Whole-model tests have now been added for the default match=24/min=48/max=64, li
 
 With the default long drafts, highly repetitive text decodes at about 6.5× and repetitive code at about 3.4×. This includes amortization of weight reads and execution overhead by longer batches; it cannot be attributed to the GDN optimization alone, nor does it mean real code tasks generally reach this speed. The default configuration completed 39 requests in total; apart from the two comparison failures of the numbering case, all checks passed; the overall test exit status is still failure.
 
-Old-path comparison of the final source, likewise at min=48/max=64 (`GDEC_NGRAM_LEGACY_GDN=1 GDEC_NGRAM_LEGACY_FINAL=1`):
+Old-path comparison of the final source, likewise at min=48/max=64 (`QWENOX_NGRAM_LEGACY_GDN=1 QWENOX_NGRAM_LEGACY_FINAL=1`):
 
 | Case | Old GDN + old last-row head (two runs) | New path (two runs) | Average decode time reduction |
 |---|---:|---:|---:|
@@ -108,8 +108,8 @@ Token comparisons all passed in this comparison, and the serial reference decode
 
 When a request omits `drafter`, the engine-side environment variable decides; the API no longer fills it in:
 
-- `GDEC_DRAFTER=ngram` (or `ngram-mod`/`3`): greedy requests default to ngram; sampling requests automatically fall back to the existing default (ngram only drafts greedy).
-- `GDEC_DRAFTER=serial` (or `0`): default to serial.
+- `QWENOX_DRAFTER=ngram` (or `ngram-mod`/`3`): greedy requests default to ngram; sampling requests automatically fall back to the existing default (ngram only drafts greedy).
+- `QWENOX_DRAFTER=serial` (or `0`): default to serial.
 - Unset or `mtp`: existing behavior unchanged (MTP if MTP weights are present, otherwise serial).
 - An explicit client-provided `drafter` always takes precedence and is unaffected by this variable.
 - The 5th field of the engine INFO line reports the current default; the API `/health` `drafter_default` forwards it faithfully ("ngram-mod"/"mtp"/"serial").
@@ -122,8 +122,8 @@ Using relative paths:
 ```bash
 bash build.sh test
 bash build.sh engine
-PROBE_TAG=my-ngram-test PROBE_CONTEXT=40960 GDEC_PREFILL_CHUNK=8192 \
-  GDEC_NGRAM_MIN=4 GDEC_NGRAM_MAX=16 bash tools/run_ngram_probe.sh
+PROBE_TAG=my-ngram-test PROBE_CONTEXT=40960 QWENOX_PREFILL_CHUNK=8192 \
+  QWENOX_NGRAM_MIN=4 QWENOX_NGRAM_MAX=16 bash tools/run_ngram_probe.sh
 # After the engine log shows serve: listening, keep the API stopped, then run:
 python3 tools/ngram_regress.py --keep-going --output logs/my-ngram-test.json
 python3 tools/snapshot_regress.py

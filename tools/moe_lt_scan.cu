@@ -1,5 +1,5 @@
 // moe_lt_scan.cu — hipBLASLt heuristic-candidate sweep for the MoE expert
-// GEMM shapes, mirroring the engine's GDEC_MOE_LT path (src/gpu/gdec.cpp
+// GEMM shapes, mirroring the engine's QWENOX_MOE_LT path (src/gpu/qwenox.cpp
 // gemm_bf16, line ~9403):
 //   A bf16 [N][K] k-contiguous (op T) x B bf16 [M][K] k-contiguous (op N)
 //   -> C/D f32 [N][M] n-contiguous, HIPBLAS_COMPUTE_32F, 64 MB workspace cap.
@@ -31,7 +31,7 @@
     }                                                                     \
   } while (0)
 
-static const size_t WS_BYTES = (size_t)64 << 20;  // == gdec lt_ws_bytes
+static const size_t WS_BYTES = (size_t)64 << 20;  // == qwenox lt_ws_bytes
 
 int main(int argc, char** argv) {
   int maxcand = argc > 1 ? atoi(argv[1]) : 64;

@@ -11,3 +11,6 @@ data/ppbench/
 data/kld/
 data/*.bin
 .rocprofv3
+# 兜底词表：tokenizer.json 体量大（~20MB），与 models/ 一样本地放置不入库
+data/tokenizer/*
+!data/tokenizer/README.md

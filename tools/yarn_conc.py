@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Concurrency + KV pool sharing test against a PARALLEL=2 gdec-api.
+"""Concurrency + KV pool sharing test against a PARALLEL=2 qwenox-api.
 
 Phase 1: send prompts A,B sequentially -> record outputs.
 Phase 2: send A,B concurrently -> expect bit-identical outputs (round-robin
@@ -43,7 +43,7 @@ def build(tag, target_tokens):
 
 
 def chat(prompt, max_tokens=220):
-    body = {"model": "gdec", "messages": [{"role": "user", "content": prompt}],
+    body = {"model": "qwenox", "messages": [{"role": "user", "content": prompt}],
             "temperature": 0, "max_tokens": max_tokens, "stream": False}
     req = urllib.request.Request(BASE + "/v1/chat/completions",
                                  data=json.dumps(body).encode(),

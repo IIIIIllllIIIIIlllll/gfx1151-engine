@@ -1,6 +1,6 @@
 # 性能测试工具
 
-`gdec-bench` 是独立的命令行性能测试程序，不启动 HTTP 服务，也不接受
+`qwenox-bench` 是独立的命令行性能测试程序，不启动 HTTP 服务，也不接受
 命令行模型路径。模型和 tokenizer 路径统一从项目根目录的
 `service.conf` 读取，避免测试命令和正式配置不一致。
 
@@ -26,8 +26,8 @@ bash build_win.sh bench
 
 生成文件：
 
-- Linux：`build/gdec-bench`
-- Windows：`build/gdec-bench.exe`
+- Linux：`build/qwenox-bench`
+- Windows：`build/qwenox-bench.exe`
 
 ## 运行
 
@@ -35,10 +35,10 @@ bash build_win.sh bench
 
 ```bash
 # Linux
-build/gdec-bench run
+build/qwenox-bench run
 
 # Windows
-build/gdec-bench.exe run
+build/qwenox-bench.exe run
 ```
 
 测试程序自身的状态、错误和汇总输出全部使用英语；引擎初始化阶段可能
@@ -62,7 +62,7 @@ build/gdec-bench.exe run
 
 | 变量 | 默认值 | 说明 |
 |---|---:|---|
-| `GDEC_BENCH_FORMAT` | 自动 | 强制选择 `hgn` 或 `gguf` |
+| `QWENOX_BENCH_FORMAT` | 自动 | 强制选择 `hgn` 或 `gguf` |
 | `BENCH_PREFILL_REPEATS` | `2` | 每个 prefill prompt 的采样次数 |
 | `BENCH_DECODE_REPEATS` | `2` | 每个解码场景的采样次数 |
 | `BENCH_DECODE_TOKENS` | `128` | 每次解码生成的 token 数 |
@@ -72,5 +72,5 @@ build/gdec-bench.exe run
 `BENCH_PREFILL_CHUNK`。例如：
 
 ```bash
-PREFILL_CHUNK=4096 build/gdec-bench run
+PREFILL_CHUNK=4096 build/qwenox-bench run
 ```

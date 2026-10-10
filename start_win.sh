@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Windows (TheRock) 启动入口：与 Linux start.sh 并列。
 # 起引擎（行协议 ENGINE_PORT，默认 8730）+ OpenAI HTTP API 前端
-# （gdec-api-win，API_PORT，默认 8731）；Ctrl+C 同时停两者。
+# （qwenox-win，API_PORT，默认 8731）；Ctrl+C 同时停两者。
 #
 # 用法:
 #   bash start_win.sh            # 前台运行，Ctrl+C 停止
@@ -95,8 +95,8 @@ awk "BEGIN { exit !($ROPE_FACTOR <= 1 || $MAX_CONTEXT <= $ROPE_FACTOR * $ROPE_OR
 awk "BEGIN { exit !($ROPE_FACTOR > 1 || $MAX_CONTEXT <= $ROPE_ORIGINAL_CTX) }" || \
   echo "警告：ROPE_FACTOR=1 且 MAX_CONTEXT=$MAX_CONTEXT 超过原生 $ROPE_ORIGINAL_CTX，超出部分的位置编码未验证（需要时请设 ROPE_FACTOR）" >&2
 (( PARALLEL == 1 || KV_PAGED )) || fail 'PARALLEL>1 需要 KV_PAGED=1'
-[[ -f build/gdec-win.exe ]] || fail '缺少 build/gdec-win.exe，请先运行 bash build_win.sh'
-[[ -f build/gdec-api-win.exe ]] || fail '缺少 build/gdec-api-win.exe，请先运行 bash build_win.sh api'
+[[ -f build/qwenox-engine-win.exe ]] || fail '缺少 build/qwenox-engine-win.exe，请先运行 bash build_win.sh'
+[[ -f build/qwenox-win.exe ]] || fail '缺少 build/qwenox-win.exe，请先运行 bash build_win.sh api'
 [[ -r "$MODEL_FILE" ]] || fail "找不到模型：$MODEL_FILE"
 [[ -r "$NGRAM_FILE" ]] || fail "找不到 n-gram 表：$NGRAM_FILE（w4b 与 MODEL_FILE 相同）"
 [[ -z "$MTP_FILE" || -r "$MTP_FILE" ]] || fail "找不到 MTP 权重：$MTP_FILE"
@@ -127,35 +127,35 @@ if [[ "${1:-}" == --check ]]; then
   exit 0
 fi
 
-# 生产选项与 Linux start.sh 一致，唯独不设 GDEC_PREFILL_CHUNK：
+# 生产选项与 Linux start.sh 一致，唯独不设 QWENOX_PREFILL_CHUNK：
 # Windows 默认 8192（256K 下 16384 会顶破 95 GiB arena 上限，实测见
-# PORTING-WINDOWS.md；maxctx ≤ 40K 时可手动 GDEC_PREFILL_CHUNK=16384 换 ~6% PP）。
-export GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1
-export GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1
-export GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 GDEC_NOWARMUP=1
-export GDEC_GEMM_WMMA=1 GDEC_GDN_FUSED=1
-export GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1
-if (( KVSNAP_MAX_GB )); then export GDEC_KVSNAP=1; else export GDEC_KVSNAP=0; fi
-export GDEC_KVSNAP_MAX_GB="$KVSNAP_MAX_GB" GDEC_RCKPT_MAX="$RCKPT_MAX"
+# PORTING-WINDOWS.md；maxctx ≤ 40K 时可手动 QWENOX_PREFILL_CHUNK=16384 换 ~6% PP）。
+export QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1
+export QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1
+export QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 QWENOX_NOWARMUP=1
+export QWENOX_GEMM_WMMA=1 QWENOX_GDN_FUSED=1
+export QWENOX_INDEX_FUSED2=1 QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1
+if (( KVSNAP_MAX_GB )); then export QWENOX_KVSNAP=1; else export QWENOX_KVSNAP=0; fi
+export QWENOX_KVSNAP_MAX_GB="$KVSNAP_MAX_GB" QWENOX_RCKPT_MAX="$RCKPT_MAX"
 # MTP_GAMMA=0：不导出（并清掉外部残留），引擎按请求模式自选（greedy 4 / 采样自适应）。
-if (( MTP_GAMMA > 0 )); then export GDEC_SPEC_GAMMA="$MTP_GAMMA"; else unset GDEC_SPEC_GAMMA; fi
-unset GDEC_KV_PAGED GDEC_KV_POOL_TOKENS
+if (( MTP_GAMMA > 0 )); then export QWENOX_SPEC_GAMMA="$MTP_GAMMA"; else unset QWENOX_SPEC_GAMMA; fi
+unset QWENOX_KV_PAGED QWENOX_KV_POOL_TOKENS
 if (( KV_PAGED )); then
-  export GDEC_KV_PAGED=1
-  if (( KV_POOL_TOKENS )); then export GDEC_KV_POOL_TOKENS="$KV_POOL_TOKENS"; fi
+  export QWENOX_KV_PAGED=1
+  if (( KV_POOL_TOKENS )); then export QWENOX_KV_POOL_TOKENS="$KV_POOL_TOKENS"; fi
 fi
-export GDEC_PARALLEL="$PARALLEL"
-export GDEC_API_MAX_IMAGES="$MAX_IMAGES"
-export GDEC_ROPE_FACTOR="$ROPE_FACTOR"
-export GDEC_ROPE_ORIGINAL_CTX="$ROPE_ORIGINAL_CTX"
-export GDEC_ROPE_BETA_FAST="$ROPE_BETA_FAST"
-export GDEC_ROPE_BETA_SLOW="$ROPE_BETA_SLOW"
-export GDEC_ROPE_ATTN_SCALE="$ROPE_ATTN_SCALE"
+export QWENOX_PARALLEL="$PARALLEL"
+export QWENOX_API_MAX_IMAGES="$MAX_IMAGES"
+export QWENOX_ROPE_FACTOR="$ROPE_FACTOR"
+export QWENOX_ROPE_ORIGINAL_CTX="$ROPE_ORIGINAL_CTX"
+export QWENOX_ROPE_BETA_FAST="$ROPE_BETA_FAST"
+export QWENOX_ROPE_BETA_SLOW="$ROPE_BETA_SLOW"
+export QWENOX_ROPE_ATTN_SCALE="$ROPE_ATTN_SCALE"
 
 mkdir -p logs
 ENGINE_LOG="logs/engine-win-$(date +%Y%m%d-%H%M%S).log"
 
-engine=(build/gdec-win.exe "$MODEL_FILE")
+engine=(build/qwenox-engine-win.exe "$MODEL_FILE")
 [[ -z "$OVERLAY_FILE" ]] || engine+=("$OVERLAY_FILE")
 [[ "$NGRAM_FILE" -ef "$MODEL_FILE" ]] || engine+=("$NGRAM_FILE")
 [[ -z "$MTP_FILE" ]] || engine+=("$MTP_FILE")
@@ -185,7 +185,7 @@ until grep -q 'serve: listening' "$ENGINE_LOG" 2>/dev/null; do
   sleep 2
 done
 
-build/gdec-api-win.exe --tokenizer "$TOKENIZER_DIR" \
+build/qwenox-win.exe --console --tokenizer "$TOKENIZER_DIR" \
   --engine "$engine_connect_host:$ENGINE_PORT" --host "$API_HOST" \
   --port "$API_PORT" --context "$MAX_CONTEXT" >"$API_LOG" 2>&1 &
 api_pid=$!

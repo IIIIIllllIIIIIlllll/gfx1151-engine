@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # gamma_sample_check.sh — 采样模式（API 默认 auto = 自适应 γ）vs 固定 γ=3，多样本汇总。最后一行 GAMMA SAMPLE CHECK: PASS/FAIL。
 #   bash tools/gamma_sample_check.sh                      # 约 13 分钟（18 个上下文×seed × 2 个配置）
-#   CFGS="3 0 4 0:GDEC_SPEC_ADAPT_R=0.25,GDEC_SPEC_ADAPT_MIN=2" SEEDS="1 2" MIN_RATIO=0.98 bash tools/gamma_sample_check.sh
+#   CFGS="3 0 4 0:QWENOX_SPEC_ADAPT_R=0.25,QWENOX_SPEC_ADAPT_MIN=2" SEEDS="1 2" MIN_RATIO=0.98 bash tools/gamma_sample_check.sh
 # 09-29 两状态 GammaCtl：真实长文 0 ÷ γ3 = 1.004（γ4 0.953），x 1.040（γ4 1.032）→ PASS。
 # 采样没法像 gamma_force_check 那样固定轨迹（接受是随机拒绝采样），换 γ 就换了随机轨迹，单样本 ±15–27%，
 # 所以按 总 token / 总秒 汇总：真实长文 = data/qsa-oracle/131072.tokens 的 OFFS 起点 × SEEDS；
@@ -11,7 +11,7 @@
 # 日志：logs/gsc/*.log，汇总 logs/gamma_sample_check.out
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
-BIN="${BIN:-build/gdec}"
+BIN="${BIN:-build/qwenox-engine}"
 SRC="${SRC:-data/qsa-oracle/131072.tokens}"
 CTX="${CTX:-8192}"
 NS="${SPEC:-512}"
@@ -79,7 +79,7 @@ for c in $CTXS; do
       G=${cfg%%:*}; KV=(); [[ $cfg == *:* ]] && IFS=, read -ra KV <<<"${cfg#*:}"
       tag=$(echo "$cfg" | tr ':=,.' '____'); L="gsc/${c}_s${s}_$tag"
       printf '  .. %-6s s%-2s %-28s（%s）' "$c" "$s" "$cfg" "$(date +%T)"
-      SPEC=$NS GAMMA=$G BIN=$BIN bash tools/pp_prod.sh "$T" "$L" "GDEC_SPEC_SAMPLE=$SMP,$s" "${KV[@]}" > "logs/$L.stdout" 2>&1 \
+      SPEC=$NS GAMMA=$G BIN=$BIN bash tools/pp_prod.sh "$T" "$L" "QWENOX_SPEC_SAMPLE=$SMP,$s" "${KV[@]}" > "logs/$L.stdout" 2>&1 \
         || die " 运行失败，见 logs/$L.stdout"
       svm_check
       grep -aq 'dense: 8-bit' "logs/$L.log" || die " 日志没有 'dense: 8-bit'，不是 HQ 权重"
@@ -97,7 +97,7 @@ minr = float(sys.argv[1]); ctxs = sys.argv[2].split(); seeds = sys.argv[3].split
 spec_re = re.compile(r'^spec-sample: (\d+) tokens in ([\d.]+) s = ([\d.]+) tok/s \| rounds=(\d+) commit/round=([\d.]+)')
 ad_re = re.compile(r'gamma-adapt: rounds per γ ([\d: ]+)\|')
 tag = lambda c: c.translate(str.maketrans(':=,.', '____'))
-show = lambda c: c.replace('GDEC_SPEC_ADAPT_', '').replace('GDEC_SPEC_', '')
+show = lambda c: c.replace('QWENOX_SPEC_ADAPT_', '').replace('QWENOX_SPEC_', '')
 R = {}
 for c in ctxs:
     for s in seeds:

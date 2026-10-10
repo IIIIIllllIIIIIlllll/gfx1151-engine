@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarise llama-perplexity / gdec --kld-base logs as one comparison table.
+"""Summarise llama-perplexity / qwenox --kld-base logs as one comparison table.
 
   python3 tools/kld_table.py NAME=logs/kld_x.log [NAME=logs/kld_y.log ...] [--unsloth]
 

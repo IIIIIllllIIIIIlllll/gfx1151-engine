@@ -24,7 +24,7 @@ struct Frame {
 bool decode_image_url(const std::string& value, std::vector<uint8_t>* bytes,
                       std::string* error);
 
-// Per-request image cap: GDEC_API_MAX_IMAGES (service.conf MAX_IMAGES),
+// Per-request image cap: QWENOX_API_MAX_IMAGES (service.conf MAX_IMAGES),
 // default 8, ceiling 256 (= engine GEN-protocol frame ceiling).
 int max_images();
 
@@ -39,7 +39,7 @@ bool prepare_messages(const json& messages, std::vector<Frame>* frames,
 // `starts` (optional) receives each id's byte offset in `prompt` (the copies
 // of an expanded pad share the pad's offset). Only frames[i].pad_tokens() is
 // read, so the frames may carry grids without patches.
-bool encode_prompt(const std::string& prompt, const gdec::Tokenizer& tokenizer,
+bool encode_prompt(const std::string& prompt, const qwenox::Tokenizer& tokenizer,
                    const std::vector<Frame>& frames, std::vector<int>* ids,
                    std::string* error, std::vector<size_t>* starts = nullptr);
 

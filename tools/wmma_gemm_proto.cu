@@ -1,11 +1,11 @@
 // wmma_gemm_proto.cu — self-written bf16 WMMA dense GEMM prototype for gfx1151.
-// Contract (mirrors Model::gemm, src/gpu/gdec.cpp:8907):
+// Contract (mirrors Model::gemm, src/gpu/qwenox.cpp:8907):
 //   Y[P,N] f32 = X[P,K]bf16 * W[N,K]bf16^T,  all row-major, fp32 accum.
 //   (rocBLAS col-major view: m=N, n=P, k=K, A=W transa=T lda=K, B=X ldb=K,
 //    C=Y ldc=N.)
 // Baseline: rocBLAS gemm_ex solution_index 1178 (fastest in-library).
 // Build: hipcc -O2 -o /tmp/wmma_gemm_proto tools/wmma_gemm_proto.cu -lrocblas
-// WMMA fragment layouts measured on this GPU (see gdec.cpp:3416):
+// WMMA fragment layouts measured on this GPU (see qwenox.cpp:3416):
 //   A(r,k): r<8 -> lane 2r elem k; r>=8 -> lane 17+2(r-8) elem k (rest ignored)
 //   B(k,c): lane c elem k AND lane 16+c elem k (duplicate)
 //   C(r,c): lane c + 16*(r>=8), elem r%8

@@ -43,7 +43,7 @@ done
 
 # 合并：每份 bench_full.md 的 hgn 列并排
 {
-  echo "# hgn v2 vs w4b 性能（$(date '+%Y-%m-%d %H:%M')，BIN=${BIN:-build/gdec}，无视觉塔，SKIP=$SKIP）"
+  echo "# hgn v2 vs w4b 性能（$(date '+%Y-%m-%d %H:%M')，BIN=${BIN:-build/qwenox-engine}，无视觉塔，SKIP=$SKIP）"
   echo
   printf '| 项目 |'; for v in $VARIANTS; do printf ' %s |' "$v"; done; echo
   printf '|---|'; for v in $VARIANTS; do printf -- '---|'; done; echo

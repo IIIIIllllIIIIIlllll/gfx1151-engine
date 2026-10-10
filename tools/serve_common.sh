@@ -2,7 +2,7 @@
 # 启动器依次：
 #   serve_init "$@"       参数、service.conf、随包运行库、数值与编译产物检查
 #   need 说明 路径 [提示]  登记本格式需要的权重文件，缺失的在 serve_run 里一次性列出
-#   设 FORMAT / MAIN_MODEL / MODEL_ARGS / VISION / MISSING_HINT，需要时 export GDEC_GGUF_*
+#   设 FORMAT / MAIN_MODEL / MODEL_ARGS / VISION / MISSING_HINT，需要时 export QWENOX_GGUF_*
 #   serve_run             tokenizer、端口、进程、内存检查，生产环境变量，--check 或启动
 # 调用前需已设置 ROOT（项目根目录，已 cd 进去）和 LAUNCHER（启动器文件名）。
 
@@ -88,9 +88,9 @@ serve_init() {
   (( MTP_GAMMA <= 8 )) || fail 'MTP_GAMMA 范围为 0–8（0=引擎按模式自选 greedy 4 / 采样自适应）'
   for cmd in flock ss systemctl stat awk pgrep setsid; do command -v "$cmd" >/dev/null || fail "缺少命令：$cmd"; done
   systemctl --user show-environment >/dev/null || fail 'systemd 用户会话不可用，请通过普通用户 SSH 登录运行'
-  [[ -x build/gdec && -x build/gdec-api ]] || fail '缺少编译产物，请先运行 bash build.sh'
-  # 权重格式只由启动器决定：外部残留的 GDEC_GGUF* 一律清掉，GGUF 启动器再按 service.conf 导出。
-  unset GDEC_GGUF GDEC_GGUF_DENSE GDEC_GGUF_MTP GDEC_GGUF_MTP_EXPERTS GDEC_GGUF_PLE GDEC_GGUF_DENSE_FILTER
+  [[ -x build/qwenox-engine && -x build/qwenox-api ]] || fail '缺少编译产物，请先运行 bash build.sh'
+  # 权重格式只由启动器决定：外部残留的 QWENOX_GGUF* 一律清掉，GGUF 启动器再按 service.conf 导出。
+  unset QWENOX_GGUF QWENOX_GGUF_DENSE QWENOX_GGUF_MTP QWENOX_GGUF_MTP_EXPERTS QWENOX_GGUF_PLE QWENOX_GGUF_DENSE_FILTER
 }
 
 serve_run() {
@@ -108,62 +108,62 @@ serve_run() {
   for port in "$ENGINE_PORT" "$API_PORT"; do
     [[ -z "$(ss -H -ltn "sport = :$port")" ]] || fail "端口 $port 已被占用"
   done
-  if processes="$(pgrep -af '(^|/)(gdec[^/[:space:]]*|flash_serve|serve_api\.py)([[:space:]]|$)')"; then
+  if processes="$(pgrep -af '(^|/)(qwenox[^/[:space:]]*|flash_serve|serve_api\.py)([[:space:]]|$)')"; then
     fail "已有引擎或 API 进程，请先停止：$processes"
   fi
   available="$(awk '/MemAvailable:/{print int($2/1048576)}' /proc/meminfo)"
   (( available >= MIN_AVAILABLE_GB )) || fail "可用内存 ${available} GiB，要求至少 ${MIN_AVAILABLE_GB} GiB"
   # Existing production options; no closed-source modules or experimental paths.
   # （放在 --check 之前：--check 会打印这些变量，tools/a5_verify.sh 等据此复现生产环境）
-  export GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1
+  export QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1
   # 自写 WMMA dense GEMM（Phase 3g）：8K +2%、32K +3%，对拍 8049 token 仅尾部分歧 4 个。
-  export GDEC_GEMM_WMMA=1
-  #export GDEC_PROF=1        # 临时诊断：每个 prefill chunk 打印 ple_host/ple_wait 等耗时
+  export QWENOX_GEMM_WMMA=1
+  #export QWENOX_PROF=1        # 临时诊断：每个 prefill chunk 打印 ple_host/ple_wait 等耗时
   # GDN 融合持久化 kernel（Phase 3c）：intra+strip 全融合、ws 不落 DRAM，kernel 3.34×，
-  # 8K +5.7%、32K +4.4%，ids 对拍 8054 token 0 分歧。与 GDEC_GDN_PIPE2 互斥（fused 优先）。
-  export GDEC_GDN_FUSED=1
-  export GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1
-  export GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 GDEC_NOWARMUP=1
+  # 8K +5.7%、32K +4.4%，ids 对拍 8054 token 0 分歧。与 QWENOX_GDN_PIPE2 互斥（fused 优先）。
+  export QWENOX_GDN_FUSED=1
+  export QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1
+  export QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 QWENOX_NOWARMUP=1
   # 32768: 32K prompt 单 chunk 实测 +7.4%（1155 vs 1076 tok/s）；65536 超内存 PSI 上限。
   # 32768性能最佳但是吃的显存太多，8192吃的最少但是性能最差，16384折中一下，性能损失不大，吃的显存更少
   # service.conf 的 PREFILL_CHUNK>0 时优先（同名环境变量再优先于 conf），否则 16384。
   if (( PREFILL_CHUNK > 0 )); then
-    export GDEC_PREFILL_CHUNK="$PREFILL_CHUNK"
+    export QWENOX_PREFILL_CHUNK="$PREFILL_CHUNK"
   else
-    export GDEC_PREFILL_CHUNK=16384
+    export QWENOX_PREFILL_CHUNK=16384
   fi
-  # 并发（D1a）：引擎 serve 且 GDEC_PARALLEL>1 时用这个分段代替上面的 16384。prefill 只在
+  # 并发（D1a）：引擎 serve 且 QWENOX_PARALLEL>1 时用这个分段代替上面的 16384。prefill 只在
   # 层间让出 GPU，32K prompt 时别的会话最长卡顿 16384 约 0.8–1.4 s、8192 约 0.6 s，
   # 单独 PP 不变（09-29 d1a_verify）。由引擎判断并发，离线工具（pp_prod/kld 等复用这些 ENV）不受影响。
-  unset GDEC_CONC_PREFILL_CHUNK
-  if (( CONC_PREFILL_CHUNK > 0 )); then export GDEC_CONC_PREFILL_CHUNK="$CONC_PREFILL_CHUNK"; fi
-  export GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1
-  if (( KVSNAP_MAX_GB )); then export GDEC_KVSNAP=1; else export GDEC_KVSNAP=0; fi
-  # PLE io_uring 聚集由 service.conf 的 PLE_URING 控制；引擎只查 GDEC_PLE_URING
+  unset QWENOX_CONC_PREFILL_CHUNK
+  if (( CONC_PREFILL_CHUNK > 0 )); then export QWENOX_CONC_PREFILL_CHUNK="$CONC_PREFILL_CHUNK"; fi
+  export QWENOX_INDEX_FUSED2=1 QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1
+  if (( KVSNAP_MAX_GB )); then export QWENOX_KVSNAP=1; else export QWENOX_KVSNAP=0; fi
+  # PLE io_uring 聚集由 service.conf 的 PLE_URING 控制；引擎只查 QWENOX_PLE_URING
   # 的存在性（设 0 也会开），故 0 时必须不导出。
-  if (( PLE_URING )); then export GDEC_PLE_URING=1; fi
-  export GDEC_KVSNAP_MAX_GB="$KVSNAP_MAX_GB"
-  export GDEC_RCKPT_MAX="$RCKPT_MAX"
+  if (( PLE_URING )); then export QWENOX_PLE_URING=1; fi
+  export QWENOX_KVSNAP_MAX_GB="$KVSNAP_MAX_GB"
+  export QWENOX_RCKPT_MAX="$RCKPT_MAX"
   # 分页 KV（A5 起默认开启）。引擎按 atoi 解析，0 即关闭；这里仍然只在开启时导出，
   # 并清掉外部环境里可能残留的值，保证 service.conf 说了算。
-  unset GDEC_KV_PAGED GDEC_KV_POOL_TOKENS
+  unset QWENOX_KV_PAGED QWENOX_KV_POOL_TOKENS
   if (( KV_PAGED )); then
-    export GDEC_KV_PAGED=1
-    if (( KV_POOL_TOKENS )); then export GDEC_KV_POOL_TOKENS="$KV_POOL_TOKENS"; fi
+    export QWENOX_KV_PAGED=1
+    if (( KV_POOL_TOKENS )); then export QWENOX_KV_POOL_TOKENS="$KV_POOL_TOKENS"; fi
   fi
-  export GDEC_PARALLEL="$PARALLEL"
-  export GDEC_API_MAX_IMAGES="$MAX_IMAGES"
-  export GDEC_ROPE_FACTOR="$ROPE_FACTOR"
-  export GDEC_ROPE_ORIGINAL_CTX="$ROPE_ORIGINAL_CTX"
-  export GDEC_ROPE_BETA_FAST="$ROPE_BETA_FAST"
-  export GDEC_ROPE_BETA_SLOW="$ROPE_BETA_SLOW"
-  export GDEC_ROPE_ATTN_SCALE="$ROPE_ATTN_SCALE"
-  # --serve reads GDEC_SPEC_GAMMA; --gamma is for offline --spec-gen.
+  export QWENOX_PARALLEL="$PARALLEL"
+  export QWENOX_API_MAX_IMAGES="$MAX_IMAGES"
+  export QWENOX_ROPE_FACTOR="$ROPE_FACTOR"
+  export QWENOX_ROPE_ORIGINAL_CTX="$ROPE_ORIGINAL_CTX"
+  export QWENOX_ROPE_BETA_FAST="$ROPE_BETA_FAST"
+  export QWENOX_ROPE_BETA_SLOW="$ROPE_BETA_SLOW"
+  export QWENOX_ROPE_ATTN_SCALE="$ROPE_ATTN_SCALE"
+  # --serve reads QWENOX_SPEC_GAMMA; --gamma is for offline --spec-gen.
   # MTP_GAMMA=0：不导出，引擎按请求模式自选（greedy 4 / 采样自适应）。
-  if (( MTP_GAMMA > 0 )); then export GDEC_SPEC_GAMMA="$MTP_GAMMA"; fi
+  if (( MTP_GAMMA > 0 )); then export QWENOX_SPEC_GAMMA="$MTP_GAMMA"; fi
   local engine_connect_host="$ENGINE_HOST"
   if [[ "$engine_connect_host" == 0.0.0.0 ]]; then engine_connect_host=127.0.0.1; fi
-  local engine=("$ROOT/build/gdec" "${MODEL_ARGS[@]}" --serve --host "$ENGINE_HOST" --port "$ENGINE_PORT" --maxctx "$MAX_CONTEXT")
+  local engine=("$ROOT/build/qwenox-engine" "${MODEL_ARGS[@]}" --serve --host "$ENGINE_HOST" --port "$ENGINE_PORT" --maxctx "$MAX_CONTEXT")
   [[ -z "$VISION" ]] || engine+=(--vision-tower "$VISION")
 
   echo "项目：$ROOT"
@@ -176,12 +176,12 @@ serve_run() {
   fi
   if (( PARALLEL > 1 && CONC_PREFILL_CHUNK > 0 )); then
     local conc=$CONC_PREFILL_CHUNK
-    (( conc > GDEC_PREFILL_CHUNK )) && conc=$GDEC_PREFILL_CHUNK
-    echo "prefill 分段：${conc}（并发，取 CONC_PREFILL_CHUNK 与单路 ${GDEC_PREFILL_CHUNK} 的较小值）"
+    (( conc > QWENOX_PREFILL_CHUNK )) && conc=$QWENOX_PREFILL_CHUNK
+    echo "prefill 分段：${conc}（并发，取 CONC_PREFILL_CHUNK 与单路 ${QWENOX_PREFILL_CHUNK} 的较小值）"
   fi
   if (( CHECK )); then
     # 机器可读：引擎环境变量与命令行（tools/a5_verify.sh、pp_prod.sh 等解析这两段）
-    env | grep '^GDEC_' | sort | sed 's/^/ENV /'
+    env | grep '^QWENOX_' | sort | sed 's/^/ENV /'
     printf 'CMD'; printf ' %q' "${engine[@]}"; echo
     echo '检查通过；没有启动引擎或 API。'
     exit 0
@@ -219,7 +219,7 @@ serve_run() {
     sleep 1
   done
   kill -0 "$engine_pid" 2>/dev/null || fail '引擎已退出'
-  "$ROOT/build/gdec-api" --tokenizer "$TOKENIZER_DIR" \
+  "$ROOT/build/qwenox-api" --tokenizer "$TOKENIZER_DIR" \
     --engine "$engine_connect_host:$ENGINE_PORT" --host "$API_HOST" \
     --port "$API_PORT" --context "$MAX_CONTEXT" >"$API_LOG" 2>&1 9>&- 8>&- &
   api_pid=$!

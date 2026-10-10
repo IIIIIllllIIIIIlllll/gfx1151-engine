@@ -440,7 +440,7 @@ __global__ void k_gdn_chunk(const float* __restrict__ qkv, const float* __restri
 // (out still overwrites the v segment in place; v was fully consumed by
 // k_gdn_intra). All per-element accumulation orders (j/d/r ascending) and the
 // hoisted expf() values match k_gdn_chunk, so out and S are bit-identical to
-// the single-kernel path. GDEC_GDN_NOSPLIT=1 selects the old kernel instead.
+// the single-kernel path. QWENOX_GDN_NOSPLIT=1 selects the old kernel instead.
 // Workspace layout per (chunk c, head h), base = ws + (c*48+h)*GDN_SPLIT_WS_FLOATS:
 //   [0,64) gcum (inclusive; [63] = glast) | [64,4160) attn2 [64][64] |
 //   [4160,12352) value' [64][128] | [12352,20544) kcd [64][128]
@@ -449,12 +449,12 @@ __global__ void k_gdn_chunk(const float* __restrict__ qkv, const float* __restri
 #define GDN_WS_VP (GDN_WS_ATTN2 + 64 * 64)
 #define GDN_WS_KCD (GDN_WS_VP + 64 * 128)
 #define GDN_SPLIT_WS_FLOATS (GDN_WS_KCD + 64 * 128)
-// dev-only per-phase clock64 accounting (build with -DGDEC_PHASE_PROF;
-// zeroed per prefill_chunk call, dumped on GDEC_PHASE_PROF env). Slots:
+// dev-only per-phase clock64 accounting (build with -DQWENOX_PHASE_PROF;
+// zeroed per prefill_chunk call, dumped on QWENOX_PHASE_PROF env). Slots:
 // 0 staging+cumsum, 1 attn dots, 2 solve, 3 vp/kcd, 4 attn2+writeout,
 // 5 strip S staging, 6 strip v_new, 7 strip out, 8 strip S update,
 // 9 intra total, 10 strip total (per-block cycles, tid0 atomicAdd).
-#ifdef GDEC_PHASE_PROF
+#ifdef QWENOX_PHASE_PROF
 __device__ unsigned long long g_ph[16];
 // gfx1151 has no s_memrealtime; clock64 is per-CU. Compiler barriers pin the
 // reads in place, and the guard drops wrapped/preempted samples (2^64 junk
@@ -820,7 +820,7 @@ __global__ void k_gdn_intra(const float* __restrict__ qkv, const float* __restri
   PH_ACC(9, tk);
 }
 
-// GDEC_GDN_PIPE2: fp16-resident k_gdn_intra with WMMA matrix phases and a
+// QWENOX_GDN_PIPE2: fp16-resident k_gdn_intra with WMMA matrix phases and a
 // 64-chunk loop per block, grid (ceil(nchunks/64), 48). Same ws layout and
 // phase math as k_gdn_intra (ut5 solve verbatim), but k/v/q tiles live in
 // LDS as fp16 and the attn/vp/kcd/attn2 dots run on WMMA. fp16 input
@@ -1324,7 +1324,7 @@ __global__ void k_gdn_inter(const float* __restrict__ qkv, float* __restrict__ S
   }
 }
 
-// --- GDEC_GDN_FUSED: one block per head (grid 48, NT=1024), serial chunk
+// --- QWENOX_GDN_FUSED: one block per head (grid 48, NT=1024), serial chunk
 // loop; intra (fp16 tiles, WMMA attn, ut5 solve) + strip (v_new/out/S) fused
 // with NO workspace DRAM round trip. S is register-resident as two persistent
 // 16x16 WMMA C-fragments per warp (fp32 master); k.S/q.S run as WMMA against
@@ -1333,7 +1333,7 @@ __global__ void k_gdn_inter(const float* __restrict__ qkv, float* __restrict__ S
 // fragments (A = transposed k*decay staged per r-quarter, B = vnT). proto:
 // tools/gdn_fused_proto.cu (fro-rel out 0.040% / S 0.047% vs the fp32 split
 // kernels, deterministic, 3.3x proto wall @ P=8192). Nonzero initial S
-// supported; S written back at the end. GDEC_GDN_FUSED=1 selects it.
+// supported; S written back at the end. QWENOX_GDN_FUSED=1 selects it.
 __global__ void __launch_bounds__(1024, 1)
 k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
         const float* __restrict__ bb, float* __restrict__ Sg,
@@ -1752,7 +1752,7 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
 // (v_new/out: j ascending, 4-grouped (e0+e1)+(e2+e3); S update: r ascending,
 // single thread per element; eg/beta/egl from the same ws gcum values), so
 // out and S are bit-identical to k_gdn_inter and k_gdn_chunk. 3 barriers per
-// chunk. Selected by default; GDEC_GDN_NOSTRIP=1 restores k_gdn_inter.
+// chunk. Selected by default; QWENOX_GDN_NOSTRIP=1 restores k_gdn_inter.
 #define GDN_NT_STRIP 256
 
 __global__ void __launch_bounds__(GDN_NT_STRIP)

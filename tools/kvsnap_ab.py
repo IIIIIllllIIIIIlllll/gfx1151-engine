@@ -4,7 +4,7 @@ Usage (repo root, one engine on 127.0.0.1:8732, kvsnap ON, restart between steps
   python3 tools/kvsnap_ab.py save [--n 8192|32768]   # empty snapshot dir
   #   -> GEN P (16 tok): engine saves a snapshot of the end-of-turn state
   #   -> GEN Q = P+out+tail on the SAME engine (live continuation) = gold 'live'
-  # restart the engine (same GDEC_KVSNAP_DIR), optionally with GDEC_KV_PAGED=1/2
+  # restart the engine (same QWENOX_KVSNAP_DIR), optionally with QWENOX_KV_PAGED=1/2
   python3 tools/kvsnap_ab.py run --tag restore-off   # log: "kvsnap: restored"
   python3 tools/kvsnap_ab.py run --tag restore-p2
   python3 tools/kvsnap_ab.py compare                 # every tag vs 'live'

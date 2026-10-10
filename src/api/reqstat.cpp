@@ -110,12 +110,12 @@ class Recorder {
 
   void init() {
     ready_ = true;
-    const char* dis = getenv("GDEC_REQSTAT");
+    const char* dis = getenv("QWENOX_REQSTAT");
     if (dis && !strcmp(dis, "0")) return;
     std::string dir = "data";
-    if (const char* v = getenv("GDEC_REQSTAT_DIR")) dir = v;
+    if (const char* v = getenv("QWENOX_REQSTAT_DIR")) dir = v;
     double max_mb = 256.0;
-    if (const char* v = getenv("GDEC_REQSTAT_MAX_MB"))
+    if (const char* v = getenv("QWENOX_REQSTAT_MAX_MB"))
       if (double x = atof(v); x >= 0.01) max_mb = x;
     hdr_.rotate_bytes = (uint64_t)(max_mb * 1048576.0);
     std::error_code ec;

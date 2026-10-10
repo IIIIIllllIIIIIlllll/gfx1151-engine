@@ -142,13 +142,43 @@
       </div>
       <div class="head-tools ovr-actions">
         <input id="ovr-key" type="password" class="hidden"
-               placeholder="管理密钥 (GDEC_API_ADMIN_KEY)" data-i18n-placeholder="ovr.key_ph">
+               placeholder="管理密钥 (QWENOX_API_ADMIN_KEY)" data-i18n-placeholder="ovr.key_ph">
         <button class="btn primary" id="ovr-save" data-i18n="ovr.save">保存并生效</button>
         <button class="btn" id="ovr-reload" data-i18n="ovr.reload">从服务端重新读取</button>
         <button class="btn" id="ovr-clear" data-i18n="ovr.clear">全部改为跟随客户端</button>
         <span class="muted small" id="ovr-status"></span>
       </div>
       <p class="note form-err hidden" id="ovr-err"></p>
+    </div>
+  </section>
+  <!-- ======================= 引擎 / 设置 ======================= -->
+  <section class="page hidden" id="page-engine">
+    <header class="page-head">
+      <h1 data-i18n="nav.engine">引擎</h1>
+      <span class="muted" id="eng-stamp"></span>
+    </header>
+    <div class="card">
+      <h2 data-i18n="eng.status">引擎状态</h2>
+      <dl class="kv" id="eng-status"><div class="kv-row muted" data-i18n="common.loading">加载中…</div></dl>
+      <div class="head-tools eng-actions" id="eng-actions">
+        <button class="btn primary" id="eng-start" data-i18n="eng.start">启动引擎</button>
+        <button class="btn" id="eng-stop" data-i18n="eng.stop">停止引擎</button>
+      </div>
+      <p class="note muted hidden" id="eng-nocontrol" data-i18n="eng.nocontrol"></p>
+      <p class="note form-err hidden" id="eng-err"></p>
+    </div>
+    <div class="card">
+      <h2 data-i18n="cfg.title">服务配置（service.conf）</h2>
+      <p class="note muted cfg-hint" data-i18n="cfg.hint"></p>
+      <div id="cfg-form"></div>
+      <div class="head-tools cfg-actions">
+        <input id="cfg-key" type="password" class="hidden"
+               placeholder="管理密钥 (QWENOX_API_ADMIN_KEY)" data-i18n-placeholder="ovr.key_ph">
+        <button class="btn primary" id="cfg-save" data-i18n="cfg.save">保存配置</button>
+        <button class="btn" id="cfg-reload" data-i18n="cfg.reload">重新读取</button>
+        <span class="muted small" id="cfg-status"></span>
+      </div>
+      <p class="note form-err hidden" id="cfg-err"></p>
     </div>
   </section>
 </main>
@@ -168,7 +198,7 @@
     </div>
     <div class="deck-label">
       <span class="brand-name">Qwen-Flash-Server</span>
-      <span class="deck-sub" aria-hidden="true">gdec-api / gfx1151</span>
+      <span class="deck-sub" aria-hidden="true">qwenox-api / gfx1151</span>
     </div>
   </div>
 </aside>
@@ -180,12 +210,13 @@
     <button class="nav-btn" data-route="usage" data-i18n="nav.usage">用量</button>
     <button class="nav-btn" data-route="requests" data-i18n="nav.requests">请求</button>
     <button class="nav-btn" data-route="sample" data-i18n="nav.sample">采样</button>
+    <button class="nav-btn" data-route="engine" data-i18n="nav.engine">引擎</button>
   </nav>
   <div class="leds">
-    <span class="led"><i class="lamp lamp-pwr"></i>PWR</span>
-    <span class="led"><i class="lamp lamp-link"></i>LINK</span>
-    <span class="led"><span class="brand-dot" id="busy-dot" data-i18n-title="hint.busy" title="引擎忙闲"></span>ENG</span>
-    <span class="led"><i class="lamp lamp-warn"></i>WARN</span>
+    <span class="led"><i class="lamp lamp-pwr" data-i18n-title="led.pwr_tip" title="电源"></i>PWR</span>
+    <span class="led"><i class="lamp lamp-link" data-i18n-title="led.link_tip" title="与 API 的连接"></i>LINK</span>
+    <span class="led"><span class="brand-dot" id="busy-dot"></span>ENG</span>
+    <span class="led"><i class="lamp lamp-warn" data-i18n-title="led.warn_tip" title="告警"></i>WARN</span>
   </div>
   <div class="sidebar-foot">
     <button class="hw-switch" id="lang-btn">

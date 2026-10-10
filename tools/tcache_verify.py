@@ -4,7 +4,7 @@
 text   : a long sampled reply, then a follow-up that replays it (with
          reasoning_content, like a real client). Through the token-cache API
          (--on) the follow-up must reuse the whole first turn; the same
-         follow-up through a GDEC_API_TOKCACHE=0 API (--off) is reported for
+         follow-up through a QWENOX_API_TOKCACHE=0 API (--off) is reported for
          comparison only (a reply that happens to be canonical BPE reuses
          fully there too).
 vision : a text turn, then an image follow-up (the text prefix must be
@@ -18,7 +18,7 @@ toolcall: the model emits a <tool_call> with float arguments; the follow-up
          past the thinking, not fall back to the turn-1 prompt end.
 persist1/persist2: token-cache persistence across an API restart. persist1
          runs one turn and saves the transcript to --state; the .sh then
-         restarts the ON API (same GDEC_API_TOKCACHE_FILE) and persist2 sends
+         restarts the ON API (same QWENOX_API_TOKCACHE_FILE) and persist2 sends
          the follow-up: reuse must be exactly as without a restart.
 Prints PASS/FAIL per check; exit code 0 only if all pass.
 """
@@ -359,7 +359,7 @@ def run_persist_check(a):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--on", type=int, required=True, help="token-cache API port")
-    ap.add_argument("--off", type=int, required=True, help="GDEC_API_TOKCACHE=0 API port")
+    ap.add_argument("--off", type=int, required=True, help="QWENOX_API_TOKCACHE=0 API port")
     ap.add_argument("--max-tokens", type=int, default=6000)
     ap.add_argument("--state", default=None, help="persist scenario transcript file")
     ap.add_argument("--only",

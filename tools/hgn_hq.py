@@ -17,7 +17,7 @@ every tensor of the old overlay (plus optionally embed_tokens) as
 Tensors matching --q4-keep substrings are copied verbatim from the old
 overlay instead (mixed precision). The output replaces the old overlay:
 
-  gdec  w4b.hgn  <out>.hgn  [mtp.hgn]  ...
+  qwenox  w4b.hgn  <out>.hgn  [mtp.hgn]  ...
 
 Usage:
   PYTHONPATH=~/Workspace/pylib python3 tools/hgn_hq.py MODEL_DIR \

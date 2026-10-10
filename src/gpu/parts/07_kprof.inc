@@ -1,14 +1,14 @@
-// ---------------- GDEC_KPROF: prefill 分段 GPU 计时（默认关） ----------------
+// ---------------- QWENOX_KPROF: prefill 分段 GPU 计时（默认关） ----------------
 // 设计：HANDOFF-V2-PREFILL.md §0。KP("tag") 在 g_str 上 hipEventRecord，标记一个
 // 分段的开始；该分段持续到下一个 KP。KP_SUB("tag")/KP_SUB_END() 标记分段内部的
 // 子区间（ht_deq、gdn:*/qsa:* 细分），按 tag 单独累加（其时间也算在外层分段里）；
 // 子区间可嵌套（栈配对，外层含内层）。chunk 内不做任何同步；
 // kprof_flush 每 chunk 调用一次（argmax D2H 之后），同步最后一个 event，用相邻
 // event 的 hipEventElapsedTime 求差，按 tag 累加（48 层合计）后打一行到 stderr。
-// 关时（GDEC_KPROF 未设置）每个 KP 只剩一次全局 bool 检查，env 只读一次。
+// 关时（QWENOX_KPROF 未设置）每个 KP 只剩一次全局 bool 检查，env 只读一次。
 // g_kprof_mute 在 decode 图捕获期间置位：hipEventRecord 进捕获流会把 event 录进图里。
 static bool g_kprof_on = [] {
-  const char* e = getenv("GDEC_KPROF");
+  const char* e = getenv("QWENOX_KPROF");
   return e && !(e[0] == '0' && e[1] == 0);
 }();
 static bool g_kprof_mute = false;

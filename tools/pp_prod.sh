@@ -2,10 +2,10 @@
 # 生产环境变量下的离线 prefill 基准（env 取自 start_hgn.sh --check，含 KV_PAGED 等）。
 #     LAUNCHER=start_gguf.sh  改取 GGUF 启动器的权重与环境
 #   bash tools/pp_prod.sh <tokfile|32k|64k|...> [标签] [K=V ...]
-#     BIN=build/gdec.base     换二进制做 A/B（默认 build/gdec）
+#     BIN=build/qwenox.base     换二进制做 A/B（默认 build/qwenox-engine）
 #     KTRACE=1                包 rocprofv3 --kernel-trace --stats，打印 kernel 耗时前 25
 #     MAXCTX=N                默认 token 数 + 8192
-#     UNSET="GDEC_A GDEC_B"   从生产 env 中去掉这些变量（开关类变量只看存在性）
+#     UNSET="QWENOX_A QWENOX_B"   从生产 env 中去掉这些变量（开关类变量只看存在性）
 #     GEN=N                   生成 token 数（默认 1；日志末尾 ids: 行可做 A/B 比对）
 #     SPEC=N [GAMMA=3]        改用 MTP 投机生成 --spec-gen N（看 MTP 接受率；GAMMA=0 自适应 γ）
 #     OVERLAY=<file>|none     替换/去掉生产 overlay（第 2 个权重参数）
@@ -27,7 +27,7 @@ esac
 LABEL="${1:-pp_$(basename "$TOK" .txt)_$(date +%H%M%S)}"; [[ $# -ge 1 ]] && shift
 NTOK=$(wc -w <"$TOK")
 MAXCTX=${MAXCTX:-$(( (NTOK + 8192 + 255) / 256 * 256 ))}
-BIN=${BIN:-build/gdec}
+BIN=${BIN:-build/qwenox-engine}
 
 for f in start_hgn.sh start_gguf.sh tools/serve_common.sh service.conf; do grep -q $'\r' "$f" && sed -i 's/\r$//' "$f"; done
 LAUNCHER=${LAUNCHER:-start_hgn.sh}
@@ -48,9 +48,9 @@ fi
 # MTP=<file> 替换最后一个权重参数（8-bit MTP 草稿 overlay）
 [[ -n "${MTP:-}" && ${#WARGS[@]} -ge 3 ]] && WARGS[-1]=$MTP
 
-for e in $(compgen -e | grep '^GDEC_'); do unset "$e"; done
-for e in "${PENV[@]}" GDEC_PROF=1 GDEC_PHASE=1 "$@"; do export "$e"; done
-export GDEC_KVSNAP=0
+for e in $(compgen -e | grep '^QWENOX_'); do unset "$e"; done
+for e in "${PENV[@]}" QWENOX_PROF=1 QWENOX_PHASE=1 "$@"; do export "$e"; done
+export QWENOX_KVSNAP=0
 for e in ${UNSET:-}; do unset "$e"; done
 mkdir -p logs
 LOG="logs/$LABEL.log"

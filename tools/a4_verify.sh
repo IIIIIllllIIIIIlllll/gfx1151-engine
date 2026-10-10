@@ -2,7 +2,7 @@
 # 一键 A4 验证（SSD KV 缓存：按页内容寻址分块 + MTP 段 + 稀疏检查点 + 后台写），
 # 前台运行，最后一行 A4 VERIFY: PASS/FAIL。a4 部分约 15 分钟，加 a5 回归约 50 分钟。
 #   bash tools/a4_verify.sh
-#   NEW_BIN=build/gdec.conc bash tools/a4_verify.sh
+#   NEW_BIN=build/qwenox.conc bash tools/a4_verify.sh
 #   A4_STAGES="e1 e2 lru bad" bash tools/a4_verify.sh     # 只跑某几段（e2/lru/bad 依赖 e1）
 # 快照目录固定为 data/kvsnap-a4（每次从空目录开始，不碰生产的 data/kvsnap）。五段：
 #   e1   空目录 + 预埋一个旧格式 s_* 目录和 tmp_ 残留：启动时应被清掉；三组对话
@@ -22,7 +22,7 @@
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 source tools/probe_lib.sh
-NEW_BIN="${NEW_BIN:-build/gdec}"
+NEW_BIN="${NEW_BIN:-build/qwenox-engine}"
 A4_STAGES=" ${A4_STAGES:-e1 e2 lru bad a5} "
 want() { [[ "$A4_STAGES" == *" $1 "* ]]; }
 T0=$SECONDS
@@ -55,10 +55,10 @@ ab() { python3 tools/a4_ab.py "$@" --dir "$DIR"; }
 start() {
   local tag=$1; shift
   local e cmd=("${BASE[@]}") i
-  for e in $(compgen -e | grep '^GDEC_'); do unset "$e"; done
+  for e in $(compgen -e | grep '^QWENOX_'); do unset "$e"; done
   for e in "${PENV[@]}"; do export "$e"; done
-  unset GDEC_KVSNAP GDEC_KVSNAP_MAX_GB
-  export GDEC_KVSNAP_DIR="$DIR" GDEC_KVSNAP_MIN=1024 GDEC_PARALLEL=1
+  unset QWENOX_KVSNAP QWENOX_KVSNAP_MAX_GB
+  export QWENOX_KVSNAP_DIR="$DIR" QWENOX_KVSNAP_MIN=1024 QWENOX_PARALLEL=1
   for e in "$@"; do export "$e"; done
   cmd[0]="$NEW_BIN"
   for i in "${!cmd[@]}"; do [[ "${cmd[$i]}" == --port ]] && cmd[$((i + 1))]=8732; done
@@ -117,7 +117,7 @@ fi
 if want lru; then
   echo; echo "================ lru：容量上限 → 启动时 LRU 淘汰 ================"
   out="$(ab predict --keep 2)"; echo "$out"; cap="$(tail -n 1 <<<"$out")"
-  if [[ "$cap" =~ ^[0-9.]+$ ]] && start a4-lru GDEC_KVSNAP_MAX_GB="$cap"; then
+  if [[ "$cap" =~ ^[0-9.]+$ ]] && start a4-lru QWENOX_KVSNAP_MAX_GB="$cap"; then
     n="$(cnt 'kvsnap: evicted' "$PROBE_LOG")"
     note "lru 上限 $cap GiB：启动时淘汰旧检查点" "$( ((n >= 1)) && echo "PASS（$n 个）" || echo "FAIL（没有 evicted 日志）")"
     ab check-lru; note "lru 剩余文件 == 预测（最新 2 个检查点及其页）" "$(pf $?)"

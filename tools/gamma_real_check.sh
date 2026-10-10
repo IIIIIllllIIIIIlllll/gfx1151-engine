@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # gamma_real_check.sh — 真实文本上自适应 γ vs 固定 γ（多样本汇总），前台约 8 分钟，最后一行 GAMMA REAL CHECK: PASS/FAIL。
 #   bash tools/gamma_real_check.sh
-#   BIN=build/gdec CTX=8192 SPEC=512 OFFS="0 16384 ..." GAMMAS="4 5 0" MIN_RATIO=0.98 bash tools/gamma_real_check.sh
+#   BIN=build/qwenox-engine CTX=8192 SPEC=512 OFFS="0 16384 ..." GAMMAS="4 5 0" MIN_RATIO=0.98 bash tools/gamma_real_check.sh
 # 起因：d2_gate_check（09-29）单样本里 8K 真实文本自适应 40.5 vs γ4 45.4 tok/s（-11%）。换 γ 会改变 greedy 轨迹，
 # 单样本噪声 ±10–17%，所以这里取 data/qsa-oracle/131072.tokens 的 6 个不同起点、各 CTX 个 token 当上下文，
 # 每个 γ 各生成 SPEC 个 token，按 总 token / 总秒 汇总（与 138de39 gamma_adapt_verify 同口径）。
@@ -9,7 +9,7 @@
 # 日志：logs/grc/*.log，汇总 logs/gamma_real_check.out
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
-BIN="${BIN:-build/gdec}"
+BIN="${BIN:-build/qwenox-engine}"
 SRC="${SRC:-data/qsa-oracle/131072.tokens}"
 CTX="${CTX:-8192}"
 NS="${SPEC:-512}"

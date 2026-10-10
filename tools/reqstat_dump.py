@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# reqstat_dump.py — 读取 gdec-api 的请求统计文件（格式见 src/api/reqstat.h 头注释）。
+# reqstat_dump.py — 读取 qwenox-api 的请求统计文件（格式见 src/api/reqstat.h 头注释）。
 #
 # 用法:
 #   tools/reqstat_dump.py summary [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--dir data]
@@ -156,7 +156,7 @@ def summarize(recs, label):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="gdec reqstat 统计读取")
+    ap = argparse.ArgumentParser(description="qwenox reqstat 统计读取")
     ap.add_argument("cmd", choices=["summary", "tail", "files"])
     ap.add_argument("n", nargs="?", type=int, default=10)
     ap.add_argument("--dir", default="data")

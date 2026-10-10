@@ -1,4 +1,4 @@
-// ---------------- serve mode (gdec wire protocol) ----------------------------
+// ---------------- serve mode (qwenox wire protocol) ----------------------------
 // Batch-1: one connection, one in-flight request. Verbs:
 // PING / INFO / MEM / GEN / X / KVSYNC.
 // GEN accepts an optional SAMPLE suffix (temp>0, top_k/top_p/min_p/seed) with
@@ -17,7 +17,7 @@
 // state at its position and the partial last page. Restoring one continues
 // bit-exactly as if the prefix had been prefilled live.
 //
-// Layout under GDEC_KVSNAP_DIR (default data/kvsnap, relative to CWD):
+// Layout under QWENOX_KVSNAP_DIR (default data/kvsnap, relative to CWD):
 //   c_<key>.kvc   trunk page: ChHdr (key, parent, 256 tokens, checksum) +
 //                 per QSA layer K[256 rows] V[256 rows] ik[64 blocks]
 //   m_<key>.kvm   MTP section of a page (B0: the MTP layer is pool layer
@@ -33,7 +33,7 @@
 // captured (checkpoint image, D2H) on the GPU thread; at the end of the turn
 // commit() captures only the pages/MTP sections no cached file holds yet and
 // hands everything to one background writer (bounded queue,
-// GDEC_KVSNAP_QUEUE_MB, default 1024): tmp_<name> + fdatasync + rename, pages
+// QWENOX_KVSNAP_QUEUE_MB, default 1024): tmp_<name> + fdatasync + rename, pages
 // before the checkpoints naming them, so a crash never publishes a torn or
 // dangling file. KVSYNC waits for the writer (tests).
 // Restores: longest checkpoint whose tokens are a strict prefix of the
@@ -42,9 +42,9 @@
 // it too (speculation continues). A damaged file drops the checkpoints that
 // need it.
 // Eviction: LRU over checkpoints (file mtime, bumped by a restore), capped
-// by GDEC_KVSNAP_MAX_GB (default 20); pages are refcounted by checkpoints and
-// deleted with the last one. States shorter than GDEC_KVSNAP_MIN (default
-// 4096 tokens) are not saved. GDEC_KVSNAP=0 disables. Startup indexes the
+// by QWENOX_KVSNAP_MAX_GB (default 20); pages are refcounted by checkpoints and
+// deleted with the last one. States shorter than QWENOX_KVSNAP_MIN (default
+// 4096 tokens) are not saved. QWENOX_KVSNAP=0 disables. Startup indexes the
 // directory, removing temporaries, pre-A4 s_* snapshot directories, and
 // orphaned/damaged files. All errors are non-fatal: the cache is an
 // accelerator, never a correctness dependency.

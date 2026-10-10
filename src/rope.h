@@ -77,11 +77,11 @@ inline const char* rope_cli_key(const std::string& option) {
 
 inline bool rope_from_env(RopeConfig& rope, std::string& error) {
   const char* names[][2] = {
-      {"GDEC_ROPE_FACTOR", "factor"},
-      {"GDEC_ROPE_ORIGINAL_CTX", "original_ctx"},
-      {"GDEC_ROPE_BETA_FAST", "beta_fast"},
-      {"GDEC_ROPE_BETA_SLOW", "beta_slow"},
-      {"GDEC_ROPE_ATTN_SCALE", "attention_factor"}};
+      {"QWENOX_ROPE_FACTOR", "factor"},
+      {"QWENOX_ROPE_ORIGINAL_CTX", "original_ctx"},
+      {"QWENOX_ROPE_BETA_FAST", "beta_fast"},
+      {"QWENOX_ROPE_BETA_SLOW", "beta_slow"},
+      {"QWENOX_ROPE_ATTN_SCALE", "attention_factor"}};
   for (const auto& entry : names) {
     const char* text = std::getenv(entry[0]);
     if (text && !rope_set(rope, entry[1], text)) {

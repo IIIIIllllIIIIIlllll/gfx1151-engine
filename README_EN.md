@@ -208,12 +208,12 @@ Restart both engine and API after changing the file.
 | `KV_PAGED` | `1` | Paged shared pool; required for PARALLEL > 1 with a pagination-compatible kernel combination |
 | `KV_POOL_TOKENS` | `0` | Physical pool shared by all slots, in tokens; 0 follows MAX_CONTEXT, smaller values are clamped to MAX_CONTEXT, rounded up to 256-token pages |
 | `PARALLEL` | `4` | Concurrent slots, range 1–8; neither multiplies the pool nor divides the per-request limit |
-| `GDEC_KV_RESERVE_DECODE` | `4096` | Engine environment variable limiting decode tokens reserved at admission, not generated output; valid range 0–2147483647 |
+| `QWENOX_KV_RESERVE_DECODE` | `4096` | Engine environment variable limiting decode tokens reserved at admission, not generated output; valid range 0–2147483647 |
 
-Script launchers export `ROPE_*` as the corresponding `GDEC_ROPE_*` variables for
+Script launchers export `ROPE_*` as the corresponding `QWENOX_ROPE_*` variables for
 both engine and API. Direct engine invocation also supports `--rope-factor`,
 `--rope-original-ctx`, `--rope-beta-fast`, `--rope-beta-slow`, and `--rope-attn-scale`;
-the API uses `GDEC_ROPE_*` environment variables. Keep both sides consistent:
+the API uses `QWENOX_ROPE_*` environment variables. Keep both sides consistent:
 changing only the API's health metadata does not alter engine RoPE.
 
 ### Two different 512K configurations
@@ -270,7 +270,7 @@ Linux GGUF uses the same variables with `start_gguf.sh`. Hardware acceptance
 used Linux hgn + BF16 paged KV + WMMA + BTV; not every weight/kernel/platform
 combination has been verified. Both Windows launchers, `start_win.sh` and the
 native `start_win.exe`, read the `service.conf` `ROPE_*` settings, apply the
-same validation, and forward them as `GDEC_ROPE_*` to engine and API; however,
+same validation, and forward them as `QWENOX_ROPE_*` to engine and API; however,
 Windows 512K hardware acceptance remains pending, and the 512K pool must
 separately fit the Windows arena (95 GiB limit) and device memory.
 
@@ -314,7 +314,7 @@ Admission uses 256-token pages and conservative active-sequence accounting:
 
 ```text
 target_pages = ceil(min(MAX_CONTEXT,
-                        prompt_tokens + min(max_tokens, GDEC_KV_RESERVE_DECODE)) / 256)
+                        prompt_tokens + min(max_tokens, QWENOX_KV_RESERVE_DECODE)) / 256)
 other_active_slot_budget = max(target_pages, actual_mapped_pages)
 available_budget = pool_pages - sum(other_active_slot_budgets)
 request_need = target_pages; for live continuation, max(target_pages, mapped_pages)
@@ -331,7 +331,7 @@ request_need = target_pages; for live continuation, max(target_pages, mapped_pag
 - On exhaustion, evict RAM checkpoints, then idle-slot KV; if still necessary,
   abort a later-admitted active request. A request needing pages can itself fail
   when it is the later one. Aborted generation returns an API error.
-- `GDEC_KV_RESERVE_DECODE=4096` does not truncate output at 4096. Request budget
+- `QWENOX_KV_RESERVE_DECODE=4096` does not truncate output at 4096. Request budget
   and `MAX_CONTEXT` still limit generation. Smaller reservations can admit more
   requests but increase mid-generation starvation risk.
 - `PARALLEL=1` bypasses multi-slot admission, not context/pool limits or cache
@@ -347,7 +347,7 @@ Equal pool sizes do not imply identical total memory with different
 ### Startup checks, caching and validation scope
 
 - Use BF16 KV + WMMA + BTV for 512K; the Linux launchers already set this
-  combination. Above native 256K, the engine disables `GDEC_QSA_UNION`;
+  combination. Above native 256K, the engine disables `QWENOX_QSA_UNION`;
   do not force unverified kernel combinations.
 - Inspect `--check` for the per-sequence limit, shared pool and slot count.
   After startup, verify engine logs for `RoPE: YaRN factor=2`, `[kvpage]` page
@@ -380,42 +380,26 @@ OpenAI API + multimodal). Porting notes and measurements are in
 (or double-click `build_win.bat`; Git is only needed at build time):
 
 ```bash
-bash build_win.sh           # All required artifacts: engine, benchmark, API, launcher
-bash build_win.sh api       # OpenAI API frontend
-bash build_win.sh launcher  # Script-free launcher start_win.exe
+bash build_win.sh           # All required artifacts: engine, benchmark, API, root stub
+bash build_win.sh api       # OpenAI API frontend (a tray app on Windows)
+bash build_win.sh launcher  # Minimal root stub start_win.exe
 ```
 
 For daily use, double-click `start_win.exe` (native Win32, no
-Git/PowerShell needed): it brings up the engine + API dual processes,
-without a console window: it only puts a tray icon in the notification area
-(right-click: open dashboard / copy API URL / view logs / quit; double-click:
-open dashboard), and output goes to `logs\`. For troubleshooting,
-`start_win.exe --console` restores the console mode (Ctrl+C or closing the
-window stops it). On the first double-click a native setup panel appears with
-four pages: page 1 Weights — V1 (single-file w4b) / V2 (main + separate
-n-gram file) / GGUF selection, each version showing only its own file rows
-(browseable, optional files can be disabled); GGUF is save-only because the
-Windows launcher supports hgn only (use `start_gguf.sh` on Linux). Page 2
-holds context window / parallel slots / shared KV pool / prefill chunk, plus
-a YaRN checkbox — enable it when the per-request limit exceeds the native
-262144 and the rope factor is derived automatically (no ROPE_FACTOR field);
-page 3 holds listen hosts and ports
-(ENGINE_HOST, API_HOST and both ports, with IPv4 and occupancy validation);
-page 4 is the VRAM environment report — free VRAM, total weight size, KV
-pool / workspace / parallelism estimates with a verdict, plus a summary of
-failures from the other pages. Each page has its own check output area
-(weight existence and format sniffing, tokenizer, numeric validity including
-MAX_CONTEXT ≤ factor × original_ctx, port availability); starting is blocked
-while any page reports a failure. "Start
-service" writes the settings back to `service.conf` (bash-compatible
-syntax, backed up to `service.conf.bak` first) and continues booting; once
-the service is ready a `# start_win: configured` marker is written so the
-panel no longer shows on double-click. To change settings later, use the
-tray right-click "Settings…" item or `start_win.exe --setup` (settings
-saved while running take effect on the next start). Configuration is
-**shared with Linux via `service.conf`** (edit it to change the model file
-name or context window); environment variables can temporarily override
-it. Clients connect to `http://<host>:8731/v1`.
+Git/PowerShell needed): it launches `build\qwenox-win.exe` with the repo
+root as working directory — on Windows the API component itself is the tray
+app, with no console window: it only puts a tray icon in the notification
+area (right-click: open console / start·stop engine / copy API URL / view
+logs / quit; double-click: open the web console). The engine does **not**
+start automatically: edit settings on the console's `#/engine` page (written
+back to `service.conf`, shared with Linux) and start/stop the engine there,
+or use the tray right-click menu. The API's own output goes to
+`logs\api-win-*.log`, engine output to `logs\engine-api-*.log`; for
+troubleshooting, `build\qwenox-win.exe --console` restores console mode.
+The tokenizer loads from `TOKENIZER_DIR` (default `models/tokenizer`) and
+falls back to the repo-bundled `data/tokenizer` (see its README). The old
+setup-panel launcher is archived in `attic/launcher/` and no longer
+maintained. Clients connect to `http://<host>:8731/v1`.
 
 Distribution: copy `build/` + `start_win.exe` + `models/` to any gfx1151
 Windows machine and it just works — **no ROCm/TheRock installation
@@ -435,7 +419,7 @@ Differences from the Linux version:
 - Prefill chunk defaults to 8192
 - Cold loading reads the full weights from disk (minute-scale, progress
   shown in console/logs)
-- The launchers do not enable `GDEC_GEMM_WMMA` or `GDEC_GDN_FUSED` (the
+- The launchers do not enable `QWENOX_GEMM_WMMA` or `QWENOX_GDN_FUSED` (the
   self-written WMMA GEMM and fused GDN kernel already promoted on Linux
   launchers, worth ~8-10% PP combined but unverified under TheRock — so
   Windows prefill uses hipBLASLt plus the legacy GDN path)

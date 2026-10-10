@@ -1888,7 +1888,7 @@ __global__ void k_store_kv(const float* __restrict__ kb, const float* __restrict
 }
 
 // BF16 variant of the above: same layout, values rounded RNE via f2bf.
-// vct (optional, GDEC_QSA_WMMA_BTV): also write V into the block-transposed
+// vct (optional, QWENOX_QSA_WMMA_BTV): also write V into the block-transposed
 // prefill cache [block][kvh][dim][slot] (layout of k_f32_to_bf16_v4_bt, with
 // i = kvh*256 + dim), so later sparse prefill / verify reads of decoded
 // positions see the same bits as the row-major cache.

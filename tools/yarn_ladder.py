@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""YaRN 512K ladder + needle test against a running gdec-api.
+"""YaRN 512K ladder + needle test against a running qwenox-api.
 
 Rungs of increasing prompt length; needle codewords at several depths on the
 long rungs. Every rung uses unique filler (rung id in each paragraph) so no
@@ -52,7 +52,7 @@ def build_prompt(rung, target_tokens, depths, tag):
 
 def chat(base, prompt, max_tokens):
     body = {
-        "model": "gdec",
+        "model": "qwenox",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
         "max_tokens": max_tokens,

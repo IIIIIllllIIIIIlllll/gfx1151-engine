@@ -8,7 +8,7 @@ import urllib.request
 base = "http://127.0.0.1:8731"
 for name in sys.argv[1:]:
     text = open(f"/tmp/yarn_prompts/prompt_{name}.txt").read()
-    body = {"model": "gdec",
+    body = {"model": "qwenox",
             "messages": [{"role": "user", "content": text}],
             "temperature": 0, "max_tokens": 8}
     req = urllib.request.Request(base + "/v1/chat/completions",

@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace gdec_uni {
+namespace qwenox_uni {
 
 static const uint32_t kCatL[][2] = {
     {0x41u, 0x5Au},
@@ -4806,4 +4806,4 @@ static const CompEntry kComp[] = {
 };
 static const size_t kCompCount = 941;
 
-}  // namespace gdec_uni
+}  // namespace qwenox_uni

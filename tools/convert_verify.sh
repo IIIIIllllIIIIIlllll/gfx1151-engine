@@ -7,7 +7,7 @@
 #     OUT=~/Models/hq/conv                 输出目录        NAME=qwen38-flash-next-hq
 #     JOBS=28                              专家量化进程数
 #     KMAX=0.060（有 imatrix）/ 0.066（无） KLD 上限
-#     BIN=build/gdec                       引擎二进制
+#     BIN=build/qwenox-engine                       引擎二进制
 #     REF_OVERLAY=~/Models/hq/qwen38-flash-next-w4b.overlay-q8.hgn  tools/hgn_hq.py 的输出（缺则跳过对照）
 #     REF_CONV=<旧 flashnext2hgn.py>       --classic 对照；默认取 git e2f4d9f 版本，不是 git 仓库则跳过
 #     SKIP_CONVERT=1                       OUT 里已有完整转换，跳过第 3 步的转换本身
@@ -27,7 +27,7 @@ OUT=${OUT:-$HOME/Models/hq/conv}
 NAME=${NAME:-qwen38-flash-next-hq}
 JOBS=${JOBS:-28}
 [[ $IMATRIX == none ]] && KMAX=${KMAX:-0.066} || KMAX=${KMAX:-0.060}
-BIN=${BIN:-build/gdec}
+BIN=${BIN:-build/qwenox-engine}
 REF_OVERLAY=${REF_OVERLAY:-$HOME/Models/hq/qwen38-flash-next-w4b.overlay-q8.hgn}
 KREF=data/kld/bf16_c512.kld
 export PYTHONPATH=${PYTHONPATH:-$HOME/Workspace/pylib}
@@ -45,7 +45,7 @@ if [[ $IMATRIX != none ]]; then
   [[ -f $IMATRIX ]] || { echo "缺少 imatrix $IMATRIX（没有就 IMATRIX=none）"; echo FAIL; exit 1; }
   IMARG=(--imatrix "$IMATRIX")
 fi
-if pgrep -af '(^|/)(gdec[^/[:space:]]*|flash_serve|serve_api\.py|llama-server|llama-perplexity|llama-cli)([[:space:]]|$)' >/dev/null; then
+if pgrep -af '(^|/)(qwenox[^/[:space:]]*|flash_serve|serve_api\.py|llama-server|llama-perplexity|llama-cli)([[:space:]]|$)' >/dev/null; then
   echo "GPU 上已有引擎/llama.cpp 在跑，请先停掉"; echo FAIL; exit 1
 fi
 svm0=$(journalctl -k -b 2>/dev/null | grep -c svm_range_cpu_invalidate_pagetables)

@@ -34,7 +34,7 @@ namespace {
 constexpr size_t kMaxEncodedBytes = 64u << 20;
 constexpr uint64_t kMaxDecodedPixels = 100000000u;
 constexpr int kDefaultMaxImages = 8;
-// Ceiling for GDEC_API_MAX_IMAGES: the launchers' MAX_IMAGES range (1–256)
+// Ceiling for QWENOX_API_MAX_IMAGES: the launchers' MAX_IMAGES range (1–256)
 // and the engine's GEN-protocol frame ceiling (kVimgMax in
 // src/gpu/parts/51_host_cfg.inc). Keep all three equal: if the API allowed
 // more than the engine accepts, a configured value would turn into requests
@@ -482,24 +482,24 @@ bool image_url_from_item(const json& item, std::string* url, bool* image,
 
 }  // namespace
 
-// GDEC_API_MAX_IMAGES (= service.conf MAX_IMAGES) sets the per-request image
+// QWENOX_API_MAX_IMAGES (= service.conf MAX_IMAGES) sets the per-request image
 // cap (default 8). The launchers reject values outside 1–256; a hand-set value
 // above 256 clamps to it with a warning.
 int max_images() {
     static const int limit = [] {
-        const char* e = std::getenv("GDEC_API_MAX_IMAGES");
+        const char* e = std::getenv("QWENOX_API_MAX_IMAGES");
         if (e != nullptr && *e != '\0') {
             char* end = nullptr;
             const long v = std::strtol(e, &end, 10);
             if (end != e && *end == '\0' && v >= 1) {
                 if (v <= kMaxImagesCap) return static_cast<int>(v);
                 fprintf(stderr,
-                        "vision: GDEC_API_MAX_IMAGES=%ld clamped to %d "
+                        "vision: QWENOX_API_MAX_IMAGES=%ld clamped to %d "
                         "(engine GEN-protocol ceiling)\n",
                         v, kMaxImagesCap);
                 return kMaxImagesCap;
             }
-            fprintf(stderr, "vision: ignoring bad GDEC_API_MAX_IMAGES=%s (want >= 1)\n",
+            fprintf(stderr, "vision: ignoring bad QWENOX_API_MAX_IMAGES=%s (want >= 1)\n",
                     e);
         }
         return kDefaultMaxImages;
@@ -582,7 +582,7 @@ bool prepare_messages(const json& messages, std::vector<Frame>* frames,
     return true;
 }
 
-bool encode_prompt(const std::string& prompt, const gdec::Tokenizer& tokenizer,
+bool encode_prompt(const std::string& prompt, const qwenox::Tokenizer& tokenizer,
                    const std::vector<Frame>& frames, std::vector<int>* ids,
                    std::string* error, std::vector<size_t>* starts) {
     std::vector<size_t> pad_offsets;
@@ -597,7 +597,7 @@ bool encode_prompt(const std::string& prompt, const gdec::Tokenizer& tokenizer,
         return false;
     }
 
-    const std::vector<gdec::TokenSpan> spans = tokenizer.encode_with_offsets(prompt);
+    const std::vector<qwenox::TokenSpan> spans = tokenizer.encode_with_offsets(prompt);
     ids->clear();
     if (starts) starts->clear();
     size_t image_index = 0;

@@ -52,7 +52,7 @@
 #include <unordered_set>
 #include <vector>
 
-namespace gdec {
+namespace qwenox {
 
 struct TokenSpan {
     int id;
@@ -125,4 +125,4 @@ class Tokenizer {
              std::vector<uint32_t>* token_char_lens) const;
 };
 
-}  // namespace gdec
+}  // namespace qwenox

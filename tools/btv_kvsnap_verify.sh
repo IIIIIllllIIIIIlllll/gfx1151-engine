@@ -4,7 +4,7 @@
 #   bash tools/btv_kvsnap_verify.sh                 # 32768 prompt，maxctx 65536，不加载 MTP
 #   N=8192 bash tools/btv_kvsnap_verify.sh
 #   MTP_FILE=models/qwen38-flash-next-mtp.hgn bash tools/btv_kvsnap_verify.sh
-#   PROBE_BINARY=/path/old/gdec bash tools/btv_kvsnap_verify.sh   # 用旧二进制对照（预期 DIFF）
+#   PROBE_BINARY=/path/old/qwenox bash tools/btv_kvsnap_verify.sh   # 用旧二进制对照（预期 DIFF）
 # 流程：
 #   1. 空快照目录起引擎 → GEN P(16 tok) 触发保存 → 同一引擎 GEN Q=P+out+tail，得 live 金标准
 #   2. 重启引擎 → GEN Q，应命中 P 的快照（日志 "kvsnap: restored"）→ 结果必须与 live 逐 token 一致
@@ -19,25 +19,25 @@ N="${N:-32768}"
 probe_precheck || exit 1
 
 # 与 tools/serve_common.sh 的生产环境变量保持一致
-export GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1
-export GDEC_GEMM_WMMA=1 GDEC_GDN_FUSED=1
-export GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1
-export GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 GDEC_NOWARMUP=1
-export GDEC_PREFILL_CHUNK="${GDEC_PREFILL_CHUNK:-16384}"
-export GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1
-unset GDEC_KV_PAGED
-# A1c：SAVE_KVP / RESTORE_KVP 分别给保存引擎、恢复引擎设 GDEC_KV_PAGED（默认都不分页）
+export QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1
+export QWENOX_GEMM_WMMA=1 QWENOX_GDN_FUSED=1
+export QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1
+export QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 QWENOX_NOWARMUP=1
+export QWENOX_PREFILL_CHUNK="${QWENOX_PREFILL_CHUNK:-16384}"
+export QWENOX_INDEX_FUSED2=1 QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1
+unset QWENOX_KV_PAGED
+# A1c：SAVE_KVP / RESTORE_KVP 分别给保存引擎、恢复引擎设 QWENOX_KV_PAGED（默认都不分页）
 #   SAVE_KVP=2 RESTORE_KVP=2 bash tools/btv_kvsnap_verify.sh   # 反转页表下保存+恢复
 #   RESTORE_KVP=2 bash tools/btv_kvsnap_verify.sh              # 不分页保存，反转页表恢复
-kvp_env() { if [[ -n "${1:-}" ]]; then export GDEC_KV_PAGED="$1"; else unset GDEC_KV_PAGED; fi; }
+kvp_env() { if [[ -n "${1:-}" ]]; then export QWENOX_KV_PAGED="$1"; else unset QWENOX_KV_PAGED; fi; }
 kvp_log() { local l; l="$(grep -m1 '\[kvpage\]' "$PROBE_LOG" || true)"; echo "页表日志: ${l:-（无 [kvpage] 行，不分页）}"; }
 DIR="${KVSNAP_DIR:-data/kvsnap-btv}"
 STATE="logs/kvsnap-btv.json"
-export GDEC_KVSNAP=1 GDEC_KVSNAP_DIR="$DIR"
+export QWENOX_KVSNAP=1 QWENOX_KVSNAP_DIR="$DIR"
 rm -rf "$DIR"; rm -f "$STATE"
 
 MODEL_DIR="${MODEL_DIR:-models}"
-engine=("${PROBE_BINARY:-build/gdec}" "$MODEL_DIR/qwen38-flash-next-w4b.hgn"
+engine=("${PROBE_BINARY:-build/qwenox-engine}" "$MODEL_DIR/qwen38-flash-next-w4b.hgn"
         "$MODEL_DIR/qwen38-flash-next-w4b.overlay.hgn")
 [[ -z "${MTP_FILE:-}" ]] || engine+=("$MTP_FILE")
 engine+=(--serve --port 8732 --maxctx "${CTX:-65536}")

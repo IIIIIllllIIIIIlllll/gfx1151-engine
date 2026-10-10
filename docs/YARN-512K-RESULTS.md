@@ -8,7 +8,7 @@ CRLF 行尾(否则 bash 脚本无法执行,后续同步需注意)。
 
 配置:`MAX_CONTEXT=524288 ROPE_FACTOR=2 ROPE_ORIGINAL_CTX=262144
 ROPE_BETA_FAST=32 ROPE_BETA_SLOW=1 PARALLEL=1 KV_POOL_TOKENS=0` +
-启动器默认 `GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1 KV_PAGED=1`。
+启动器默认 `QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1 KV_PAGED=1`。
 
 ## 结论:全部必测项通过
 
@@ -27,7 +27,7 @@ ROPE_BETA_FAST=32 ROPE_BETA_SLOW=1 PARALLEL=1 KV_POOL_TOKENS=0` +
 
 - `GPU_ARCH=gfx1151 bash build.sh test`:**ALL PASS**(含 ixrope_P517/P13/P8192、
   rope_b、qsa_*、gdn_* 全部用例)。
-- `build.sh all`:gdec / gdec-api / 工具链编译成功。
+- `build.sh all`:qwenox / qwenox-api / 工具链编译成功。
 - 启动日志关键行:
   - `RoPE: YaRN factor=2 original_ctx=262144 beta_fast=32 beta_slow=1 attention_scale=1.06931`
   - `[kvpage] paged QSA KV on: 2048 pages x 256 tokens (+1 guard), kv=bf16+btv`
@@ -87,7 +87,7 @@ ROPE_BETA_FAST=32 ROPE_BETA_SLOW=1 PARALLEL=1 KV_POOL_TOKENS=0` +
 
 - 全部阶梯 prefill 写入 2048 页池(bf16+btv);needle 全深度命中证明分页读取
   正确;decode/MTP 正常(探针请求 draft acceptance 0.625);两次完整重启 +
-  页池复用 + 2080 页从 SSD 恢复快照均正常。`GDEC_QSA_UNION` 未开启(>256K 自动
+  页池复用 + 2080 页从 SSD 恢复快照均正常。`QWENOX_QSA_UNION` 未开启(>256K 自动
   禁用逻辑已在代码中,未手动强开)。
 
 ## 已记录的非阻塞异常
@@ -151,9 +151,9 @@ YaRN 有四层配置入口,全部生效且互相对得上:
 | 层 | 入口 | 校验 |
 |---|---|---|
 | 部署配置 | service.conf 的 `ROPE_FACTOR/ROPE_ORIGINAL_CTX/ROPE_BETA_FAST/ROPE_BETA_SLOW/ROPE_ATTN_SCALE` | 启动器 regex+范围校验(factor≥1、beta>0) |
-| 启动器 | start_hgn.sh / start_gguf.sh / start_win.sh 同名环境变量 | 导出 `GDEC_ROPE_*`,`--check` 可见 |
-| 引擎 | `GDEC_ROPE_*` 环境变量 + `--rope-factor` 等 CLI(CLI 覆盖 env) | `rope_config_valid`:非法值 rc=2 清晰报错;factor>1 打印 YaRN 行;KVSNAP 指纹含全部 rope 参数 |
-| API | 同一 `GDEC_ROPE_*` 环境 | `/health` 暴露 `rope_scaling`(factor=1 时为 null) |
+| 启动器 | start_hgn.sh / start_gguf.sh / start_win.sh 同名环境变量 | 导出 `QWENOX_ROPE_*`,`--check` 可见 |
+| 引擎 | `QWENOX_ROPE_*` 环境变量 + `--rope-factor` 等 CLI(CLI 覆盖 env) | `rope_config_valid`:非法值 rc=2 清晰报错;factor>1 打印 YaRN 行;KVSNAP 指纹含全部 rope 参数 |
+| API | 同一 `QWENOX_ROPE_*` 环境 | `/health` 暴露 `rope_scaling`(factor=1 时为 null) |
 
 推荐 512K 生产配置(与交接文档一致):
 `MAX_CONTEXT=524288 ROPE_FACTOR=2 ROPE_ORIGINAL_CTX=262144 ROPE_BETA_FAST=32 ROPE_BETA_SLOW=1 bash start_hgn.sh`
@@ -213,7 +213,7 @@ YaRN 有四层配置入口,全部生效且互相对得上:
 
 修复(引擎侧,~70 行):
 - `Slot` 增加 `reserved/pages0` 页预约记账;`slot_admit` 在认领槽位时预估
-  `need = ceil((新增 prompt token + min(max_tokens, GDEC_KV_RESERVE_DECODE=4096))
+  `need = ceil((新增 prompt token + min(max_tokens, QWENOX_KV_RESERVE_DECODE=4096))
   / 256) + 2(COW 余量)`,供给 = 空闲页 + 空闲槽可逐出页 − 在跑请求的未用预约;
   不足即返回 -2 立即拒绝(API 400),不再排队等待。
 - decode 预约封顶 4096,因为 API 对未指定 max_tokens 的请求会传整个剩余
@@ -239,14 +239,14 @@ YaRN 有四层配置入口,全部生效且互相对得上:
 重写:准入纯函数抽到 `src/kv_admission.h`(decode 封顶解析 / 目标页 /
 need / available);`slot_admit` 先放 g_sm → 取得 GPU turn → 再取 g_sm
 复核取消与槽位,在持有 turn 时读 `slot_pages`;预约 = 整序列目标页
-(prompt + min(max_tokens, GDEC_KV_RESERVE_DECODE),按 MAX_CONTEXT 裁剪,
+(prompt + min(max_tokens, QWENOX_KV_RESERVE_DECODE),按 MAX_CONTEXT 裁剪,
 无 +2 余量),在跑槽按 max(预约, 已映射) 扣减;成功准入直接持 turn 进
 生成(不二次 acquire),拒绝/取消都释放 turn。新增主机回归
 `tools/kv_admission_test.py`(抽取生产代码 + 假模型,七组)。
 
-复测环境:远端全量重编(build/gdec 20:08,EXIT=0);配置
+复测环境:远端全量重编(build/qwenox-engine 20:08,EXIT=0);配置
 `MAX_CONTEXT=524288 ROPE_FACTOR=2 ... PARALLEL=2 KV_POOL_TOKENS=0
-GDEC_KV_RESERVE_DECODE=4096`,BF16 KV + WMMA + BTV。
+QWENOX_KV_RESERVE_DECODE=4096`,BF16 KV + WMMA + BTV。
 
 **主机层**:七组全 PASS(g++);`--tsan` 复跑同样全 PASS(无线程竞态
 报告);`build.sh test` 已接入该回归,ktest ALL PASS。
@@ -285,8 +285,8 @@ exact-full(524288)与 oversize(~572K)均 0.4~0.5s 干净 400。移除 +2
   超订,C 经 SSD 3.18s 恢复 308907 token/1206 页,D 按 max(预约,已映射)
   =1207 页正确扣减后被拒(841<1207)——恢复页参与准入记账无误。
 
-**判定5 超预约 decode 和取消**(`NEW_BIN=build/gdec bash
-tools/conc_verify.sh`,溢出阶段脚本固定 GDEC_KV_RESERVE_DECODE=256):
+**判定5 超预约 decode 和取消**(`NEW_BIN=build/qwenox-engine bash
+tools/conc_verify.sh`,溢出阶段脚本固定 QWENOX_KV_RESERVE_DECODE=256):
 4 路并发 == 单路串行逐位 PASS(10 请求);4 路控制 PASS(负载下 PING
 0ms、排队取消 1.0s、运行中取消 30ms、同连接重复 GEN、断连);池溢出
 PASS:O1 A(先)超预约增长,池干硬兜底中断后来者 B(1154 token 后

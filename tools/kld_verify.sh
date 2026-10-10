@@ -16,10 +16,10 @@ export CHUNKS=${CHUNKS:-8}
 Q4=${Q4:-$(ls "$HOME"/App/llama.cpp/models/Qwen3.8-Flash-Next-UD-Q4_K_XL/*-00001-of-*.gguf 2>/dev/null | head -1)}
 D=data/kld/verify
 [[ -f "$Q4" ]] || { echo "找不到 Q4_K_XL GGUF（设 Q4=...）"; echo "KLD VERIFY: FAIL"; exit 1; }
-[[ -x "${BIN:-build/gdec}" ]] || { echo "找不到引擎 ${BIN:-build/gdec}"; echo "KLD VERIFY: FAIL"; exit 1; }
-if pgrep -x gdec >/dev/null || pgrep -f 'llama-(server|perplexity|cli)' >/dev/null; then
-  echo "已有 gdec / llama 进程在跑（显存不够两个模型），先停掉再测:"
-  pgrep -af 'gdec|llama-' | grep -v pgrep | cut -c1-150
+[[ -x "${BIN:-build/qwenox-engine}" ]] || { echo "找不到引擎 ${BIN:-build/qwenox-engine}"; echo "KLD VERIFY: FAIL"; exit 1; }
+if pgrep -x qwenox >/dev/null || pgrep -f 'llama-(server|perplexity|cli)' >/dev/null; then
+  echo "已有 qwenox / llama 进程在跑（显存不够两个模型），先停掉再测:"
+  pgrep -af 'qwenox|llama-' | grep -v pgrep | cut -c1-150
   echo "KLD VERIFY: FAIL"; exit 1
 fi
 mkdir -p "$D"

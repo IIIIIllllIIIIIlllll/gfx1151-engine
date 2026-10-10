@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""gdec-api 服务端参数覆盖（/admin/overrides）检查，由 tools/api_override_verify.sh 调用。
+"""qwenox-api 服务端参数覆盖（/admin/overrides）检查，由 tools/api_override_verify.sh 调用。
 
   python3 tools/api_override_verify.py main    --port 8733 --file F   # 功能检查（无管理密钥）
   python3 tools/api_override_verify.py persist --port 8733 --file F   # 重启 API 后覆盖表仍在
-  python3 tools/api_override_verify.py auth    --port 8733 --key K    # 设了 GDEC_API_ADMIN_KEY 时的鉴权
+  python3 tools/api_override_verify.py auth    --port 8733 --key K    # 设了 QWENOX_API_ADMIN_KEY 时的鉴权
 
 每项打印 OK / FAIL，有 FAIL 时退出码 1。
 """
@@ -51,7 +51,7 @@ def jpost(path, body, headers=None):
 
 def ovr_header(h):
     for k, v in h.items():
-        if k.lower() == "x-gdec-overrides":
+        if k.lower() == "x-qwenox-overrides":
             return set(v.split(","))
     return set()
 
@@ -159,7 +159,7 @@ def run_main(file):
     st, ov, out, rs, usage = chat_stream({"temperature": 0.9, "enable_thinking": True})
     check("强制（流式）：与参考一致", st == 200 and out == ref, "%s %r" % (st, out))
     check("强制（流式）：无思考内容", rs == "", rs[:80])
-    check("强制（流式）：响应头带 X-Gdec-Overrides", "temperature" in ov, ov)
+    check("强制（流式）：响应头带 X-Qwenox-Overrides", "temperature" in ov, ov)
 
     st, ov, out, rs, n, raw = chat({"temperature": 0.8, "logprobs": True})
     check("强制贪心 + 客户端 logprobs -> 200，logprobs 被去掉",

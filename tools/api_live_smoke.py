@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Low-cost post-deploy checks for gdec-api against a real engine."""
+"""Low-cost post-deploy checks for qwenox-api against a real engine."""
 import argparse
 import json
 import urllib.error

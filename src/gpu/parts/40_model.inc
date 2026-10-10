@@ -1,4 +1,4 @@
-// Concurrent serve (GDEC_PARALLEL > 1): thrown by kv_reserve / kv_cow when the
+// Concurrent serve (QWENOX_PARALLEL > 1): thrown by kv_reserve / kv_cow when the
 // shared KV pool cannot back this sequence's rows (the later request loses),
 // and by the serve yield hook when another request aborted this one. Always
 // raised before any device write of the step, so the slot can simply reset.
@@ -17,13 +17,13 @@ struct GpuModel {
   NgramMod ngram;
   // Adaptive ngram verify chunk rows, shared by both chain loops and kept
   // across requests (the content mix is a workload property, so warmup should
-  // not repeat per request). 0 = the GDEC_NGRAM_CHUNK env is still unparsed.
+  // not repeat per request). 0 = the QWENOX_NGRAM_CHUNK env is still unparsed.
   int ng_cs = 0;
   bool ng_cs_fixed = false;
-  bool ng_legacy = false;  // GDEC_NGRAM_CHUNK=0: legacy single-pass verify
+  bool ng_legacy = false;  // QWENOX_NGRAM_CHUNK=0: legacy single-pass verify
   void ng_chunk_init() {
     if (ng_cs) return;
-    const char* e = getenv("GDEC_NGRAM_CHUNK");
+    const char* e = getenv("QWENOX_NGRAM_CHUNK");
     const int v = e ? atoi(e) : -1;
     ng_legacy = v == 0;
     ng_cs_fixed = v > 0;
@@ -33,7 +33,7 @@ struct GpuModel {
   // repetitive content. Track the draft-token accept ratio with an EMA over
   // ngram rounds, close the leg for 32 rounds, then probe again. Like ng_cs
   // the state is a Model member shared by both chain loops and kept across
-  // requests (the content mix is a workload property). GDEC_NGRAM_GATE=0
+  // requests (the content mix is a workload property). QWENOX_NGRAM_GATE=0
   // pins the leg open.
   struct NgGate {
     double ema = 1.0;  // decayed draft-token accept ratio (starts optimistic)
@@ -41,7 +41,7 @@ struct GpuModel {
     int rounds = 0;
     static bool disabled() {
       static const int v = [] {
-        const char* e = getenv("GDEC_NGRAM_GATE");
+        const char* e = getenv("QWENOX_NGRAM_GATE");
         return e ? atoi(e) : 1;
       }();
       return v == 0;
@@ -82,7 +82,7 @@ struct GpuModel {
   // C1 f16 indexer: f16 twins of d_iq / d_ik / d_ikg（RNE 自同一份 fp32 值），
   // 打分走 k_index_scores_wmma16<false>，score 复用 d_iscores 内存按 f16 存，
   // select 走 ST=__half 变体。原型（logs/c1_f16_proto1.log）：重合率
-  // 0.99886-0.99992 ≥ 0.995 门，x1.93-2.00 vs t64。GDEC_INDEX_F16=0 退出；
+  // 0.99886-0.99992 ≥ 0.995 门，x1.93-2.00 vs t64。QWENOX_INDEX_F16=0 退出；
   // 其余 index 旧开关（OLDSEL/SCORE64=0/SEL2P=0）任一出现即整路回 fp32。
   uint16_t *d_iqh = nullptr, *d_ikh = nullptr, *d_ikgh = nullptr;
   bool index_f16() const {
@@ -91,15 +91,15 @@ struct GpuModel {
   // Block ranking is sensitive to projection rounding; retain FP32 here.
   // aggr 10-05: bf16 indexer projection by default (the fp32 SGEMM ran at
   // ~2.4 TFLOPS: 264 ms per 16K chunk; bf16 gemm path 16K +2.6%, ids equal).
-  // GDEC_INDEX_F32=1 (or GDEC_INDEX_BF16=0) restores the fp32 projection.
-  bool index_f32 = getenv("GDEC_INDEX_F32") != nullptr || env_zero("GDEC_INDEX_BF16");
-  bool index_fused2 = getenv("GDEC_INDEX_FUSED2") != nullptr;
-  bool index_stream_select = getenv("GDEC_INDEX_STREAM_SELECT") != nullptr;
+  // QWENOX_INDEX_F32=1 (or QWENOX_INDEX_BF16=0) restores the fp32 projection.
+  bool index_f32 = getenv("QWENOX_INDEX_F32") != nullptr || env_zero("QWENOX_INDEX_BF16");
+  bool index_fused2 = getenv("QWENOX_INDEX_FUSED2") != nullptr;
+  bool index_stream_select = getenv("QWENOX_INDEX_STREAM_SELECT") != nullptr;
   // Fused-path fast kernels (09_kernels_index.inc), bit-exact, default on:
-  // GDEC_INDEX_SCORE64=0 -> old k_index_scores_tiled; GDEC_INDEX_SEL2P=0 ->
-  // old selector for n > 8192 (stream / rocPRIM per GDEC_INDEX_STREAM_SELECT).
-  bool index_score64 = !env_zero("GDEC_INDEX_SCORE64");
-  bool index_sel2p = !env_zero("GDEC_INDEX_SEL2P");
+  // QWENOX_INDEX_SCORE64=0 -> old k_index_scores_tiled; QWENOX_INDEX_SEL2P=0 ->
+  // old selector for n > 8192 (stream / rocPRIM per QWENOX_INDEX_STREAM_SELECT).
+  bool index_score64 = !env_zero("QWENOX_INDEX_SCORE64");
+  bool index_sel2p = !env_zero("QWENOX_INDEX_SEL2P");
   static bool env_zero(const char* k) {
     const char* v = getenv(k);
     return v && v[0] == '0' && v[1] == 0;
@@ -108,23 +108,23 @@ struct GpuModel {
   // 在 P>=8192 时把 X 重排成 2 个连续 K=3072 切片跑两次 + slice1 原子加。
   // proto（tools/b3_splitk_proto.cu，logs/b3_splitk3.log）：16K 下
   // 14.5+0.5 ms vs 16.4 ms（x1.13）；收益来自 X 连续切片，strided 版 x0.84
-  // 已否决。默认开，GDEC_GEMM_SPLITK=0 退出。
+  // 已否决。默认开，QWENOX_GEMM_SPLITK=0 退出。
   // B3 split-K: Windows +1.3% (10-03); Linux 16K −1.6% (aggr 10-05: unsplit
-  // k1 16.35 ms vs split+repack ~18.8) -> Linux default off, GDEC_GEMM_SPLITK=1 on.
+  // k1 16.35 ms vs split+repack ~18.8) -> Linux default off, QWENOX_GEMM_SPLITK=1 on.
   static bool gemm_splitk_on() {
 #ifdef _WIN32
-    static const bool want = !env_zero("GDEC_GEMM_SPLITK");
+    static const bool want = !env_zero("QWENOX_GEMM_SPLITK");
 #else
-    static const bool want = getenv("GDEC_GEMM_SPLITK") && !env_zero("GDEC_GEMM_SPLITK");
+    static const bool want = getenv("QWENOX_GEMM_SPLITK") && !env_zero("QWENOX_GEMM_SPLITK");
 #endif
-    static const bool on = getenv("GDEC_GEMM_WMMA") != nullptr &&
-                           getenv("GDEC_GEMM_NO_K64") == nullptr &&
-                           getenv("GDEC_GEMM_RB") == nullptr && want;
+    static const bool on = getenv("QWENOX_GEMM_WMMA") != nullptr &&
+                           getenv("QWENOX_GEMM_NO_K64") == nullptr &&
+                           getenv("QWENOX_GEMM_RB") == nullptr && want;
     return on;
   }
   int* d_iselected = nullptr;
   int index_blocks = 0;
-  // Draft lm_head override (default on, GDEC_DRAFT_LM_Q4=0 opts out): when an
+  // Draft lm_head override (default on, QWENOX_DRAFT_LM_Q4=0 opts out): when an
   // overlay upgraded lm_head to a wider dtype, drafting reads the base file's
   // 4-bit copy instead (~0.5x bytes per draft step). Verify/output exactness
   // is unchanged -- only the proposal distribution shifts slightly.
@@ -133,7 +133,7 @@ struct GpuModel {
   // Paged QSA KV (memory model Phase A1). The trunk FP32 KV cache (d_kc/d_vc)
   // and indexer keys (d_ik) are addressed through a logical->physical page
   // table (KV_PAGE = 256 tokens = 64 indexer blocks; one table shared by all
-  // QSA layers). GDEC_KV_PAGED=1: identity table, =2: reversed table
+  // QSA layers). QWENOX_KV_PAGED=1: identity table, =2: reversed table
   // (self-test: output must stay bitwise identical to unpaged). Unset/0: legacy
   // addressing (ptab == nullptr in every kernel). A1c: the BF16 cache
   // (d_kcb/d_vcb and the transposed d_vcbt) is paged too when the sparse
@@ -143,7 +143,7 @@ struct GpuModel {
   // d_mvcf/d_mkcb/d_mvcb/d_mik are views of that slice (no transposed V).
   // A2: pages are allocated on demand from a pool (KvPagePool, 10_ple_io.inc)
   // as the live sequence grows (kv_reserve) and returned when it shrinks or
-  // resets (kv_trim). GDEC_KV_PAGED=1: lowest-free-first allocation, =2:
+  // resets (kv_trim). QWENOX_KV_PAGED=1: lowest-free-first allocation, =2:
   // scrambled order + FIFO reuse (self-test). Physical page kv_pool.guard()
   // backs every unmapped logical page.
   // A3: RAM checkpoints (49_rckpt.inc) pin their prefix pages by refcount
@@ -154,7 +154,7 @@ struct GpuModel {
   bool kv_paged = false;
   int kv_lpages = 0;            // logical pages per sequence = ceil(maxctx / 256)
   int kv_pool_pages = 0;        // allocatable physical pages (kv_pool_pages_for)
-  int kv_mode = 0;              // GDEC_KV_PAGED value (2 = self-test logging)
+  int kv_mode = 0;              // QWENOX_KV_PAGED value (2 = self-test logging)
   bool (*kv_evict_fn)(GpuModel&) = nullptr;  // A3: drop one pinned checkpoint
   // Concurrent serve: called once no checkpoint is left to evict. Frees pages
   // held by other sequence slots (true -> retry) or throws KvOverflow.
@@ -183,26 +183,26 @@ struct GpuModel {
   KvSeqTable kv_seq;            // live sequence; kv_seq.tab is d_ptab's host mirror
   float* d_ikg = nullptr;       // [index_blocks][128] gathered keys (paged prefill)
   const int* kvpt() const { return kv_paged ? d_ptab : nullptr; }
-  bool qsa_dense = getenv("GDEC_QSA_DENSE") != nullptr;
+  bool qsa_dense = getenv("QWENOX_QSA_DENSE") != nullptr;
   // BF16 KV cache: measured parity at 32K (QSA is latency-bound, not DRAM-bound)
   // and flips the 8192 oracle -> opt-in experiment, default stays FP32.
-  bool qsa_kv_fp32 = getenv("GDEC_QSA_KV_BF16") == nullptr;  // default: FP32 cache
+  bool qsa_kv_fp32 = getenv("QWENOX_QSA_KV_BF16") == nullptr;  // default: FP32 cache
   // WMMA sparse prefill attention (k_qsa_wmma): opt-in on top of BF16 KV mode.
   // bf16 P + WMMA accumulation is not bitwise fp32 — FP32 kernels stay default.
-  bool qsa_wmma = getenv("GDEC_QSA_WMMA") != nullptr;
+  bool qsa_wmma = getenv("QWENOX_QSA_WMMA") != nullptr;
   // Keep the established row-major cache for decode, MTP, snapshots, and
   // the default WMMA path; this second cache is a prefill-only opt-in.
   bool qsa_wmma_btv = qsa_wmma && !qsa_kv_fp32 &&
-                      getenv("GDEC_QSA_WMMA_BTV") != nullptr;
-  // GDEC_QSA_WMMA6=1: dim-split 128-thread rewrite (k_qsa_wmma6); layered on
+                      getenv("QWENOX_QSA_WMMA_BTV") != nullptr;
+  // QWENOX_QSA_WMMA6=1: dim-split 128-thread rewrite (k_qsa_wmma6); layered on
   // the transposed-V path since it reads B fragments from that cache.
-  bool qsa_wmma6 = qsa_wmma_btv && getenv("GDEC_QSA_WMMA6") != nullptr;
-  // GDEC_QSA_UNION=1: 4-query 块并集 WMMA prefill（k_qsa_union_merge +
+  bool qsa_wmma6 = qsa_wmma_btv && getenv("QWENOX_QSA_WMMA6") != nullptr;
+  // QWENOX_QSA_UNION=1: 4-query 块并集 WMMA prefill（k_qsa_union_merge +
   // k_qsa_wmma_u），叠加在转置 V 路径上；组边缘回退 k_qsa_wmma<true>。
   // aggr 10-05: default ON (paged support + tail-edge sel-offset fix added;
   // 16K +0.9% paged, +2.2% unpaged; NOT bit-identical — key order — KLD
-  // pending). GDEC_QSA_UNION=0 restores the per-token kernel.
-  bool qsa_union = qsa_wmma_btv && !env_zero("GDEC_QSA_UNION");
+  // pending). QWENOX_QSA_UNION=0 restores the per-token kernel.
+  bool qsa_union = qsa_wmma_btv && !env_zero("QWENOX_QSA_UNION");
   uint16_t* d_ublk = nullptr;  // [ngroups][QSA_UCAP] 并集块号
   uint16_t* d_umask = nullptr; // [ngroups][QSA_UCAP] 4 query x 4 slot 掩码
   int* d_ucount = nullptr;     // [ngroups] 并集块数（含 pad，4 的倍数）
@@ -211,12 +211,12 @@ struct GpuModel {
   uint16_t* vct_layer(int qi) const {
     return qsa_wmma_btv ? d_vcbt + (size_t)qi * qsa_vt_blocks * 2 * 256 * 4 : nullptr;
   }
-  bool prefill_fused = getenv("GDEC_PREFILL_UNFUSED") == nullptr;
-  bool gr_bf16 = getenv("GDEC_GR_BF16") != nullptr && prefill_fused;
-  bool gr_scatter_norm = getenv("GDEC_GR_SCATTER_NORM") != nullptr || gr_bf16;
-  // Independent of GDEC_QSA_DENSE: dense used to force atomic MoE (and so lose
+  bool prefill_fused = getenv("QWENOX_PREFILL_UNFUSED") == nullptr;
+  bool gr_bf16 = getenv("QWENOX_GR_BF16") != nullptr && prefill_fused;
+  bool gr_scatter_norm = getenv("QWENOX_GR_SCATTER_NORM") != nullptr || gr_bf16;
+  // Independent of QWENOX_QSA_DENSE: dense used to force atomic MoE (and so lose
   // MoE_LT), which made it 2x slower in MoE and not a clean attention-only A/B.
-  bool moe_deterministic = getenv("GDEC_MOE_ATOMIC") == nullptr;
+  bool moe_deterministic = getenv("QWENOX_MOE_ATOMIC") == nullptr;
   float* d_router;                        // 512
   int* d_topids;                          // 16
   float* d_topw;                          // 16
@@ -262,7 +262,7 @@ struct GpuModel {
   int* d_rdelta = nullptr;                   // device scalar: decode rope delta
   float2* d_cs1 = nullptr;                   // dump scratch (32 cos/sin)
   int* d_rpos1 = nullptr;                    // dump scratch (rope position)
-  FILE* mrope_dump_ = nullptr;               // GDEC_MROPE_DUMP sink
+  FILE* mrope_dump_ = nullptr;               // QWENOX_MROPE_DUMP sink
   bool mrope_dump_meta_ = false;
   // ---- Vision tower (stage 4) ----
   // vision_on only via load_vision (--vision-tower). Per-request state lives
@@ -292,7 +292,7 @@ struct GpuModel {
   int* d_topidsb;
   float* d_topwb;
   int* d_slot_order = nullptr;  // verify MoE 槽序（k_moe_sort_slots，按专家排序）
-  int moe_dump_base_ = -1;      // GDEC_MOE_TOPIDS_DUMP：记录用的当前 chunk base
+  int moe_dump_base_ = -1;      // QWENOX_MOE_TOPIDS_DUMP：记录用的当前 chunk base
   float *d_guvb, *d_hidb, *d_moeaccb, *d_eyb, *d_sgb;
   float* d_eb;              // [maxctx, 2560] PLE embeddings
   float* ple_eb = nullptr;  // pinned staging [maxctx, 2560]
@@ -311,14 +311,14 @@ struct GpuModel {
   // B3 split-K: [BP, 6144] bf16，k1 (2560,6144) 的 X 重排成 2 个连续 K=3072
   // 切片。层边界即死（仅单次 gemm 内活跃），与 d_wbf16 同理性不入 WS 小拷贝。
   uint16_t* d_skx = nullptr;
-  // GDEC_MOE_LT buffers (allocated only when enabled): gathered bf16 pair rows
+  // QWENOX_MOE_LT buffers (allocated only when enabled): gathered bf16 pair rows
   // and per-group dequant scratch.
   __hip_bfloat16* d_moexg = nullptr;   // [BP*topk, d]
   __hip_bfloat16* d_moewup = nullptr;  // [MOE_LT_GRP(x2 if OVL), 2*moe_mid, d]
   __hip_bfloat16* d_moewdn = nullptr;  // [MOE_LT_GRP(x2 if OVL), d, moe_mid]
-  uint16_t* d_hidb2 = nullptr;  // GDEC_MOE_LT_CMP: fused-reference packed hid
-  float* d_pairs2 = nullptr;    // GDEC_MOE_LT_CMP: fused-reference weighted pairs
-  int* d_cmpi = nullptr;        // GDEC_MOE_LT_CMP: [max|diff|, max|ref|] ordered int
+  uint16_t* d_hidb2 = nullptr;  // QWENOX_MOE_LT_CMP: fused-reference packed hid
+  float* d_pairs2 = nullptr;    // QWENOX_MOE_LT_CMP: fused-reference weighted pairs
+  int* d_cmpi = nullptr;        // QWENOX_MOE_LT_CMP: [max|diff|, max|ref|] ordered int
   // bf16 conversion cache: d_xb/d_Rhatb are converted once per layer section
   // instead of once per gemm; invalidated where those buffers are written
   const float* xf16_src = nullptr;
@@ -405,8 +405,8 @@ struct GpuModel {
     return ckpt.find("mtp.fc_hidden.weight") && mtp_moe_default();
   }
   bool ngram_verify_active = false;
-  bool ngram_legacy_gdn = getenv("GDEC_NGRAM_LEGACY_GDN") != nullptr;
-  bool ngram_legacy_final = getenv("GDEC_NGRAM_LEGACY_FINAL") != nullptr;
+  bool ngram_legacy_gdn = getenv("QWENOX_NGRAM_LEGACY_GDN") != nullptr;
+  bool ngram_legacy_final = getenv("QWENOX_NGRAM_LEGACY_FINAL") != nullptr;
   bool mtp_tap_capture = false;  // prefill_chunk copies d_Rb rows into d_mtap
   bool bench_quiet = false;      // offline bench: suppress per-layer/per-run diagnostics
   int mtp_norm_mode = 0;       // 0 = full-10240 RMSNorm (H1), 1 = 4x2560 (H2)
@@ -434,7 +434,7 @@ struct GpuModel {
   float* d_mRb = nullptr;      // batch stream (maxbatch, 10240)
   float* d_mRhatb = nullptr;   // batch normed stream
   float* d_mtap = nullptr;     // captured trunk taps (maxbatch, 10240)
-  // Offline test hook (--spec-gen + GDEC_SPEC_FORCE=<ids file>): greedy
+  // Offline test hook (--spec-gen + QWENOX_SPEC_FORCE=<ids file>): greedy
   // spec_loop verifies drafts against these ids instead of the trunk argmax,
   // so every γ policy commits the same trajectory (paired γ A/B without greedy
   // near-tie divergence; verify cost unchanged). Empty = off.
@@ -469,7 +469,7 @@ struct GpuModel {
   // GPU sampling prep (spec sampling fast path): correction lists, radix
   // top-k scratch and per-row candidate blocks. Rows are capped at 65 (ngram
   // <= 64 + 1); the dense path stays as fallback (top_k unset/>64, candidate
-  // overflow, GDEC_SMS_GPU=0).
+  // overflow, QWENOX_SMS_GPU=0).
   static constexpr int SMS_ROWS = 65, SMS_TCAP = 512, SMS_PCAP = 64;
   static constexpr int SMS_BIAS_CAP = 20480, SMS_HIST_CAP = 120000;
   int* d_sm_ctrl = nullptr;        // [SMS_ROWS][8]
@@ -516,25 +516,25 @@ struct GpuModel {
   // Greedy draft chain without per-step D2H: step j reads step j-1's argmax
   // via D2D, one blocking D2H collects the chain. 0 restores per-step sync.
   const bool draft_desync =
-      !getenv("GDEC_DRAFT_DESYNC") || atoi(getenv("GDEC_DRAFT_DESYNC")) != 0;
+      !getenv("QWENOX_DRAFT_DESYNC") || atoi(getenv("QWENOX_DRAFT_DESYNC")) != 0;
   // Draft-only vocab subset (first N rows of lm_head, FR-Spec style): greedy
   // draft argmax over the subset; verify is untouched, so committed output is
   // unchanged even when the true argmax lies outside. 0 = full vocab.
   // Greedy argmax path only; sampling drafts keep the full distribution.
   const int draft_vocab = [] {
-    const char* e = getenv("GDEC_DRAFT_VOCAB");
+    const char* e = getenv("QWENOX_DRAFT_VOCAB");
     return e ? atoi(e) : 0;
   }();
   // Dump top-2 verify logits for rows near absolute position N (draft
   // dependence forensics: tiny margin at a fork = fp tie-flip, large = leak).
   const int fork_dump = [] {
-    const char* e = getenv("GDEC_FORK_DUMP");
+    const char* e = getenv("QWENOX_FORK_DUMP");
     return e ? atoi(e) : 0;
   }();
 
   explicit GpuModel(const Checkpoint& c, int mc) : ckpt(c), maxctx(mc) {
     if (qsa_union && maxctx > 262144) {  // block ids uint16: 65536 blocks max
-      fprintf(stderr, "qsa: disabling GDEC_QSA_UNION above 256K because its "
+      fprintf(stderr, "qsa: disabling QWENOX_QSA_UNION above 256K because its "
                       "block ids are uint16\n");
       qsa_union = false;
     }
@@ -574,10 +574,10 @@ struct GpuModel {
     // 2257→2639 ms，无周期）；而 maxctx 尺寸的 KV/ik/vcbt/iscores 对位置
     // 不敏感（qsa:flash/idx 在两位形间不变）。固定低位摆放同时让布局与
     // maxctx 无关——此前 262144 仅因这些缓冲被 maxctx 增长顶高 5.21 GiB
-    // 就掉 14%（1464.5→1253.8 tok/s @128k，E1 用 GDEC_PAD_BATCH 复现）。
-    // GDEC_PAD_BATCH (bytes)：调试开关——哑分配整体推移批缓冲的 arena 偏移。
+    // 就掉 14%（1464.5→1253.8 tok/s @128k，E1 用 QWENOX_PAD_BATCH 复现）。
+    // QWENOX_PAD_BATCH (bytes)：调试开关——哑分配整体推移批缓冲的 arena 偏移。
     {
-      const char* pbs = getenv("GDEC_PAD_BATCH");
+      const char* pbs = getenv("QWENOX_PAD_BATCH");
       if (pbs && atoll(pbs) > 0) {
         void* pad_dummy = nullptr;
         DALLOC(&pad_dummy, (size_t)atoll(pbs));
@@ -643,7 +643,7 @@ struct GpuModel {
       }
       if (moe_lt && g_cfg.topk == 10 && moe_deterministic && !moe_host_route && !moe_ordered) {
         // 4-expert dequant groups: scratch stays MALL-resident between dequant
-        // and its GEMMs (measured in tools/moe_lt_bench.cu). GDEC_MOE_LT_OVL
+        // and its GEMMs (measured in tools/moe_lt_bench.cu). QWENOX_MOE_LT_OVL
         // doubles it for the A/B slot rotation of the overlap pipeline.
         DALLOC(&d_moexg, (size_t)BP * g_cfg.topk * g_cfg.d * 2);
         DALLOC(&d_moewup, (size_t)4 * 2 * g_cfg.moe_mid * g_cfg.d * 2 * (moe_lt_ovl ? 2 : 1));
@@ -696,23 +696,23 @@ struct GpuModel {
     int nqsa = g_cfg.layers / 4;  // 12
     kv_nl = nqsa + (mtp_kv_wanted() ? 1 : 0);
     {
-      const char* pe = getenv("GDEC_KV_PAGED");
+      const char* pe = getenv("QWENOX_KV_PAGED");
       int mode = pe ? atoi(pe) : 0;
       // A1c: the BF16 cache is paged on the k_qsa_flash (dense / decode) and
       // k_qsa_wmma<*, true> (sparse prefill, with or without BTV) kernels.
       // The union / wmma6 / k_qsa_flash_bf16 sparse kernels are not paged.
       const bool bf16_ok = qsa_dense || (qsa_wmma && !qsa_wmma6);  // union: paged since aggr
       if (mode && !qsa_kv_fp32 && !bf16_ok) {
-        fprintf(stderr, "[kvpage] GDEC_KV_PAGED ignored: with GDEC_QSA_KV_BF16, "
-                        "paging needs GDEC_QSA_WMMA (with or without _BTV) and no "
-                        "GDEC_QSA_WMMA6 / GDEC_QSA_UNION\n");
+        fprintf(stderr, "[kvpage] QWENOX_KV_PAGED ignored: with QWENOX_QSA_KV_BF16, "
+                        "paging needs QWENOX_QSA_WMMA (with or without _BTV) and no "
+                        "QWENOX_QSA_WMMA6 / QWENOX_QSA_UNION\n");
         mode = 0;
       }
       kv_paged = mode != 0;
       kv_mode = mode;
       kv_lpages = (maxctx + KV_PAGE - 1) / KV_PAGE;
       // A3: at least one full-length sequence; pinned checkpoints share the
-      // pool (GDEC_KV_POOL_TOKENS enlarges it); +1 physical guard page.
+      // pool (QWENOX_KV_POOL_TOKENS enlarges it); +1 physical guard page.
       kv_pool_pages = kv_pool_pages_for(maxctx);
       kv_layer_rows =
           kv_paged ? (size_t)(kv_pool_pages + 1) * KV_PAGE : (size_t)maxctx;
@@ -730,7 +730,7 @@ struct GpuModel {
                 qsa_kv_fp32 ? "fp32" : (qsa_wmma_btv ? "bf16+btv" : "bf16"));
         if (kv_pool_pages > kv_lpages)
           fprintf(stderr, "[kvpage] pool enlarged: %d pages = %.2fx one sequence "
-                          "(GDEC_KV_POOL_TOKENS)\n",
+                          "(QWENOX_KV_POOL_TOKENS)\n",
                   kv_pool_pages, (double)kv_pool_pages / kv_lpages);
       }
     }
@@ -747,8 +747,8 @@ struct GpuModel {
       DALLOC(&d_ik, (size_t)kv_nl * ik_layer_blocks * 128 * 4);
       if (kv_paged) DALLOC(&d_ikg, (size_t)index_blocks * 128 * 4);
       // C1 f16 twins（门控与 30_host_util.inc 的 arena 估算同步）
-      if (!env_zero("GDEC_INDEX_F16") && index_score64 && index_sel2p &&
-          getenv("GDEC_INDEX_OLDSEL") == nullptr) {
+      if (!env_zero("QWENOX_INDEX_F16") && index_score64 && index_sel2p &&
+          getenv("QWENOX_INDEX_OLDSEL") == nullptr) {
         DALLOC(&d_iqh, (size_t)maxbatch_cap * 512 * 2);
         DALLOC(&d_ikh, (size_t)kv_nl * ik_layer_blocks * 128 * 2);
         if (kv_paged) DALLOC(&d_ikgh, (size_t)index_blocks * 128 * 2);
@@ -801,7 +801,7 @@ struct GpuModel {
       const int k = g_cfg.topk;
       if (k != 10 || !moe_deterministic || moe_host_route || moe_ordered || moe_untiled)
         throw std::runtime_error(
-            "GDEC_GGUF needs top-10 and the default MoE routing (no GDEC_MOE_ATOMIC / "
+            "QWENOX_GGUF needs top-10 and the default MoE routing (no QWENOX_MOE_ATOMIC / "
             "HOST_ROUTE / ORDERED / UNTILED)");
       DALLOC(&d_gg_x16, (size_t)g_cfg.d * 2);
       DALLOC(&d_gg_hid, (size_t)k * g_cfg.moe_mid * 2);
@@ -824,7 +824,7 @@ struct GpuModel {
     CK(hipMemset(d_pos, 0, 4));
     CK(hipMemset(d_ringpos, 0, 4));
     CK(hipMemset(d_rdelta, 0, 4));
-    if (getenv("GDEC_MROPE_DUMP")) {
+    if (getenv("QWENOX_MROPE_DUMP")) {
       DALLOC(&d_cs1, 32 * sizeof(float2));
       DALLOC(&d_rpos1, 4);
     }
@@ -933,7 +933,7 @@ struct GpuModel {
       if (!ple_table)
         throw std::runtime_error(
             "PLE n-gram table (layers.1.ple.ngram_embedding.weight) not found: hgn v2 keeps it "
-            "in a separate file — set NGRAM_FILE (gdec: pass that .hgn as an overlay)");
+            "in a separate file — set NGRAM_FILE (qwenox: pass that .hgn as an overlay)");
       ple_iq4 = ple_table->dtype == 11;
       if (ple_iq4) {
         // GGUF IQ4_NL table: 90 B rows, no global scale. The batch-read fd is
@@ -984,9 +984,9 @@ struct GpuModel {
       } else {
         // Validated wiring (mtp-test 0.855): branch-grouped norm + per-branch
         // fc_hidden + broadcast e. Env flips back for debugging only.
-        const char* nm = getenv("GDEC_MTP_NORM");
+        const char* nm = getenv("QWENOX_MTP_NORM");
         mtp_norm_mode = (nm && !strcmp(nm, "full")) ? 0 : 1;
-        const char* hg = getenv("GDEC_MTP_HAGG");
+        const char* hg = getenv("QWENOX_MTP_HAGG");
         mtp_hagg_mode = (hg && !strcmp(hg, "sum")) ? 0 : 1;
         DALLOC(&d_mR, rb * 4);
         DALLOC(&d_mRhat, rb * 4);
@@ -1045,7 +1045,7 @@ struct GpuModel {
                 (int)ckpt.at("mtp.fc_hidden.weight").dtype);
       }
     }
-    fprintf(stderr, "gdec: state allocated (maxctx=%d)\n", maxctx);
+    fprintf(stderr, "qwenox: state allocated (maxctx=%d)\n", maxctx);
   }
 
   ~GpuModel() {
@@ -1115,7 +1115,7 @@ struct GpuModel {
   // reads it instead (~0.5x bytes per draft step); verify and serial decode
   // still use the production lm_head, so committed outputs are unchanged.
   void setup_draft_lmhead(const Tensor* base_lm) {
-    if (env_zero("GDEC_DRAFT_LM_Q4") || !base_lm || base_lm->dtype != 5) return;
+    if (env_zero("QWENOX_DRAFT_LM_Q4") || !base_lm || base_lm->dtype != 5) return;
     const Tensor& cur = ckpt.at("lm_head.weight");
     if (cur.data == base_lm->data) return;  // no overlay override
     uint64_t cols = base_lm->dims[base_lm->ndims - 1];
@@ -1280,10 +1280,10 @@ struct GpuModel {
         img_emb_cap = ncap;
       }
       auto t0 = std::chrono::steady_clock::now();
-      // Debug hook (GDEC_VISION_EMBEDS_NPY=<f4 (M,2560) npy>): inject
+      // Debug hook (QWENOX_VISION_EMBEDS_NPY=<f4 (M,2560) npy>): inject
       // precomputed embeds (host bf16 RNE) instead of running the ViT.
       // Isolates LLM/injection behavior from ViT numerics in A/B probes.
-      const char* dbg_emb = getenv("GDEC_VISION_EMBEDS_NPY");
+      const char* dbg_emb = getenv("QWENOX_VISION_EMBEDS_NPY");
       if (dbg_emb) {
         VitNpy e = vit_npy_read(dbg_emb);
         if (e.shape.size() != 2 || e.shape[0] != (uint64_t)M ||
@@ -1331,16 +1331,16 @@ struct GpuModel {
   }
 
 
-  // ---- M-RoPE debug dump (GDEC_MROPE_DUMP=<file>; syncs the stream) ----
+  // ---- M-RoPE debug dump (QWENOX_MROPE_DUMP=<file>; syncs the stream) ----
   // Format: "META rope_delta=<d>", then per table fill one line per row:
   //   ROW <base> <row> <pT> <pH> <pW> <cos0> <sin0> ... <cos31> <sin31>
   // and per decode step:
   //   DEC <tag> <rpos> <rdelta> <cos0> <sin0> ... <cos31> <sin31>
   // cos/sin as C %a hexfloats (exact binary value of the fp32 table entry).
   FILE* mrope_dump() {
-    if (mrope_dump_ || !getenv("GDEC_MROPE_DUMP")) return mrope_dump_;
-    mrope_dump_ = fopen(getenv("GDEC_MROPE_DUMP"), "w");
-    if (mrope_dump_) fprintf(mrope_dump_, "# gdec-mrope-dump v1\n");
+    if (mrope_dump_ || !getenv("QWENOX_MROPE_DUMP")) return mrope_dump_;
+    mrope_dump_ = fopen(getenv("QWENOX_MROPE_DUMP"), "w");
+    if (mrope_dump_) fprintf(mrope_dump_, "# qwenox-mrope-dump v1\n");
     return mrope_dump_;
   }
 
@@ -1396,8 +1396,8 @@ struct GpuModel {
   // it from memory (a fixed pointer arg replays correctly under graph capture;
   // a baked scalar would freeze the capture-time base). Same value, same math
   // -> bit-identical. Stream-ordered: every consumer's public entry re-writes
-  // it before launching. GDEC_VBASE=0 falls back to scalar args everywhere.
-  static bool vbase_on() { return !env_zero("GDEC_VBASE"); }
+  // it before launching. QWENOX_VBASE=0 falls back to scalar args everywhere.
+  static bool vbase_on() { return !env_zero("QWENOX_VBASE"); }
   const int* vbptr() const { return vbase_on() ? d_vbase : nullptr; }
   // Staging is a small pinned ring, not one slot: a pinned async copy reads
   // host memory when the stream reaches it, so rewriting a single slot before
@@ -1498,7 +1498,7 @@ struct GpuModel {
   // tokens (< 2051) take the same path (ntok = token+1, identity source map);
   // the old 3-pass k_qsa_step dense kernel cost ~0.7ms->5.4ms/layer growing
   // linearly with pos (rocprofv3: 55.8% of all decode kernel time), while the
-  // flash split stays flat. GDEC_QSA_DENSE takes the same split kernel with no
+  // flash split stays flat. QWENOX_QSA_DENSE takes the same split kernel with no
   // selection list (all visible positions). k_qsa_step used to be its fallback,
   // but its pass 3 recomputes every q.k per output dim: 1170 ms/token at 8K.
   template <typename KVT>
@@ -1583,8 +1583,8 @@ struct GpuModel {
   // order, so a decode step was not bit-reproducible: timing changes (another
   // slot's work in between, a debug sync) flipped near-tie tokens thousands of
   // steps later. The top-k kernel keeps the partials in registers and sums in
-  // expert order, overwriting every row (no memset). GDEC_MOE_DOWN_ATOMIC /
-  // GDEC_MOE_ATOMIC restore the old path.
+  // expert order, overwriting every row (no memset). QWENOX_MOE_DOWN_ATOMIC /
+  // QWENOX_MOE_ATOMIC restore the old path.
   bool moe_down_direct(int k, const WView& dn) const {
     return moe_down_topk && k == 10 && dn.cols == 640;
   }
@@ -1666,16 +1666,16 @@ struct GpuModel {
     const int k = g_cfg.topk, E = g_cfg.experts, d = g_cfg.d, mid = g_cfg.moe_mid;
     // Small P (decode, spec verify): raw-block GEMVs, FP32 hid, weighted sum in
     // expert-rank order written straight to acc (26_kernels_moe_gguf.inc).
-    // GDEC_GG_GEMV=<max P> (default 8, 0 = always WMMA).
+    // QWENOX_GG_GEMV=<max P> (default 8, 0 = always WMMA).
     static const int gemv_max = [] {
-      const char* s = getenv("GDEC_GG_GEMV");
+      const char* s = getenv("QWENOX_GG_GEMV");
       return s && *s ? atoi(s) : 8;
     }();
     // 2 <= P <= 8: experts shared between the P tokens (spec verify) are read
     // once (bit-identical to the plain path); unweighted pairs go to d_guvb.
-    // GDEC_GG_UQ=0 disables.
+    // QWENOX_GG_UQ=0 disables.
     static const bool uq_on = [] {
-      const char* s = getenv("GDEC_GG_UQ");
+      const char* s = getenv("QWENOX_GG_UQ");
       return !(s && *s == '0');
     }();
     const bool uq = uq_on && P >= 2;
@@ -1713,7 +1713,7 @@ struct GpuModel {
                                                                      P, d);
   }
 
-  // hgn q4cp routed experts through the LUT-decode WMMA kernels (GDEC_MOE_Q4W):
+  // hgn q4cp routed experts through the LUT-decode WMMA kernels (QWENOX_MOE_Q4W):
   // same prefill workspaces / dataflow as moe_gguf's P > 1 branch; acc f32
   // [P][d] fully overwritten. Returns false (nothing launched) if unsupported.
   // Whether moe_q4w_run(gu, dn, ..., P) will take the LUT path (no launches).
@@ -1744,15 +1744,15 @@ struct GpuModel {
     static bool logged = false;
     if (!logged) {
       logged = true;
-      fprintf(stderr, "moe prefill: q4cp LUT WMMA (GDEC_MOE_Q4W=0 disables)\n");
+      fprintf(stderr, "moe prefill: q4cp LUT WMMA (QWENOX_MOE_Q4W=0 disables)\n");
     }
     KP("moe:route");
     moe_routing.run(topids, topw, d_tokidx, d_pweight, d_eoff, d_pairids, P, k, E);
     // §11.5 mt（q4cp 站）：同专家双 64-tile 合并 BN=128，每个 K stage 的权重
-    // 解码一次供两个 tile 半用，逐 bit 不变；默认开，GDEC_MOE_MT=0 回退。
+    // 解码一次供两个 tile 半用，逐 bit 不变；默认开，QWENOX_MOE_MT=0 回退。
     // 门槛同 v2：平均每专家 slot >= 80（P=2048 档 v2 实测 −5.2%，小 P 走原
     // 路径）。w4b 与 v2 不同：moe 在关键路径上（segsum==wall，见 §11.5）。
-    static const bool moe_mt_env = !env_zero("GDEC_MOE_MT");
+    static const bool moe_mt_env = !env_zero("QWENOX_MOE_MT");
     const bool mt = moe_mt_env && (int64_t)P * k >= 80 * E;
     k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, mt ? 128 : 64);
     const int max_tiles = mt ? (P * k + 127) / 128 + E : (P * k + 63) / 64 + E;
@@ -1768,7 +1768,7 @@ struct GpuModel {
       moe_lut_up(moelut::kQ4CP, pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, hid, mid, d,
                  g_str);
     KP("moe:down");
-    // B1 w4b f16 pairs（与 v2 GDEC_V2_PAIRS_F16 同款）：down 写 f16、reduce 读
+    // B1 w4b f16 pairs（与 v2 QWENOX_V2_PAIRS_F16 同款）：down 写 f16、reduce 读
     // f16（__half2float 精确拓宽，fp32 累加不变），reduce 读流量减半。默认开
     // （KLD 过线后翻转，=0 回退）。w4b_pairs_f16_env 与分配门控
     // guvb_f16_env 语义同步。
@@ -1952,64 +1952,64 @@ struct GpuModel {
   }
 
   // one token; returns true + writes argmax id when want_token
-  bool dbg = getenv("GDEC_DEBUG") != nullptr;
-  bool perf = getenv("GDEC_PERF") != nullptr;
-  bool qsa_loop = getenv("GDEC_QSA_LOOP") != nullptr;  // prefill QSA fallback
-  bool qsa_global_v = getenv("GDEC_QSA_GLOBAL_V") != nullptr;
-  bool moe_naive = getenv("GDEC_MOE_NAIVE") != nullptr;  // prefill MoE fallback
+  bool dbg = getenv("QWENOX_DEBUG") != nullptr;
+  bool perf = getenv("QWENOX_PERF") != nullptr;
+  bool qsa_loop = getenv("QWENOX_QSA_LOOP") != nullptr;  // prefill QSA fallback
+  bool qsa_global_v = getenv("QWENOX_QSA_GLOBAL_V") != nullptr;
+  bool moe_naive = getenv("QWENOX_MOE_NAIVE") != nullptr;  // prefill MoE fallback
   // Small batches: per-pair naive gemv reads ~the same expert bytes as the
   // packed path (few shared experts) but at ~2x its effective bandwidth
   // (measured: P=8 chunk 0.19s -> 0.14s). 0 disables the auto switch.
   int moe_naive_max = [] {
-    const char* e = getenv("GDEC_MOE_NAIVE_MAX");
+    const char* e = getenv("QWENOX_MOE_NAIVE_MAX");
     return e ? atoi(e) : 16;
   }();
-  // Default small-P down path; GDEC_MOE_DOWN_ATOMIC restores the old
+  // Default small-P down path; QWENOX_MOE_DOWN_ATOMIC restores the old
   // per-expert atomic accumulation for numerical/performance comparisons.
   bool moe_down_topk =
-      moe_deterministic && getenv("GDEC_MOE_DOWN_ATOMIC") == nullptr;
-  bool moe_ordered = getenv("GDEC_MOE_ORDERED") != nullptr;  // diagnostic: expert-order scatter
-  bool moe_host_route = getenv("GDEC_MOE_HOST_ROUTE") != nullptr;
-  bool moe_untiled = getenv("GDEC_MOE_UNTILED") != nullptr;
-  bool moe_fp32_io = getenv("GDEC_MOE_FP32_IO") != nullptr;
-  bool moe_up_legacy = getenv("GDEC_MOE_UP_LEGACY") != nullptr;
-  bool moe_up_no_table = getenv("GDEC_MOE_UP_NO_TABLE") != nullptr;
-  bool moe_down_no_table = getenv("GDEC_MOE_DOWN_NO_TABLE") != nullptr;
-  bool moe_reduce_old = getenv("GDEC_MOE_REDUCE_OLD") != nullptr;
+      moe_deterministic && getenv("QWENOX_MOE_DOWN_ATOMIC") == nullptr;
+  bool moe_ordered = getenv("QWENOX_MOE_ORDERED") != nullptr;  // diagnostic: expert-order scatter
+  bool moe_host_route = getenv("QWENOX_MOE_HOST_ROUTE") != nullptr;
+  bool moe_untiled = getenv("QWENOX_MOE_UNTILED") != nullptr;
+  bool moe_fp32_io = getenv("QWENOX_MOE_FP32_IO") != nullptr;
+  bool moe_up_legacy = getenv("QWENOX_MOE_UP_LEGACY") != nullptr;
+  bool moe_up_no_table = getenv("QWENOX_MOE_UP_NO_TABLE") != nullptr;
+  bool moe_down_no_table = getenv("QWENOX_MOE_DOWN_NO_TABLE") != nullptr;
+  bool moe_reduce_old = getenv("QWENOX_MOE_REDUCE_OLD") != nullptr;
   // bf16 pair rows from the deterministic down kernel; the router weight is
   // applied in fp32 by k_moe_reduce_pw_bf16 instead of pre-multiplied in fp32.
-  bool moe_pairs_bf16 = getenv("GDEC_MOE_PAIRS_BF16") != nullptr;
+  bool moe_pairs_bf16 = getenv("QWENOX_MOE_PAIRS_BF16") != nullptr;
   // hgn q4cp prefill MoE (P > moe_naive_max) via the LUT-decode F16 WMMA kernels
   // (27_kernels_moe_lut.inc, same dataflow as moe_gguf). Default on,
-  // GDEC_MOE_Q4W=0 restores GDEC_MOE_LT / tiled k_moe_w4. When on, GDEC_MOE_LT is
+  // QWENOX_MOE_Q4W=0 restores QWENOX_MOE_LT / tiled k_moe_w4. When on, QWENOX_MOE_LT is
   // ignored (no LT buffers); decode (P <= moe_naive_max) is untouched.
   bool moe_q4w = moe_q4w_env();
-  bool moe_lt = getenv("GDEC_MOE_LT") != nullptr && !moe_q4w;  // prefill MoE: dequant + per-expert hipBLASLt
+  bool moe_lt = getenv("QWENOX_MOE_LT") != nullptr && !moe_q4w;  // prefill MoE: dequant + per-expert hipBLASLt
   // Validated PP dataflow changes. Unset each switch to restore its baseline.
   // Keep the P<=8 direct GEMV path's input precision and scratch lifetime.
-  bool pp_moe_out = getenv("GDEC_PP_MOE_OUT") != nullptr;
-  bool moe_lt_bf16 = getenv("GDEC_MOE_LT_BF16") != nullptr;  // bf16 GEMM outputs (LT path)
-  bool moe_lt_cmp = getenv("GDEC_MOE_LT_CMP") != nullptr;  // debug: in-run fused reference diff
-  bool moe_lt_ovl = getenv("GDEC_MOE_LT_OVL") != nullptr;  // overlap next group's dequant with current GEMMs (LT path)
+  bool pp_moe_out = getenv("QWENOX_PP_MOE_OUT") != nullptr;
+  bool moe_lt_bf16 = getenv("QWENOX_MOE_LT_BF16") != nullptr;  // bf16 GEMM outputs (LT path)
+  bool moe_lt_cmp = getenv("QWENOX_MOE_LT_CMP") != nullptr;  // debug: in-run fused reference diff
+  bool moe_lt_ovl = getenv("QWENOX_MOE_LT_OVL") != nullptr;  // overlap next group's dequant with current GEMMs (LT path)
   // LT loses below ~4K tokens (512 tiny per-expert launches + the d_eoff sync
   // cost more than the GEMM wins; measured 2026-09-10: +0.7s @2K, wash @8K).
-  int moe_lt_min = getenv("GDEC_MOE_LT_MIN") ? atoi(getenv("GDEC_MOE_LT_MIN")) : 4096;
-  bool gdn_loop = getenv("GDEC_GDN_LOOP") != nullptr;  // prefill GDN fallback
-  bool gdn_nosplit = getenv("GDEC_GDN_NOSPLIT") != nullptr;  // single-kernel GDN fallback
-  bool gdn_nostrip = getenv("GDEC_GDN_NOSTRIP") != nullptr;  // old inter (no strip)
-  bool gdn_stream = getenv("GDEC_GDN_STREAM") != nullptr;  // four-chunk workspace window
+  int moe_lt_min = getenv("QWENOX_MOE_LT_MIN") ? atoi(getenv("QWENOX_MOE_LT_MIN")) : 4096;
+  bool gdn_loop = getenv("QWENOX_GDN_LOOP") != nullptr;  // prefill GDN fallback
+  bool gdn_nosplit = getenv("QWENOX_GDN_NOSPLIT") != nullptr;  // single-kernel GDN fallback
+  bool gdn_nostrip = getenv("QWENOX_GDN_NOSTRIP") != nullptr;  // old inter (no strip)
+  bool gdn_stream = getenv("QWENOX_GDN_STREAM") != nullptr;  // four-chunk workspace window
   int gdn_window_chunks = [] {
-    const char* e = getenv("GDEC_GDN_WINDOW_CHUNKS");
+    const char* e = getenv("QWENOX_GDN_WINDOW_CHUNKS");
     return e ? std::max(1, atoi(e)) : 4;
   }();
-  bool gdn_wave = getenv("GDEC_GDN_WAVE") != nullptr;  // column-local triangular solve
-  bool gdn_pipe = getenv("GDEC_GDN_PIPE") != nullptr;  // intra/strip two-stream window pipeline (strip path)
-  bool gdn_pipe2 = getenv("GDEC_GDN_PIPE2") != nullptr;  // fp16-resident WMMA intra (chunk-looped)
-  bool gdn_fused = getenv("GDEC_GDN_FUSED") != nullptr;  // intra+strip fused, block-per-head persistent (no ws)
-  bool gr_scat4 = getenv("GDEC_GR_SCAT4") != nullptr;  // one-block-per-token GR scatter+norm
-  bool gdn_ut5 = getenv("GDEC_GDN_UT5") != nullptr;  // blocked triangular inverse
-  bool ple_loop = getenv("GDEC_PLE_LOOP") != nullptr;  // prefill PLE fallback
-  bool prof = getenv("GDEC_PROF") != nullptr;  // host-side phase timing
+  bool gdn_wave = getenv("QWENOX_GDN_WAVE") != nullptr;  // column-local triangular solve
+  bool gdn_pipe = getenv("QWENOX_GDN_PIPE") != nullptr;  // intra/strip two-stream window pipeline (strip path)
+  bool gdn_pipe2 = getenv("QWENOX_GDN_PIPE2") != nullptr;  // fp16-resident WMMA intra (chunk-looped)
+  bool gdn_fused = getenv("QWENOX_GDN_FUSED") != nullptr;  // intra+strip fused, block-per-head persistent (no ws)
+  bool gr_scat4 = getenv("QWENOX_GR_SCAT4") != nullptr;  // one-block-per-token GR scatter+norm
+  bool gdn_ut5 = getenv("QWENOX_GDN_UT5") != nullptr;  // blocked triangular inverse
+  bool ple_loop = getenv("QWENOX_PLE_LOOP") != nullptr;  // prefill PLE fallback
+  bool prof = getenv("QWENOX_PROF") != nullptr;  // host-side phase timing
   double p_topk_wait = 0, p_bucket = 0, p_gemm = 0, p_pleh = 0,
          p_ple_wait = 0;
   // perf accumulators (ms): embed, ple, attn, moe, head
@@ -2151,7 +2151,7 @@ struct GpuModel {
     // engine's k1 WMMA config for (2560,6144) is ~1.3x faster than the
     // harness's old-d3 reference, so the true d3 ratio vs the OFF path is
     // ~1.0, not 1.25; end-to-end +1.8% < the 3% default-on bar, so MAXP
-    // defaults are 0 (off). Opt in with GDEC_DENSE_LUT_MAXP_{D3,D9,DZ,DQ}
+    // defaults are 0 (off). Opt in with QWENOX_DENSE_LUT_MAXP_{D3,D9,DZ,DQ}
     // (80%-of-crossover values 3200/1200/1600/1400). The weight runs as a
     // single-"expert" moe_lut_down with plain 64-slot tiles — the MoE-mt
     // BN=128 path (v2 MoE station) is not involved; the activation enters as
@@ -2162,23 +2162,23 @@ struct GpuModel {
     // mean 0.121637 vs off 0.121246, +0.0004 << 0.002). P<1024 keeps the Lt
     // fallback (MINP); =0 disables.
     static const int dlut_minp = [] {
-      const char* s = getenv("GDEC_DENSE_LUT_MINP");
+      const char* s = getenv("QWENOX_DENSE_LUT_MINP");
       return s && *s ? atoi(s) : 1024;
     }();
     static const int dlut_d3 = [] {
-      const char* s = getenv("GDEC_DENSE_LUT_MAXP_D3");
+      const char* s = getenv("QWENOX_DENSE_LUT_MAXP_D3");
       return s && *s ? atoi(s) : 0;
     }();
     static const int dlut_d9 = [] {
-      const char* s = getenv("GDEC_DENSE_LUT_MAXP_D9");
+      const char* s = getenv("QWENOX_DENSE_LUT_MAXP_D9");
       return s && *s ? atoi(s) : 0;
     }();
     static const int dlut_dz = [] {
-      const char* s = getenv("GDEC_DENSE_LUT_MAXP_DZ");
+      const char* s = getenv("QWENOX_DENSE_LUT_MAXP_DZ");
       return s && *s ? atoi(s) : 0;
     }();
     static const int dlut_dq = [] {
-      const char* s = getenv("GDEC_DENSE_LUT_MAXP_DQ");
+      const char* s = getenv("QWENOX_DENSE_LUT_MAXP_DQ");
       return s && *s ? atoi(s) : 0;
     }();
     if (w.dtype == 5 && P >= dlut_minp && P <= maxbatch_cap && !(N % 128) &&
@@ -2197,7 +2197,7 @@ struct GpuModel {
           dllog = true;
           fprintf(stderr,
                   "dense lut: q4cp d3<=%d d9<=%d dz<=%d dq<=%d minp=%d "
-                  "(GDEC_DENSE_LUT_MAXP_D3/D9/DZ/DQ, GDEC_DENSE_LUT_MINP)\n",
+                  "(QWENOX_DENSE_LUT_MAXP_D3/D9/DZ/DQ, QWENOX_DENSE_LUT_MINP)\n",
                   dlut_d3, dlut_d9, dlut_dz, dlut_dq, dlut_minp);
         }
         const int nt = (P + 63) / 64;
@@ -2228,7 +2228,7 @@ struct GpuModel {
         return;
       }
     }
-    static const bool gemm_dbg = getenv("GDEC_GEMM_DBG") != nullptr;
+    static const bool gemm_dbg = getenv("QWENOX_GEMM_DBG") != nullptr;
     if (gemm_dbg)
       fprintf(stderr, "gemm-LT: dtype=%d N=%llu K=%llu P=%d xbf=%d xs=%llu\n",
               w.dtype, (unsigned long long)N, (unsigned long long)K, P,
@@ -2260,7 +2260,7 @@ struct GpuModel {
       }
     }
     float one = 1.f, zero = 0.f;
-    if (getenv("GDEC_GEMM_RB")) {  // fallback: rocBLAS default algo
+    if (getenv("QWENOX_GEMM_RB")) {  // fallback: rocBLAS default algo
       rocblas_set_stream(rbh, g_str);
       rocblas_status st = rocblas_gemm_ex(
           rbh, rocblas_operation_transpose, rocblas_operation_none, (rocblas_int)N,
@@ -2279,7 +2279,7 @@ struct GpuModel {
                       .count();
       return;
     }
-    // Phase 3g: self-written bf16 WMMA GEMM (GDEC_GEMM_WMMA=1). Diverts the
+    // Phase 3g: self-written bf16 WMMA GEMM (QWENOX_GEMM_WMMA=1). Diverts the
     // winning projection shapes at P >= 1024 to k_gemm_wmma — d3 config
     // (512t w2x8 f4x2, gm=16) for N=2560 K=6144, d9 (256t w2x4 f4x4) for
     // N=6144/10240/12288 K=2560 (gm=4) and the narrow-K/N winners
@@ -2298,10 +2298,10 @@ struct GpuModel {
     //  - (2560,6144) out-proj: k1 BM=64 BP=128, 16.4 ms vs 21.1-21.6 ms for
     //    the old d3 512t config and Lt (x1.3).
     // The K=2560 d9 shapes and (2560,640) stay on d9 (KST=64 configs lose
-    // there). GDEC_GEMM_NO_K64 restores the old routing (Lt / d3) for A/B.
-    // GDEC_GEMM_RB above takes precedence if both are set.
-    static const bool gemm_wmma = getenv("GDEC_GEMM_WMMA") != nullptr;
-    static const bool gemm_k64 = getenv("GDEC_GEMM_NO_K64") == nullptr;
+    // there). QWENOX_GEMM_NO_K64 restores the old routing (Lt / d3) for A/B.
+    // QWENOX_GEMM_RB above takes precedence if both are set.
+    static const bool gemm_wmma = getenv("QWENOX_GEMM_WMMA") != nullptr;
+    static const bool gemm_k64 = getenv("QWENOX_GEMM_NO_K64") == nullptr;
     if (gemm_dbg)
       fprintf(stderr, "gemm-ptr: N=%llu K=%llu P=%d wp=%p xp=%p y=%p\n",
               (unsigned long long)N, (unsigned long long)K, P,
@@ -2338,7 +2338,7 @@ struct GpuModel {
         return;
       }
       const bool gw_d3 = (N == 2560 && K == 6144);
-      static const bool d9_old0 = getenv("GDEC_GEMM_D9_OLD") != nullptr;
+      static const bool d9_old0 = getenv("QWENOX_GEMM_D9_OLD") != nullptr;
       // aggr: N=640 (shared gate/up, indexer proj; was hipBLASLt ~1.7 ms @16K)
       // and N=512 join the 128x128 tile route (1.33 / 1.06 ms @16K).
       const bool gw_d9 = (K == 2560 && (N == 6144 || N == 10240 || N == 12288 ||
@@ -2350,8 +2350,8 @@ struct GpuModel {
             (unsigned)(((P + 127) / 128) * (int)((N + 255) / 256));
         // aggr 10-05 (tools/gemm_tune d9 @16384): 128x128 w2x2 f4x4 128-thread
         // tile beats the 128x256 d9 one — qkv N=10240 22.0 vs 22.8 ms (gm=4),
-        // z N=6144 12.8 vs 13.8 ms (gm=1). GDEC_GEMM_D9_OLD=1 restores.
-        static const bool d9_old = getenv("GDEC_GEMM_D9_OLD") != nullptr;
+        // z N=6144 12.8 vs 13.8 ms (gm=1). QWENOX_GEMM_D9_OLD=1 restores.
+        static const bool d9_old = getenv("QWENOX_GEMM_D9_OLD") != nullptr;
         if (gw_d9 && !d9_old) {
           const unsigned g2 = (unsigned)(((P + 127) / 128) * (int)((N + 127) / 128));
           k_gemm_wmma<128, 128, 2, 2, 4, 4, 32, 128>
@@ -2459,7 +2459,7 @@ struct GpuModel {
   // MoE path; removed with it (3d-1 fused W4 kernels replace it).
 
   // bf16 A (weights, [N][K] k-contiguous -> op T) x bf16 B ([P][K] k-contiguous
-  // -> op N) -> C[N,P] (n-contiguous), fp32 or bf16 out. Used by GDEC_MOE_LT
+  // -> op N) -> C[N,P] (n-contiguous), fp32 or bf16 out. Used by QWENOX_MOE_LT
   // per-expert GEMMs. Algo cached per (N,K,P,outbf16); on miss trust heuristic
   // index 4 (the fast Tensile kernel for every projection shape measured in
   // tools/moe_lt_bench.cu scan mode; per-M validation syncs would stall the
@@ -2523,28 +2523,28 @@ struct GpuModel {
   // bit-identical, and the P x 10240 fp32 G never goes to DRAM. Writes d_xb
   // (fp32) + d_xbf16 exactly like the unfused pair. Returns false (caller
   // runs the unfused pair) unless that exact route would have been taken.
-  // Opt-out GDEC_HC_FUSE=0 (tools/hcmix_verify.sh).
-  // B2-2 (GDEC_HC_NORHAT=1 显式开启，默认关): sc 非空时 Rh 实参应是未归一化
+  // Opt-out QWENOX_HC_FUSE=0 (tools/hcmix_verify.sh).
+  // B2-2 (QWENOX_HC_NORHAT=1 显式开启，默认关): sc 非空时 Rh 实参应是未归一化
   // 的 d_Rb，epilogue 现场乘 (R*sc)*(1+Hw)（见 k_gemm_wmma Epi=1 注释），Rhat
   // 不落盘。终判否决（2026-10-03，128k@16384 背靠背 1175.7 vs 1216.4 = -3.3%，
   // KPROF hc+hc2 +293ms/chunk）：Epi=2 staging 归一化的 VALU + Sc/Hw 额外读
   // 超过省下的 Rhat 落盘带宽；正确性全过（c8192 0.08129 vs 0.08249），代码留存。
   bool hc_norhat(int P) const {
-    static const bool on = getenv("GDEC_HC_NORHAT") != nullptr &&
-                           !env_zero("GDEC_HC_NORHAT") &&
-                           !env_zero("GDEC_HC_FUSE") &&
-                           getenv("GDEC_GEMM_WMMA") != nullptr &&
-                           getenv("GDEC_GEMM_RB") == nullptr &&
-                           getenv("GDEC_GEMM_NO_K64") == nullptr;
+    static const bool on = getenv("QWENOX_HC_NORHAT") != nullptr &&
+                           !env_zero("QWENOX_HC_NORHAT") &&
+                           !env_zero("QWENOX_HC_FUSE") &&
+                           getenv("QWENOX_GEMM_WMMA") != nullptr &&
+                           getenv("QWENOX_GEMM_RB") == nullptr &&
+                           getenv("QWENOX_GEMM_NO_K64") == nullptr;
     return on && prefill_fused && gr_bf16 && P >= 1024 && g_cfg.branches == 4 &&
            (uint64_t)g_cfg.d * 4 == 10240 &&
            ((((uintptr_t)d_t320b | (uintptr_t)d_xbf16b) & 15) == 0);
   }
   bool hc_up_fused(const WView& w, int P, const float* sc = nullptr,
                    const float* hw = nullptr, bool x_ready = false) {
-    static const bool on = !env_zero("GDEC_HC_FUSE") &&
-                           getenv("GDEC_GEMM_WMMA") != nullptr &&
-                           getenv("GDEC_GEMM_RB") == nullptr;
+    static const bool on = !env_zero("QWENOX_HC_FUSE") &&
+                           getenv("QWENOX_GEMM_WMMA") != nullptr &&
+                           getenv("QWENOX_GEMM_RB") == nullptr;
     const uint64_t N = w.rows, K = w.cols;
     if (!on || P < 1024 || N != 10240 || K != 320 || g_cfg.branches != 4 ||
         (uint64_t)g_cfg.d * 4 != N)
@@ -2574,7 +2574,7 @@ struct GpuModel {
                 bool norhat = false) {
     char buf[128];
     snprintf(buf, sizeof buf, "%s.input_mix_weight_down.weight", prefix.c_str());
-    static const bool mixsplit = !env_zero("GDEC_HC_MIXSPLIT");
+    static const bool mixsplit = !env_zero("QWENOX_HC_MIXSPLIT");
     const WView wdn = wview(ckpt.at(buf));
     if (norhat && mixsplit && wdn.dtype != 0 && wdn.rows == 320 && wdn.cols == 10240) {
       // aggr 10-05: branch-split mix-down. W' = W*(1+hw) (dequant scratch,
@@ -2644,8 +2644,8 @@ struct GpuModel {
     if (prefill_fused) {
       if (gr_bf16) {
         // verify sizes: 4 column slices over P*4 blocks (per-column arithmetic
-        // single-thread, unchanged). GDEC_COMBINE_CS=0 keeps P blocks.
-        static const bool comb_cs = !env_zero("GDEC_COMBINE_CS");
+        // single-thread, unchanged). QWENOX_COMBINE_CS=0 keeps P blocks.
+        static const bool comb_cs = !env_zero("QWENOX_COMBINE_CS");
         if (comb_cs && P <= 8)
           k_gr_combine_b_hc_bf16<<<dim3(P, 4), 256, 0, g_str>>>(
               d_Gb, d_Rhatbf16, d_xb, g_cfg.d, g_cfg.branches, P, d_xbf16,
@@ -2690,9 +2690,9 @@ struct GpuModel {
   // whole P x 10240 bf16 Rhat, ~0.97 ms at P=8192) is skipped. R / Rhat are
   // bit-identical; w4 differs in summation order only (fp32, err/sum|terms|
   // ~1e-8 vs ~1e-7 for any sequential fp32 dot; tools/injfuse_proto.cu).
-  // Opt-out GDEC_HC_INJ_FUSE=0 (tools/injfuse_verify.sh: KLD + speed).
+  // Opt-out QWENOX_HC_INJ_FUSE=0 (tools/injfuse_verify.sh: KLD + speed).
   bool inj_fuse_on() const {
-    static const bool on = !env_zero("GDEC_HC_INJ_FUSE");
+    static const bool on = !env_zero("QWENOX_HC_INJ_FUSE");
     return on && gr_bf16 && prefill_fused && !gr_scat4 && g_cfg.d <= 2560 &&
            g_cfg.branches == 4;
   }
@@ -2780,12 +2780,12 @@ struct GpuModel {
       float* const sc = nr ? d_hcsc : nullptr;
       // Verify sizes (P<=8): 1 token/block -> 4P blocks instead of 4*ceil(P/4).
       // Per-(t,b) arithmetic is T-invariant (proto: R/Rhat bit-identical), the
-      // 4-token serial loop was pure latency at 4 blocks. GDEC_SCAT_T1=0: T=4.
-      static const bool scat_t1 = !env_zero("GDEC_SCAT_T1");
+      // 4-token serial loop was pure latency at 4 blocks. QWENOX_SCAT_T1=0: T=4.
+      static const bool scat_t1 = !env_zero("QWENOX_SCAT_T1");
       // v2 (coalesced + pipelined): kernel −5% only (this op is at ~190 GB/s,
-      // bandwidth-bound) and not bit-identical -> opt-in GDEC_GR_SCAT_V2=1.
-      static const bool scat_v2 = getenv("GDEC_GR_SCAT_V2") && !env_zero("GDEC_GR_SCAT_V2");
-      static const bool scat_t8 = getenv("GDEC_GR_SCAT_T8") != nullptr;
+      // bandwidth-bound) and not bit-identical -> opt-in QWENOX_GR_SCAT_V2=1.
+      static const bool scat_v2 = getenv("QWENOX_GR_SCAT_V2") && !env_zero("QWENOX_GR_SCAT_V2");
+      static const bool scat_t8 = getenv("QWENOX_GR_SCAT_T8") != nullptr;
       if (scat_v2 && scat_t8 && g_cfg.d == 2560 && P > 8) {
         if (write_done)
           k_gr_scatter_norm_inj_bf16_v2<8, false><<<4 * ((P + 7) / 8), 256, 0, g_str>>>(
@@ -2842,7 +2842,7 @@ struct GpuModel {
 
   // GDN: projections batched. Chunked path: conv/l2norm/gates batched, then
   // k_gdn_chunk (chunk=64, fp32) advances S and writes all outputs at once.
-  // GDEC_GDN_LOOP=1 falls back to the per-token recurrence loop.
+  // QWENOX_GDN_LOOP=1 falls back to the per-token recurrence loop.
   void gdn_b(int l, int gi, int P) {
     char buf[128];
     KP_SUB("gdn:proj");
@@ -2865,8 +2865,8 @@ struct GpuModel {
     if (!gdn_loop) {
       KP_SUB("gdn:conv");
       // conv+silu and the q/k l2norm in one pass (k_gdn_conv_l2n_b, bit-exact
-      // vs the pair, tools/convl2_verify.sh); opt-out GDEC_GDN_CONVL2=0.
-      static const bool convl2 = !env_zero("GDEC_GDN_CONVL2");
+      // vs the pair, tools/convl2_verify.sh); opt-out QWENOX_GDN_CONVL2=0.
+      static const bool convl2 = !env_zero("QWENOX_GDN_CONVL2");
       const bool cl2 = convl2 && P <= 65535;
       int64_t tot = (int64_t)P * 10240 / 4;  // 4 channels per thread (float4)
       if (cl2)
@@ -2927,7 +2927,7 @@ struct GpuModel {
         // Keep producer and consumer close; S carries the exact recurrence
         // across windows and the last window alone can contain a padded chunk.
         int window = gdn_stream ? 64 * gdn_window_chunks : P;
-        // GDEC_GDN_PIPE (strip path): intra stays on g_str, strips run on a
+        // QWENOX_GDN_PIPE (strip path): intra stays on g_str, strips run on a
         // side stream. ws is double-buffered by window parity: intra(w) waits
         // for strip(w-2) (its ws slot's previous reader), strip(w) waits for
         // intra(w) and stays stream-serial (the S recurrence). Event objects
@@ -3018,7 +3018,7 @@ struct GpuModel {
     gemm(wview(ckpt.at(buf)), d_qkvb + 4096, d_yb, P, 10240 /*row stride*/);
   }
 
-  // Debug (GDEC_ATTN_HASH): per prefill chunk and QSA layer, hashes of the
+  // Debug (QWENOX_ATTN_HASH): per prefill chunk and QSA layer, hashes of the
   // attention inputs (K / V / transposed V over valid rows [0, base+P), the
   // transposed-V tail slots [base+P, roundup4), q, selections) and the output.
   void dbg_attn_hash(int qi, int base, int P, const uint16_t* kc, const uint16_t* vc,
@@ -3070,7 +3070,7 @@ struct GpuModel {
     if (dense_P > 0) {
       // F1 (§11.1)：bf16 KV + qsa_wmma 时稠密前缀也走 k_qsa_wmma 的 Dense 变体
       // （grid=(dense_P,2)，first=kbase=base，selected 不用）。fp32 KV、
-      // GDEC_QSA_DENSE（dense_P=P 全稠密）保持原 fp32 标量路径。
+      // QWENOX_QSA_DENSE（dense_P=P 全稠密）保持原 fp32 标量路径。
       bool dense_launched = false;
       if constexpr (sizeof(KVT) == 2) {
         if (qsa_wmma && !qsa_dense) {
@@ -3179,7 +3179,7 @@ struct GpuModel {
                 d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel, first_abs,
                 base, nullptr, dvb);
         } else if (qsa_wmma) {
-          // GDEC_QSA_WMMA=1: WMMA bf16 sparse flash (256 thr), see k_qsa_wmma.
+          // QWENOX_QSA_WMMA=1: WMMA bf16 sparse flash (256 thr), see k_qsa_wmma.
           if (ptab)
             k_qsa_wmma<false, true><<<dim3(nsparse, 2), 256, 0, g_str>>>(
                 d_qsb, kc, vc, nullptr, d_attnb, P, 256, 2, 24, sel, first_abs, base,
@@ -3305,15 +3305,15 @@ struct GpuModel {
               old, p, kv_pool.nfree(), kv_pool_pages);
   }
   long long kv_cow_count = 0;
-  // GDEC_KV_ZERO=1 (debug, A5 hunt): no row a sequence has not written holds
+  // QWENOX_KV_ZERO=1 (debug, A5 hunt): no row a sequence has not written holds
   // another sequence's data -- unpaged: the whole trunk KV/ik cache is zeroed
   // on reset_state; paged: every freshly mapped page is zeroed. If outputs
   // then agree across modes, some kernel reads rows >= pos and uses them.
-  // debug: GDEC_KV_ZERO=1 zeroes all of K/V/Vt/ik; or a subset of letters
-  // k v t i (e.g. GDEC_KV_ZERO=i), for both the unpaged and the paged zeroing.
-  bool kv_zero_dbg = getenv("GDEC_KV_ZERO") != nullptr;
+  // debug: QWENOX_KV_ZERO=1 zeroes all of K/V/Vt/ik; or a subset of letters
+  // k v t i (e.g. QWENOX_KV_ZERO=i), for both the unpaged and the paged zeroing.
+  bool kv_zero_dbg = getenv("QWENOX_KV_ZERO") != nullptr;
   bool kv_zero_has(char c) {
-    const char* e = getenv("GDEC_KV_ZERO");
+    const char* e = getenv("QWENOX_KV_ZERO");
     return e && (!strcmp(e, "1") || strchr(e, c));
   }
   void kv_zero_unpaged() {
@@ -3444,35 +3444,35 @@ struct GpuModel {
   // P >= 1024 the fastest listed solution is timed once (first such call,
   // one ~0.1 s sync stall) and reused for every P; it is only adopted if it
   // beats sgemm, and any non-success launch falls back to sgemm.
-  // GDEC_IPROJ_SGEMM=1 keeps plain rocblas_sgemm (A/B).
+  // QWENOX_IPROJ_SGEMM=1 keeps plain rocblas_sgemm (A/B).
   int iproj_sol = INT_MIN;  // INT_MIN = not picked yet, INT_MAX = use sgemm
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"  // beta API
   void iproj_sgemm(const float* w, const float* x, float* y, int P) {
     const float one = 1.f, zero = 0.f;
-    static const bool plain = getenv("GDEC_IPROJ_SGEMM") != nullptr;
+    static const bool plain = getenv("QWENOX_IPROJ_SGEMM") != nullptr;
     // decode-P (<=8) multi-row fp32 GEMV in place of rocblas_sgemm's
     // MT32x32x8 (20 blocks, ~110 us at P=4 vs ~36 us streaming the 6.5 MB
     // weight once). NOT bit-exact vs sgemm (lane-split reorder); ktest
     // maxrel 1e-5 vs fp64 (same order as sgemm's own fp32 error) and
-    // 8K/32K MTP+chain ids matched base exactly. GDEC_IPROJ_GEMV=0 opt-out.
-    static const bool use_gemv = !env_zero("GDEC_IPROJ_GEMV");
+    // 8K/32K MTP+chain ids matched base exactly. QWENOX_IPROJ_GEMV=0 opt-out.
+    static const bool use_gemv = !env_zero("QWENOX_IPROJ_GEMV");
     if (use_gemv && !plain && P >= 1 && P <= 8) {
       const unsigned blocks = (640 + 15) / 16;  // 16 warps (512 thr) per block
       switch (P) {
-#define GDEC_IPROJ_GV(PP)                                                \
+#define QWENOX_IPROJ_GV(PP)                                                \
   case PP:                                                               \
     k_f32_gemv_mr<PP><<<blocks, 512, 0, g_str>>>(w, x, y, 640, 2560);    \
     break;
-        GDEC_IPROJ_GV(1)
-        GDEC_IPROJ_GV(2)
-        GDEC_IPROJ_GV(3)
-        GDEC_IPROJ_GV(4)
-        GDEC_IPROJ_GV(5)
-        GDEC_IPROJ_GV(6)
-        GDEC_IPROJ_GV(7)
-        GDEC_IPROJ_GV(8)
-#undef GDEC_IPROJ_GV
+        QWENOX_IPROJ_GV(1)
+        QWENOX_IPROJ_GV(2)
+        QWENOX_IPROJ_GV(3)
+        QWENOX_IPROJ_GV(4)
+        QWENOX_IPROJ_GV(5)
+        QWENOX_IPROJ_GV(6)
+        QWENOX_IPROJ_GV(7)
+        QWENOX_IPROJ_GV(8)
+#undef QWENOX_IPROJ_GV
       }
       return;
     }
@@ -3556,7 +3556,7 @@ struct GpuModel {
 
   // QSA: projections batched. Flash path: qsplit/norm/rope batched, KV rows
   // bulk-copied to cache slots 0..P-1, one causal flash kernel over all
-  // positions. GDEC_QSA_LOOP=1 falls back to the per-token loop (debug).
+  // positions. QWENOX_QSA_LOOP=1 falls back to the per-token loop (debug).
   // Indexer + score/select phase of qsa_b: host-driven, base-dependent grids,
   // so verify graph capture (P3-B) runs it eagerly between graph segments.
   void qsa_idx_b(int l, int qi, int P, int base) {
@@ -3569,7 +3569,7 @@ struct GpuModel {
       ensure_rope_tab(g_cfg.rope_theta, 64);
       ensure_rope_cs(base, P);
       snprintf(buf, sizeof buf, "layers.%d.self_attn.indexer.index_qk_proj.weight", l);
-      if (getenv("GDEC_VGDUMP")) {  // P3-B: xf16 cache state at the idx gemm
+      if (getenv("QWENOX_VGDUMP")) {  // P3-B: xf16 cache state at the idx gemm
         fprintf(stderr, "[xc%d] P=%d hit=%d xf16P=%d xf16K=%d\n", l, P,
                 (int)(xf16_src == d_xb && xf16_xs == (size_t)g_cfg.d &&
                       xf16_P == P && xf16_K == g_cfg.d),
@@ -3593,7 +3593,7 @@ struct GpuModel {
       // absolute 4-token blocks [base/4, (base+P)/4); a left-straddling block
       // (base%4 != 0) is completed with history rows from the raw ring
       int nb = (base + P) / 4, b0 = base / 4;
-      if (getenv("GDEC_VGDUMP") && P >= 2 && P <= 16 && !vg_capturing_) {
+      if (getenv("QWENOX_VGDUMP") && P >= 2 && P <= 16 && !vg_capturing_) {
         char tag[12];
         snprintf(tag, sizeof tag, "ir0_%d", l);
         vg_dump_buf(tag, P, d_iraw + (size_t)qi * 512, 512 * 4);
@@ -3642,7 +3642,7 @@ struct GpuModel {
       const int a0 = std::max(2051, base);
       const int grid =
           2051 + (a0 - 2051 + INDEX_BATCH - 1) / INDEX_BATCH * INDEX_BATCH;
-      if (getenv("GDEC_VGDUMP")) {  // P3-B bisect: selection inputs
+      if (getenv("QWENOX_VGDUMP")) {  // P3-B bisect: selection inputs
         char tag[12];
         // split keys hash: prefix blocks vs last two blocks (freshly pooled)
         snprintf(tag, sizeof tag, "ikp%d", l);
@@ -3681,7 +3681,7 @@ struct GpuModel {
         int nxt = first < grid ? min(grid, base + P)
                                : min(first + INDEX_BATCH, base + P);
         int count = nxt - first;
-        if (index_fused2 && count >= 16 && getenv("GDEC_INDEX_OLDSEL") == nullptr) {
+        if (index_fused2 && count >= 16 && getenv("QWENOX_INDEX_OLDSEL") == nullptr) {
           int* const selrow = d_iselected + (size_t)(first - base) * 512;  // batch-local
           if (index_f16()) {
             // C1: f16 WMMA 打分 + f16 score（复用 d_iscores 内存）+ f16 select
@@ -3731,7 +3731,7 @@ struct GpuModel {
                      count);
         first = nxt;
       }
-      if (getenv("GDEC_VGDUMP")) {
+      if (getenv("QWENOX_VGDUMP")) {
         char tag[12];
         snprintf(tag, sizeof tag, "is%d", l);
         vg_dump_buf(tag, P, d_iselected, (size_t)P * 512 * 4);
@@ -3776,8 +3776,8 @@ struct GpuModel {
       // P > 8: o_proj takes the dequant->bf16->GEMM path (P <= 8 would run
       // the multi-row GEMV on fp32 x), so the output gate + bf16 convert fuse
       // into k_sigmoid_gate_bf16_v4, which reads the gate half of d_qgb
-      // directly (qsplit skips its gs copy). GDEC_QSA_GATE_BF16=0 disables.
-      static const bool gate_bf16_on = !env_zero("GDEC_QSA_GATE_BF16");
+      // directly (qsplit skips its gs copy). QWENOX_QSA_GATE_BF16=0 disables.
+      static const bool gate_bf16_on = !env_zero("QWENOX_QSA_GATE_BF16");
       const bool gate_bf16 = gate_bf16_on && P > 8;
       KP_SUB("qsa:prep");
       k_qsa_qsplit<true><<<dim3(24, P), 256, 0, g_str>>>(
@@ -3807,7 +3807,7 @@ struct GpuModel {
         uint16_t* kc = d_kcb + qsa_off;
         uint16_t* vc = d_vcb + qsa_off;
         uint16_t* vct = vct_layer(qi);
-        if (vct && base > 0 && getenv("GDEC_VCT_CHECK")) {  // debug only
+        if (vct && base > 0 && getenv("QWENOX_VCT_CHECK")) {  // debug only
           static unsigned* d_chk = nullptr;
           if (!d_chk) CK(hipMalloc(&d_chk, 3 * sizeof(unsigned)));
           const unsigned init[3] = {0u, ~0u, 0u};
@@ -3884,9 +3884,9 @@ struct GpuModel {
             });
           }
         }
-        if (vct && getenv("GDEC_VCT_TAILZERO") && ((base + P) & 3)) {  // debug only
+        if (vct && getenv("QWENOX_VCT_TAILZERO") && ((base + P) & 3)) {  // debug only
           const int r0 = base + P, r1 = (r0 + 3) & ~3;
-          const char* tv = getenv("GDEC_VCT_TAILVAL");  // hex bf16 poison (debug)
+          const char* tv = getenv("QWENOX_VCT_TAILVAL");  // hex bf16 poison (debug)
           k_vct_zero_slots<<<(unsigned)(((size_t)(r1 - r0) * 512 + 255) / 256), 256, 0,
                              g_str>>>(vct, kvpt(), r0, r1,
                                       tv ? (uint16_t)strtoul(tv, nullptr, 16) : 0);
@@ -3895,7 +3895,7 @@ struct GpuModel {
         KP_SUB("qsa:flash");
         qsa_flash_b(kc, vc, P, dense_P, base, vct, kvpt(), dvb);
         KP_SUB_END();
-        if (base > 0 && getenv("GDEC_ATTN_HASH")) dbg_attn_hash(qi, base, P, kc, vc, vct);
+        if (base > 0 && getenv("QWENOX_ATTN_HASH")) dbg_attn_hash(qi, base, P, kc, vc, vct);
       }
       KP_SUB("qsa:gate");
       if (gate_bf16) {  // see qsplit above
@@ -3956,7 +3956,7 @@ struct GpuModel {
   // updated, acc/d_yb are not written and the caller skips gr_write_b.
   // ---- in-pass snapshot cut (see cut_abs) ----
   bool cut_snap_supported() const {
-    static const bool off = env_zero("GDEC_CUT_INPASS");
+    static const bool off = env_zero("QWENOX_CUT_INPASS");
     return !off && gdn_fused && !gdn_loop && !gdn_nosplit && gr_bf16 && !ple_loop;
   }
   void cut_alloc() {
@@ -4007,9 +4007,9 @@ struct GpuModel {
   }
 
   // d_routerb [P][512] -> d_topidsb/d_topwb. wave-per-token kernel (bit-
-  // identical, aggr 10-05); GDEC_ROUTER_W32=0 restores the block-per-token one.
+  // identical, aggr 10-05); QWENOX_ROUTER_W32=0 restores the block-per-token one.
   void router_topk_b(int P, int k) {
-    static const bool w32 = !env_zero("GDEC_ROUTER_W32");
+    static const bool w32 = !env_zero("QWENOX_ROUTER_W32");
     if (w32 && g_cfg.experts == 512 && k == 10)
       k_router_topk_w32<10><<<(P + 7) / 8, 256, 0, g_str>>>(d_routerb, d_topidsb, d_topwb, P);
     else
@@ -4023,9 +4023,9 @@ struct GpuModel {
     gemm(wview(ckpt.at(buf)), d_xb, d_routerb, P);
     int k = g_cfg.topk;
     router_topk_b(P, k);
-    // GDEC_MOE_UNION_LOG=1: distinct experts across the P rows (P<=8, i.e.
+    // QWENOX_MOE_UNION_LOG=1: distinct experts across the P rows (P<=8, i.e.
     // verify); decides whether naive-MoE expert dedup is worth it.
-    static const bool moe_union_log = getenv("GDEC_MOE_UNION_LOG") != nullptr;
+    static const bool moe_union_log = getenv("QWENOX_MOE_UNION_LOG") != nullptr;
     if (moe_union_log && P <= 8) {
       struct UStat {
         long long n = 0, uni = 0, slots = 0;
@@ -4051,11 +4051,11 @@ struct GpuModel {
         }
       S.n++; S.uni += u; S.slots += (long long)P * k;
     }
-    // GDEC_MOE_TOPIDS_DUMP=<file>: 把每次小 P 调用（2<=P<=32，即 verify/合批
+    // QWENOX_MOE_TOPIDS_DUMP=<file>: 把每次小 P 调用（2<=P<=32，即 verify/合批
     // 场景）的 topids 追加到文件，供 tools/c0_union.py 做跨序列专家并集分析。
     // 行格式：L <layer> B <base> P <P> 后接 P*k 个专家 id。默认零开销。
     static FILE* moe_dump = [] {
-      const char* f = getenv("GDEC_MOE_TOPIDS_DUMP");
+      const char* f = getenv("QWENOX_MOE_TOPIDS_DUMP");
       return f ? fopen(f, "w") : nullptr;
     }();
     if (moe_dump && P >= 2 && P <= 32) {
@@ -4084,8 +4084,8 @@ struct GpuModel {
     }
     // Shared expert first (its scratch d_guvb/d_hidb/d_xbf16b is dead before
     // the routed experts reuse it), so its add folds into the routed reduce.
-    // GDEC_MOE_SG_FUSE=0: old order + k_axpy_sg.
-    static const bool sg_fuse = !env_zero("GDEC_MOE_SG_FUSE");
+    // QWENOX_MOE_SG_FUSE=0: old order + k_axpy_sg.
+    static const bool sg_fuse = !env_zero("QWENOX_MOE_SG_FUSE");
     if (!moe_naive && P > moe_naive_max && sg_fuse && moe_q4w_ok(gu, dn, P)) {
       KP("moe:shared");
       moe_b_shared_ey(l, P);
@@ -4119,10 +4119,10 @@ struct GpuModel {
       // 不变）。09-28 HQ γ=4 实测：verify gg 351→338µs/层，减去 sort 7.3µs/层后
       // 净 +0.26 ms/轮（0.3%）——Cache 层级已接住绝大部分重复专家读（未排序 gg 等效
       // 262 GB/s，已超 DRAM 冷流率），单序列 P=5 收益低于门槛。
-      // 默认关，GDEC_MOE_SORT=1 启用（留待 D2 合批 R≥16、工作集远超 Cache 的场景）。
+      // 默认关，QWENOX_MOE_SORT=1 启用（留待 D2 合批 R≥16、工作集远超 Cache 的场景）。
       // P=1（串行/draft）单 token topk 专家天然不重复，跳过。
       static const bool moe_sort =
-          getenv("GDEC_MOE_SORT") != nullptr && !env_zero("GDEC_MOE_SORT");
+          getenv("QWENOX_MOE_SORT") != nullptr && !env_zero("QWENOX_MOE_SORT");
       const int* slot_order = nullptr;
       if (moe_sort && P >= 2 && P * k <= 256) {
         k_moe_sort_slots<<<1, 128, 0, g_str>>>(topidsb, P, k, 16, d_slot_order);
@@ -4239,7 +4239,7 @@ struct GpuModel {
         bool b16 = moe_lt_bf16;
         __hip_bfloat16* guv16 = (__hip_bfloat16*)d_guvb;
         // up phase: group dequant -> per-expert GEMM -> segment silu
-        // GDEC_MOE_LT_OVL pipeline: scratch is double-buffered (slots gi&1);
+        // QWENOX_MOE_LT_OVL pipeline: scratch is double-buffered (slots gi&1);
         // group gi+1's dequant runs on ovl_str while g_str runs group gi's
         // GEMMs. ovl_deq[b] = deq into slot b done; ovl_gemm[b] = GEMMs that
         // read slot b done. deq(gi+1) waits on the group gi-1 GEMMs (the
@@ -4465,7 +4465,7 @@ struct GpuModel {
               (const float*)dn.data, d_hidb, d_tokidx, d_pweight, d_eoff + e,
               acc, g_cfg.d, dn.cols, dn.scale_stride);
       } else if (moe_deterministic) {
-        // GDEC_MOE_PAIRS_BF16: down writes unweighted bf16 pair rows; the
+        // QWENOX_MOE_PAIRS_BF16: down writes unweighted bf16 pair rows; the
         // router weight moves to the reduce (fp32 multiply). Requires the
         // fixed top-10 reduce below.
         bool pairs_bf16 = moe_pairs_bf16 && k == 10 && !moe_reduce_old;
@@ -4564,7 +4564,7 @@ struct GpuModel {
   // d_guvb takes the down pairs). LUT path: the
   // shared expert runs first (its d_guvb / d_hidb scratch is dead by then) and
   // k_v2_reduce_rot folds reduce + rot_out + shared add into one pass
-  // (GDEC_MOE_SG_FUSE=0: shared expert afterwards via k_axpy_sg).
+  // (QWENOX_MOE_SG_FUSE=0: shared expert afterwards via k_axpy_sg).
   // w4hc/Rhc: fuse the HC write-back into k_v2_reduce_rot_hc (B2-1) and
   // return true; only on the LUT sg_fuse path.
   bool moe_b_v2(int l, const WView& gu, const WView& dn, float* acc, int P,
@@ -4588,16 +4588,16 @@ struct GpuModel {
         logged = true;
         fprintf(stderr, "moe prefill: hgn v2 i4r LUT WMMA\n");
       }
-      static const bool sg_fuse = !env_zero("GDEC_MOE_SG_FUSE");
+      static const bool sg_fuse = !env_zero("QWENOX_MOE_SG_FUSE");
       KP("moe:shared");
       if (sg_fuse) moe_b_shared_ey(l, P);
       KP("moe:route");
       moe_routing.run(d_topidsb, d_topwb, d_tokidx, d_pweight, d_eoff, d_pairids, P, k, E);
       // §11.5 多 tile 共享解码（mt）：tile 按 128 slot 合并（同专家两个 64-slot
-      // tile 一个 CTA 解码一遍），逐 bit 不变；默认开，GDEC_MOE_MT=0 回退。
+      // tile 一个 CTA 解码一遍），逐 bit 不变；默认开，QWENOX_MOE_MT=0 回退。
       // microbench：P=2048 亏 5%、4096 +1.8%、8192 +7.5%、16384 +5.5%——按平均
       // 每专家 slot 数 >= 80 设门槛，小 P（tail chunk / 短 prompt）走原路径。
-      static const bool moe_mt_env = !env_zero("GDEC_MOE_MT");
+      static const bool moe_mt_env = !env_zero("QWENOX_MOE_MT");
       const bool mt = moe_mt_env && (int64_t)P * k >= 80 * E;
       k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, mt ? 128 : 64);
       const int max_tiles = mt ? (P * k + 127) / 128 + E : (P * k + 63) / 64 + E;
@@ -4620,8 +4620,8 @@ struct GpuModel {
       // 实测（Windows, 2026-10-02）：reduce −148 ms/16K，down 几乎不变，整体
       // +1.2~1.5%。终判（10-03，Linux BF16 基准 data/kld/bf16_c512.kld 64×512）：
       // mean_kld 0.106993(关) → 0.107705(开)，门槛 0.10699+0.002=0.10899 过线，
-      // 默认开；GDEC_V2_PAIRS_F16=0 回退 fp32 pairs。
-      static const bool pairs_f16 = !env_zero("GDEC_V2_PAIRS_F16");
+      // 默认开；QWENOX_V2_PAIRS_F16=0 回退 fp32 pairs。
+      static const bool pairs_f16 = !env_zero("QWENOX_V2_PAIRS_F16");
       if (mt)
         moe_lut_down_mt(pdn, hid, d_moetiles, d_moentiles, max_tiles, d_guvb, d, mid, g_str,
                         pairs_f16);
@@ -4770,7 +4770,7 @@ struct GpuModel {
     } else {
       gr_read_b(attn_prefix, P);
     }
-    if (getenv("GDEC_VGDUMP")) {
+    if (getenv("QWENOX_VGDUMP")) {
       char tag[12];
       snprintf(tag, sizeof tag, "nx%d", l);
       vg_dump_buf(tag, P, d_xb, (size_t)P * 2560 * 4);
@@ -4815,7 +4815,7 @@ struct GpuModel {
       gr_read_b(mlp_prefix, P);
     }
     KP("moe");
-    // B2-1 (GDEC_HC_FUSE_WRITE, 默认关 — KPROF 实测回退，见 HANDOFF-PREFILL-ALL
+    // B2-1 (QWENOX_HC_FUSE_WRITE, 默认关 — KPROF 实测回退，见 HANDOFF-PREFILL-ALL
     // §4 B2-1 状态段): fold the mlp site's HC write-back into the moe reduce
     // (saves the d_yb f32 write + re-read; R bit-identical). Requires the
     // gr_bf16 write path; the deferred (flush_mlp=false) consumer additionally
@@ -4823,7 +4823,7 @@ struct GpuModel {
     // LUT sg_fuse paths and reports back; otherwise the precomputed d_w4b is
     // recomputed bit-identically by the normal write path.
     static const bool hcw_env =
-        getenv("GDEC_HC_FUSE_WRITE") != nullptr && !env_zero("GDEC_HC_FUSE_WRITE");
+        getenv("QWENOX_HC_FUSE_WRITE") != nullptr && !env_zero("QWENOX_HC_FUSE_WRITE");
     const bool can_hcw = hcw_env && !dbg && gr_bf16 &&
                          (flush_mlp || (gr_scatter_norm && inj_fuse_on()));
     bool hcw = false;
@@ -4861,7 +4861,7 @@ struct GpuModel {
   // enqueue, and once a second report the highest COMPLETED layer as an
   // estimated token count. hipEventQuery is non-blocking (hipErrorNotReady
   // is the expected answer for in-flight layers), so this never serializes
-  // the pipeline the way the GDEC_PHASE sync profiling does.
+  // the pipeline the way the QWENOX_PHASE sync profiling does.
   void prog_print(int P) {
     auto now = std::chrono::steady_clock::now();
     double iv = std::chrono::duration<double>(now - prog_last).count();
@@ -4965,7 +4965,7 @@ struct GpuModel {
     fl.workers.store(nt);
     fl.pool.clear();
     fl.pool.reserve(nt);
-    if (!getenv("GDEC_PLE_NOSORT")) {
+    if (!getenv("QWENOX_PLE_NOSORT")) {
       fl.barrier.store(0, std::memory_order_relaxed);
       if (ple_uring_ready()) {
         // IOCP/io_uring batch-pread gather: phase A is the same 16-thread row
@@ -5063,9 +5063,9 @@ struct GpuModel {
     ple_fl.pool.clear();
   }
 
-  // GDEC_VGDUMP (debug): sync + D2H an arbitrary device buffer, FNV-1a hash.
+  // QWENOX_VGDUMP (debug): sync + D2H an arbitrary device buffer, FNV-1a hash.
   void vg_dump_buf(const char* tag, int P, const void* p, size_t bytes) {
-    if (vg_capturing_ || P < 2 || P > 16 || !getenv("GDEC_VGDUMP")) return;
+    if (vg_capturing_ || P < 2 || P > 16 || !getenv("QWENOX_VGDUMP")) return;
     CK(hipStreamSynchronize(g_str));
     std::vector<uint8_t> h(bytes);
     CK(hipMemcpy(h.data(), p, bytes, hipMemcpyDeviceToHost));
@@ -5075,11 +5075,11 @@ struct GpuModel {
             (unsigned long long)fnv);
   }
 
-  // GDEC_VGDUMP (debug): sync + D2H d_Rb rows [0,P), print an FNV-1a hash of
+  // QWENOX_VGDUMP (debug): sync + D2H d_Rb rows [0,P), print an FNV-1a hash of
   // the raw row bytes (bf16 or f32 depending on gr_bf16) — sensitive
   // round-state comparator for verify-graph bisection.
   void vg_dump_row(const char* tag, int P, int base) {
-    if (vg_capturing_ || P > 16 || !getenv("GDEC_VGDUMP")) return;
+    if (vg_capturing_ || P > 16 || !getenv("QWENOX_VGDUMP")) return;
     CK(hipStreamSynchronize(g_str));
     const size_t row = (size_t)10240 * (gr_bf16 ? 2 : 4);
     std::vector<uint8_t> h((size_t)P * row);
@@ -5103,7 +5103,7 @@ struct GpuModel {
       embed_rows(et, d_tokarr, P, d_Rb, 10240);
       k_repeat4_b<<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(d_Rb, d_Rb, g_cfg.d);
     }
-    if (!vg_capturing_ && getenv("GDEC_VGDUMP")) {
+    if (!vg_capturing_ && getenv("QWENOX_VGDUMP")) {
       CK(hipStreamSynchronize(g_str));
       int tk[16] = {};
       int nd = P < 16 ? P : 16;
@@ -5222,7 +5222,7 @@ struct GpuModel {
     kv_prepare(base, base + P);  // A2/A3: back (and unshare) rows [base, base+P)
     set_vbase(base);  // P3-A: all base-reading batch kernels this chunk read d_vbase
     cut_begin_chunk(base, P);
-    static const bool phase_prof = getenv("GDEC_PHASE") != nullptr;
+    static const bool phase_prof = getenv("QWENOX_PHASE") != nullptr;
     auto phase = [&](const char* tag, std::chrono::steady_clock::time_point& tp) {
       if (!phase_prof) return;
       CK(hipStreamSynchronize(g_str));
@@ -5232,7 +5232,7 @@ struct GpuModel {
       tp = now;
     };
     xf16_src = nullptr;  // a new batch invalidates the bf16 conversion cache
-#ifdef GDEC_PHASE_PROF
+#ifdef QWENOX_PHASE_PROF
     {
       static const unsigned long long zeros[16] = {};
       CK(hipMemcpyToSymbol(g_ph, zeros, sizeof(zeros)));
@@ -5314,7 +5314,7 @@ struct GpuModel {
       if (prog_total > 0) prog_probe(l, P);
       conc_borrow_yield(base, P, l);  // D1b: no-op unless armed and contended
       if (l == 24) phase("L01-24", TP);
-      if (phase_prof && getenv("GDEC_PHASE")[0] == '2') {
+      if (phase_prof && getenv("QWENOX_PHASE")[0] == '2') {
         char lbuf[16];
         snprintf(lbuf, sizeof lbuf, "L%02d", l);
         phase(lbuf, TP);
@@ -5324,8 +5324,8 @@ struct GpuModel {
     // PLE chunk-ahead prefetch: gather the next chunk's rows on host threads
     // while the GPU drains this chunk's layer queue below (row addresses are
     // pure functions of token ids, all known now; staging is double-buffered).
-    // GDEC_PLE_NOPREFETCH disables for A/B.
-    static const bool ple_noprefetch = getenv("GDEC_PLE_NOPREFETCH") != nullptr;
+    // QWENOX_PLE_NOPREFETCH disables for A/B.
+    static const bool ple_noprefetch = getenv("QWENOX_PLE_NOPREFETCH") != nullptr;
     if (ple_on && nxt && !nxt->empty() && !ple_fl.valid && !ple_noprefetch) {
       const int64_t pre0 = chist.empty() ? pad_id : chist.back();
       const int64_t pre1 = chist.size() < 2 ? pad_id : chist[chist.size() - 2];
@@ -5401,8 +5401,8 @@ struct GpuModel {
       fprintf(stderr, "prof-chunk: P=%d wall=%.1fms\n", P, sec * 1e3);
       p_gemm = p_topk_wait = p_bucket = p_pleh = p_ple_wait = 0;
     }
-#ifdef GDEC_PHASE_PROF
-    if (getenv("GDEC_PHASE_PROF")) {
+#ifdef QWENOX_PHASE_PROF
+    if (getenv("QWENOX_PHASE_PROF")) {
       CK(hipStreamSynchronize(g_str));
       unsigned long long h[16];
       CK(hipMemcpyFromSymbol(h, g_ph, sizeof(h)));
@@ -5424,7 +5424,7 @@ struct GpuModel {
   // Wiring: MTP stream position p takes (trunk h_p, emb(t_{p+1})) and predicts
   // t_{p+2}. Input: h = sum_b fc_hidden(norm_h(tap)[b]), e =
   // fc_embedding(norm_e(embed(tok))), stream = repeat4(h + e). Norm mode is
-  // GDEC_MTP_NORM=full (one 10240 RMSNorm, default) or =branch (4x2560).
+  // QWENOX_MTP_NORM=full (one 10240 RMSNorm, default) or =branch (4x2560).
   void mtp_input_1(const float* tap) {
     embed_rows(wview(ckpt.at("embed_tokens.weight")), d_mtok, 1, d_emb, 0);
     k_rmsnorm_zc_grouped<<<1, 1024, 0, g_str>>>(d_emb, d_mnorm_e, d_me, 2560,
@@ -5789,10 +5789,10 @@ struct GpuModel {
         // Same fused tiled scores + select as the trunk qsa_b path (the MTP
         // sgemm alone was ~0.23 s per 32K prompt, the tiled kernel ~0.03 s).
         // Only the MTP draft path sees these selections.
-        // GDEC_MTP_INDEX_SGEMM=1 keeps the old sgemm + index_select.
-        static const bool mtp_sgemm = getenv("GDEC_MTP_INDEX_SGEMM") != nullptr;
+        // QWENOX_MTP_INDEX_SGEMM=1 keeps the old sgemm + index_select.
+        static const bool mtp_sgemm = getenv("QWENOX_MTP_INDEX_SGEMM") != nullptr;
         if (index_fused2 && !mtp_sgemm && count >= 16 &&
-            getenv("GDEC_INDEX_OLDSEL") == nullptr) {
+            getenv("QWENOX_INDEX_OLDSEL") == nullptr) {
           int* const selrow = d_iselected + (size_t)(first - base) * 512;
           if (index_f16()) {
             uint16_t* const sc16 = (uint16_t*)d_iscores;
@@ -5966,13 +5966,13 @@ struct GpuModel {
     // aggr 10-05: ingest = KV/indexer build only (see mtp_qsa_b kv_only). The
     // attention output, the MLP-site HC and the MoE of ingested rows were
     // never consumed (~80% of a 16K prompt's 425 ms MTP ingest).
-    // GDEC_MTP_INGEST_FULL=1 runs the full layer as before.
-    static const bool full = getenv("GDEC_MTP_INGEST_FULL") != nullptr;
-    static const bool kvo_qsa = !full && !env_zero("GDEC_MTP_KVO_QSA");
-    static const bool kvo_rest = !full && !env_zero("GDEC_MTP_KVO_REST");
+    // QWENOX_MTP_INGEST_FULL=1 runs the full layer as before.
+    static const bool full = getenv("QWENOX_MTP_INGEST_FULL") != nullptr;
+    static const bool kvo_qsa = !full && !env_zero("QWENOX_MTP_KVO_QSA");
+    static const bool kvo_rest = !full && !env_zero("QWENOX_MTP_KVO_REST");
     mtp_qsa_b(P, base, kvo_qsa);
     static const int rest_lvl = [] {  // bisect: how many of the 4 rest steps run
-      const char* e = getenv("GDEC_MTP_REST_LVL");
+      const char* e = getenv("QWENOX_MTP_REST_LVL");
       return e ? atoi(e) : -1;
     }();
     const int lvl = rest_lvl >= 0 ? rest_lvl : (kvo_rest ? 0 : 4);
@@ -5980,7 +5980,7 @@ struct GpuModel {
     if (lvl >= 2) mtp_gr_read_b("mtp.layers.0.mlp_hyper_connection", P);
     if (lvl >= 3) mtp_moe_b(P);
     if (lvl >= 4) mtp_gr_write_b("mtp.layers.0.mlp_hyper_connection", P);
-    if (getenv("GDEC_MTP_HASH")) {  // debug: hash the MTP persistent state rows
+    if (getenv("QWENOX_MTP_HASH")) {  // debug: hash the MTP persistent state rows
       CK(hipStreamSynchronize(g_str));
       auto fnv = [](uint64_t h, const void* p, size_t n) {
         const uint8_t* b = (const uint8_t*)p;
@@ -6059,7 +6059,7 @@ struct GpuModel {
   }
 
   // =================== MTP speculative loop (Phase B) ========================
-  // gr_bf16 shims: d_Rb rows are bf16 under GDEC_GR_BF16, but the MTP ingest
+  // gr_bf16 shims: d_Rb rows are bf16 under QWENOX_GR_BF16, but the MTP ingest
   // path and the decode state d_R are fp32. spec_taps stages rows 0..P-1 as
   // fp32 in d_Rhatb (scratch outside prefill; consumed by mtp_input_b before
   // anything else touches it).
@@ -6187,7 +6187,7 @@ struct GpuModel {
   template <typename Sampler>
   bool sms_gpu_active(const Sampler& s) const {
     static const bool off =
-        getenv("GDEC_SMS_GPU") && atoi(getenv("GDEC_SMS_GPU")) == 0;
+        getenv("QWENOX_SMS_GPU") && atoi(getenv("QWENOX_SMS_GPU")) == 0;
     if (off) return false;
     if (s.top_k <= 0 || s.top_k > 64 || s.top_k >= g_cfg.vocab) return false;
     if ((int)s.bias.size() > SMS_BIAS_CAP) return false;
@@ -6357,7 +6357,7 @@ struct GpuModel {
   }
 
   // prepare_sparse on candidate row `row` (draft: row 0 of the d_logits
-  // pass). GDEC_SMS_CHECK=1 also replays the dense prepare() on the raw
+  // pass). QWENOX_SMS_CHECK=1 also replays the dense prepare() on the raw
   // logits row and compares the two distributions (support + probabilities).
   template <typename Sampler>
   void sms_prep(Sampler& s, int row, bool draft,
@@ -6365,7 +6365,7 @@ struct GpuModel {
     const int k = s.top_k;
     s.prepare_sparse(sms_out_ids.data() + (size_t)row * k,
                      sms_out_vals.data() + (size_t)row * k, k, out);
-    static const bool chk = getenv("GDEC_SMS_CHECK") != nullptr;
+    static const bool chk = getenv("QWENOX_SMS_CHECK") != nullptr;
     if (!chk) return;
     static long n = 0, bad = 0;
     static double maxd = 0, maxout = 0;
@@ -6508,7 +6508,7 @@ struct GpuModel {
   }
 
   // Adaptive MTP draft length, active when a spec_loop* is entered with
-  // gamma == 0 (API: sampling with GDEC_SPEC_GAMMA unset; offline: --gamma 0).
+  // gamma == 0 (API: sampling with QWENOX_SPEC_GAMMA unset; offline: --gamma 0).
   // Tracks an EMA of the per-depth conditional acceptance p_j = P(draft j
   // accepted | drafts 0..j-1 accepted) and after each round picks γ in
   // [kmin, gmax] maximizing E[commit]/cost, cost(γ) = 1 + r·γ.
@@ -6548,11 +6548,11 @@ struct GpuModel {
       if (gamma > 0) { cur = std::min(8, gamma); return; }
       adapt = true;
       cur = sample ? 3 : 4;  // previous fixed auto defaults
-      static const float env_r = env_f("GDEC_SPEC_ADAPT_R", 0.3f);
-      static const float env_alpha = env_f("GDEC_SPEC_ADAPT_ALPHA", 0.05f);
-      static const float env_hyst = env_f("GDEC_SPEC_ADAPT_HYST", 0.02f);
-      static const int env_min = (int)env_f("GDEC_SPEC_ADAPT_MIN", 3.f);
-      static const int env_max = (int)env_f("GDEC_SPEC_ADAPT_MAX", 7.f);
+      static const float env_r = env_f("QWENOX_SPEC_ADAPT_R", 0.3f);
+      static const float env_alpha = env_f("QWENOX_SPEC_ADAPT_ALPHA", 0.05f);
+      static const float env_hyst = env_f("QWENOX_SPEC_ADAPT_HYST", 0.02f);
+      static const int env_min = (int)env_f("QWENOX_SPEC_ADAPT_MIN", 3.f);
+      static const int env_max = (int)env_f("QWENOX_SPEC_ADAPT_MAX", 7.f);
       r = std::max(0.01f, env_r);
       alpha = std::max(0.005f, std::min(1.f, env_alpha));
       hyst = std::max(0.f, env_hyst);
@@ -6574,12 +6574,12 @@ struct GpuModel {
       double pf = a[0] / std::max(1e-9, 1.0 - a[1] + a[0]);
       return (pf * e[1] + (1.0 - pf) * e[0]) / (1.0 + r * G);
     }
-    // GDEC_SPEC_TRACE=1: record every round (γ, accepted, wall ms since the
+    // QWENOX_SPEC_TRACE=1: record every round (γ, accepted, wall ms since the
     // previous update) and print it in report() — offline controller replay
     // (tools/gamma_sim.py). Observation only; fixed and adaptive γ alike.
     static bool trace_on() {
       static const bool on = [] {
-        const char* e = getenv("GDEC_SPEC_TRACE");
+        const char* e = getenv("QWENOX_SPEC_TRACE");
         return e && e[0] == '1';
       }();
       return on;
@@ -6692,7 +6692,7 @@ struct GpuModel {
         batch_argmax(g + 1, v.data());
       } else
         spec_snap = false;
-      if (getenv("GDEC_VGDUMP")) {  // P3-B bisect: whole-logits round hash
+      if (getenv("QWENOX_VGDUMP")) {  // P3-B bisect: whole-logits round hash
         CK(hipStreamSynchronize(g_str));
         const size_t nb = (size_t)(g + 1) * g_cfg.vocab * 4;
         std::vector<uint8_t> lh(nb);
@@ -6850,7 +6850,7 @@ struct GpuModel {
     int depth_hits[8] = {0}, depth_tot[8] = {0};
     int accepted = 0, ng_rounds = 0, mtp_rounds = 0, ng_roll = 0, mtp_roll = 0;
     double verify_ms = 0, replay_ms = 0;
-    // ngram verify chunking: GDEC_NGRAM_CHUNK=0 keeps the legacy single-pass
+    // ngram verify chunking: QWENOX_NGRAM_CHUNK=0 keeps the legacy single-pass
     // 65-row verify; N pins the chunk size; unset adapts within [8,64]
     // (init 16), doubling after fully-accepted rounds, halving after rejects.
     // The level is a Model member shared with the sampling chain and kept
@@ -7211,7 +7211,7 @@ struct GpuModel {
       auto t0 = std::chrono::steady_clock::now();
       // GPU sampling prep (direction A): corrections + top-k on device, host
       // replays the filter chain on <= top_k candidates per row. The dense
-      // path remains as fallback (GDEC_SMS_GPU=0, top_k unset/>64, overflow).
+      // path remains as fallback (QWENOX_SMS_GPU=0, top_k unset/>64, overflow).
       const bool smg = sms_gpu_active(sampler) && sms_round_shared(sampler);
       std::vector<typename Sampler::SDist> q_sd(smg ? g : 0);
       std::vector<char> q_sparse(g, 0);
@@ -7987,7 +7987,7 @@ struct GpuModel {
   hipGraphExec_t g1_exec = nullptr, g2_exec = nullptr;
   bool graphs_ok = false;
   void build_graphs() {
-    if (dbg || perf || getenv("GDEC_NOGRAPH")) return;
+    if (dbg || perf || getenv("QWENOX_NOGRAPH")) return;
     // pre-populate lazy caches (hipMalloc/hipMemcpy are illegal during capture)
     for (int l = 0; l < g_cfg.layers; l++) {
       char p[128];
@@ -8059,9 +8059,9 @@ struct GpuModel {
   int* p_vgbase = nullptr;         // pinned base staging for the d_vbase write
 
   bool vgraph_ok(int P, int base) {
-    static const bool off = env_zero("GDEC_VGRAPH");
+    static const bool off = env_zero("QWENOX_VGRAPH");
     if (off || !vbase_on()) return false;
-    if ((dbg && !getenv("GDEC_VGRAPH_DBG")) || perf || g_kprof_on)
+    if ((dbg && !getenv("QWENOX_VGRAPH_DBG")) || perf || g_kprof_on)
       return false;
     if (P < 2 || P > kVGMaxP || base < 2051 || base + P > maxctx) return false;
     if (mrope_active_ || cut_abs >= 0 || qsa_dense || qsa_loop || qsa_wmma6)
@@ -8071,8 +8071,8 @@ struct GpuModel {
     // graphs bake this slot's pointers (d_ptab, d_R, ...): single-slot only
     if (nslots > 1) return false;
     if (injp_cur >= 0 || !hcw_site_.empty()) return false;
-    if (getenv("GDEC_VCT_CHECK") || getenv("GDEC_ATTN_HASH") ||
-        getenv("GDEC_VCT_TAILZERO"))
+    if (getenv("QWENOX_VCT_CHECK") || getenv("QWENOX_ATTN_HASH") ||
+        getenv("QWENOX_VCT_TAILZERO"))
       return false;
     // D1b mid-chunk GPU lending is not part of the graphs (production has
     // moe_lt on, which already makes the yield a no-op).
@@ -8134,11 +8134,11 @@ struct GpuModel {
     if (hipStreamBeginCapture(cap, hipStreamCaptureModeGlobal) != hipSuccess)
       ok = false;
     if (ok) {  // seg 0: token upload + embed + L0 + PLE + L1..first QSA-1
-      // GDEC_VGRAPH_NOPLE / GDEC_VGRAPH_NOGDN / GDEC_VGRAPH_NOEMB (debug
+      // QWENOX_VGRAPH_NOPLE / QWENOX_VGRAPH_NOGDN / QWENOX_VGRAPH_NOEMB (debug
       // bisect): run that part eagerly in vgraph_run instead of capturing it.
-      static const bool s0_ple = !getenv("GDEC_VGRAPH_NOPLE");
-      static const bool s0_gdn = !getenv("GDEC_VGRAPH_NOGDN");
-      static const bool s0_emb = !getenv("GDEC_VGRAPH_NOEMB");
+      static const bool s0_ple = !getenv("QWENOX_VGRAPH_NOPLE");
+      static const bool s0_gdn = !getenv("QWENOX_VGRAPH_NOGDN");
+      static const bool s0_emb = !getenv("QWENOX_VGRAPH_NOEMB");
       if (s0_emb)
         enq_embed_body(p_vgtok, P);
       else
@@ -8158,10 +8158,10 @@ struct GpuModel {
         G.bnd_injp_for[G.nseg - 1] = injp_for;
       }
     }
-    // GDEC_VGRAPH_SEGS=k (debug bisect): capture only the first k segments;
+    // QWENOX_VGRAPH_SEGS=k (debug bisect): capture only the first k segments;
     // vgraph_run finishes the remaining layers eagerly (host base).
     static const int seg_limit =
-        getenv("GDEC_VGRAPH_SEGS") ? atoi(getenv("GDEC_VGRAPH_SEGS")) : 999;
+        getenv("QWENOX_VGRAPH_SEGS") ? atoi(getenv("QWENOX_VGRAPH_SEGS")) : 999;
     for (int lq = 3; ok && lq < g_cfg.layers && G.nseg < seg_limit; lq += 4) {
       // The indexer reads d_xb, written by the layer's attention norm: run
       // the norm eagerly too, ahead of the indexer, outside the graph.
@@ -8248,7 +8248,7 @@ struct GpuModel {
     injp_cur = G.bnd_injp_cur[0];
     injp_for = G.bnd_injp_for[0];
     if (d_iraw) vg_dump_buf("irH2", 2, d_iraw, 512 * 4);  // P3-B bisect
-    if (getenv("GDEC_VGDUMP")) {
+    if (getenv("QWENOX_VGDUMP")) {
       CK(hipStreamSynchronize(g_str));
       int tk[16] = {};
       int nd = P < 16 ? P : 16;
@@ -8258,9 +8258,9 @@ struct GpuModel {
       vg_dump_row("vgs", P, base);
     }
     {  // eager fallback for parts excluded from seg 0 (bisect envs)
-      static const bool s0_ple = !getenv("GDEC_VGRAPH_NOPLE");
-      static const bool s0_gdn = !getenv("GDEC_VGRAPH_NOGDN");
-      static const bool s0_emb = !getenv("GDEC_VGRAPH_NOEMB");
+      static const bool s0_ple = !getenv("QWENOX_VGRAPH_NOPLE");
+      static const bool s0_gdn = !getenv("QWENOX_VGRAPH_NOGDN");
+      static const bool s0_emb = !getenv("QWENOX_VGRAPH_NOEMB");
       if (!s0_emb) enq_embed_body(tokens.data(), P);  // H2D repeats, same value
       if (!s0_gdn) enq_layer_b(0, P, false, true, base);
       if (ple_on && !s0_ple) enq_ple_device_b(P, base, 0);
@@ -8279,13 +8279,13 @@ struct GpuModel {
       injp_cur = G.bnd_injp_cur[s];  // see the restore after seg[0]
       injp_for = G.bnd_injp_for[s];
       s++;
-      if (getenv("GDEC_VGDUMP")) {
+      if (getenv("QWENOX_VGDUMP")) {
         char tag[8];
         snprintf(tag, sizeof tag, "vgS%d", s - 1);
         vg_dump_row(tag, P, base);
       }
     }
-    if (lq < g_cfg.layers) {  // GDEC_VGRAPH_SEGS bisect: eager remainder
+    if (lq < g_cfg.layers) {  // QWENOX_VGRAPH_SEGS bisect: eager remainder
       for (int l = lq; l < g_cfg.layers; l++) {
         if (is_qsa(l)) {
           enq_layer_norm_b(l, P, gr_scatter_norm && l > 1);
@@ -8334,9 +8334,9 @@ struct GpuModel {
         return false;
       }
       fprintf(stderr, "verify graphs captured (P=%d, %d segments)\n", P, G.nseg);
-      // GDEC_VGRAPH_NOLAUNCH (debug): capture once, then stay eager forever —
+      // QWENOX_VGRAPH_NOLAUNCH (debug): capture once, then stay eager forever —
       // isolates capture-time side effects from replay effects.
-      if (getenv("GDEC_VGRAPH_NOLAUNCH")) {
+      if (getenv("QWENOX_VGRAPH_NOLAUNCH")) {
         for (int s = 0; s < G.nseg; s++) (void)hipGraphExecDestroy(G.seg[s]);
         G.nseg = -1;
         return false;
@@ -8346,7 +8346,7 @@ struct GpuModel {
     return true;
   }
 
-  // ---- Sequence slots (concurrent serve, GDEC_PARALLEL) ----
+  // ---- Sequence slots (concurrent serve, QWENOX_PARALLEL) ----
   // Everything one sequence carries from step to step: host mirrors, GDN /
   // conv / PLE ring / indexer ring state, the page table (the KV pages live
   // in the shared pool, MTP layer included), the MTP indexer ring and
@@ -8358,7 +8358,7 @@ struct GpuModel {
   // members, so every kernel path runs unchanged on the bound slot.
   // mrope_gen_ is NOT per slot: it is a global generation for the ropecs
   // cache key (bind also drops that cache).
-#define GDEC_SLOT_FIELDS(X)                                                    \
+#define QWENOX_SLOT_FIELDS(X)                                                    \
   X(pos) X(ple_ringpos) X(chist) X(ngram) X(mtp_pos) X(kv_seq) X(d_ptab)      \
   X(mrope_active_) X(rope_delta_) X(mrope_pos_) X(mrope_grids_) X(d_rdelta)   \
   X(img_inj) X(img_hash_) X(d_img_emb) X(img_emb_rows) X(img_emb_cap)         \
@@ -8371,9 +8371,9 @@ struct GpuModel {
   X(d_S) X(d_convst) X(d_ring) X(d_iraw) X(d_R) X(d_pos) X(d_ringpos)         \
   X(d_miraw) X(d_mpos)
   struct SeqState {
-#define GDEC_SLOT_DECL(f) decltype(GpuModel::f) f{};
-    GDEC_SLOT_FIELDS(GDEC_SLOT_DECL)
-#undef GDEC_SLOT_DECL
+#define QWENOX_SLOT_DECL(f) decltype(GpuModel::f) f{};
+    QWENOX_SLOT_FIELDS(QWENOX_SLOT_DECL)
+#undef QWENOX_SLOT_DECL
   };
   // Invariant: the bound slot's state is in the members and slots_[bound_]
   // holds a placeholder; every other slots_[i] holds slot i's state.
@@ -8381,9 +8381,9 @@ struct GpuModel {
   int nslots = 1, bound_ = 0;
   void swap_slot(SeqState& s) {
     using std::swap;
-#define GDEC_SLOT_SWAP(f) swap(f, s.f);
-    GDEC_SLOT_FIELDS(GDEC_SLOT_SWAP)
-#undef GDEC_SLOT_SWAP
+#define QWENOX_SLOT_SWAP(f) swap(f, s.f);
+    QWENOX_SLOT_FIELDS(QWENOX_SLOT_SWAP)
+#undef QWENOX_SLOT_SWAP
   }
   void bind(int s) {
     if (s == bound_) return;
@@ -8406,7 +8406,7 @@ struct GpuModel {
   // HANDOFF-CONCURRENCY §5.2 audit), d_posarr/d_ringarr (constant).
   // d_moetiles/d_moentiles/moe_routing/moe_lt/qsa_union paths are never taken
   // at P <= conc_rmax_; conc_borrow_yield refuses to lend when they are on.
-#define GDEC_WS_FIELDS(X)                                                     \
+#define QWENOX_WS_FIELDS(X)                                                     \
   X(d_Rb) X(d_Rhatb) X(d_Rhatbf16) X(d_hcsc) X(d_xb) X(d_yb) X(d_Gb)          \
   X(d_t320b)                                                                  \
   X(d_w4b) X(d_qkvb) X(d_zb) X(d_g48b) X(d_beta48b) X(d_qgb) X(d_qsb)        \
@@ -8417,9 +8417,9 @@ struct GpuModel {
   X(d_convoutb) X(d_tokarr) X(d_img_inj) X(d_iproj) X(d_iq) X(d_iqh) X(d_iselected)   \
   X(d_iscores) X(d_mRb) X(d_mRhatb) X(d_mtap)
   struct WsPtrs {
-#define GDEC_WS_DECL(f) decltype(GpuModel::f) f = nullptr;
-    GDEC_WS_FIELDS(GDEC_WS_DECL)
-#undef GDEC_WS_DECL
+#define QWENOX_WS_DECL(f) decltype(GpuModel::f) f = nullptr;
+    QWENOX_WS_FIELDS(QWENOX_WS_DECL)
+#undef QWENOX_WS_DECL
     float *d_injp0 = nullptr, *d_injp1 = nullptr;
     float* ple_eb = nullptr;
     uint8_t* ple_eb_dev = nullptr;
@@ -8436,52 +8436,52 @@ struct GpuModel {
   void ws_alloc_small(int R) {
     if (ws_ok_ || R < 1) return;
     const size_t B = (size_t)R;
-#define GDEC_WS_DUP(p, bytes) \
+#define QWENOX_WS_DUP(p, bytes) \
     if (p) DALLOC(&ws_small_.p, (bytes))
-    GDEC_WS_DUP(d_Rb, B * 10240 * 4);
-    GDEC_WS_DUP(d_Rhatb, B * 10240 * 4);
-    GDEC_WS_DUP(d_Rhatbf16, B * 10240 * 2);
-    GDEC_WS_DUP(d_hcsc, B * 4 * 4);
-    GDEC_WS_DUP(d_xb, B * 2560 * 4);
-    GDEC_WS_DUP(d_yb, B * 2560 * 4);
-    GDEC_WS_DUP(d_Gb, B * 10240 * 4);
-    GDEC_WS_DUP(d_t320b, B * 320 * 4);
-    GDEC_WS_DUP(d_w4b, B * 4 * 4);
-    GDEC_WS_DUP(d_qkvb, B * 10240 * 4);
-    GDEC_WS_DUP(d_zb, B * 6144 * 4);
-    GDEC_WS_DUP(d_g48b, B * 48 * 4);
-    GDEC_WS_DUP(d_beta48b, B * 48 * 4);
-    GDEC_WS_DUP(d_qgb, B * 12288 * 4);
-    GDEC_WS_DUP(d_qsb, B * 6144 * 4);
-    GDEC_WS_DUP(d_gsb, B * 6144 * 4);
-    GDEC_WS_DUP(d_kbb, B * 512 * 4);
-    GDEC_WS_DUP(d_vbb, B * 512 * 4);
-    GDEC_WS_DUP(d_ropecs, B * 32 * sizeof(float2));
-    GDEC_WS_DUP(d_attnb, B * 6144 * 4);
-    GDEC_WS_DUP(d_routerb, B * 512 * 4);
-    GDEC_WS_DUP(d_topidsb, B * 16 * 4);
-    GDEC_WS_DUP(d_topwb, B * 16 * 4);
-    GDEC_WS_DUP(d_slot_order, 256 * 4);
-    GDEC_WS_DUP(d_guvb, B * g_cfg.topk * (moe_deterministic ? 2560 : 1280) * 4);
-    GDEC_WS_DUP(d_hidb, B * g_cfg.topk * 640 * 4);
-    GDEC_WS_DUP(d_moeaccb, B * 2560 * 4);
-    GDEC_WS_DUP(d_eyb, B * 2560 * 4);
-    GDEC_WS_DUP(d_sgb, B * 4);
-    GDEC_WS_DUP(d_eb, B * 2560 * 4);
-    GDEC_WS_DUP(d_xbf16, B * 10240 * 2);
-    GDEC_WS_DUP(d_xbf16b, B * 6144 * 2);
-    GDEC_WS_DUP(d_tokidx, B * g_cfg.topk * 4);
-    GDEC_WS_DUP(d_pweight, B * g_cfg.topk * 4);
-    GDEC_WS_DUP(d_pairids, B * g_cfg.topk * 4);
-    GDEC_WS_DUP(d_convb, B * 10240 * 4);
-    GDEC_WS_DUP(d_keysb, B * 10240 * 4);
-    GDEC_WS_DUP(d_plevb, B * 2560 * 4);
-    GDEC_WS_DUP(d_qnb, B * 10240 * 4);
-    GDEC_WS_DUP(d_Ub, B * 10240 * 4);
-    GDEC_WS_DUP(d_Unb, B * 10240 * 4);
-    GDEC_WS_DUP(d_convoutb, B * 10240 * 4);
-    GDEC_WS_DUP(d_tokarr, B * 4);
-    GDEC_WS_DUP(d_img_inj, B * sizeof(int2));
+    QWENOX_WS_DUP(d_Rb, B * 10240 * 4);
+    QWENOX_WS_DUP(d_Rhatb, B * 10240 * 4);
+    QWENOX_WS_DUP(d_Rhatbf16, B * 10240 * 2);
+    QWENOX_WS_DUP(d_hcsc, B * 4 * 4);
+    QWENOX_WS_DUP(d_xb, B * 2560 * 4);
+    QWENOX_WS_DUP(d_yb, B * 2560 * 4);
+    QWENOX_WS_DUP(d_Gb, B * 10240 * 4);
+    QWENOX_WS_DUP(d_t320b, B * 320 * 4);
+    QWENOX_WS_DUP(d_w4b, B * 4 * 4);
+    QWENOX_WS_DUP(d_qkvb, B * 10240 * 4);
+    QWENOX_WS_DUP(d_zb, B * 6144 * 4);
+    QWENOX_WS_DUP(d_g48b, B * 48 * 4);
+    QWENOX_WS_DUP(d_beta48b, B * 48 * 4);
+    QWENOX_WS_DUP(d_qgb, B * 12288 * 4);
+    QWENOX_WS_DUP(d_qsb, B * 6144 * 4);
+    QWENOX_WS_DUP(d_gsb, B * 6144 * 4);
+    QWENOX_WS_DUP(d_kbb, B * 512 * 4);
+    QWENOX_WS_DUP(d_vbb, B * 512 * 4);
+    QWENOX_WS_DUP(d_ropecs, B * 32 * sizeof(float2));
+    QWENOX_WS_DUP(d_attnb, B * 6144 * 4);
+    QWENOX_WS_DUP(d_routerb, B * 512 * 4);
+    QWENOX_WS_DUP(d_topidsb, B * 16 * 4);
+    QWENOX_WS_DUP(d_topwb, B * 16 * 4);
+    QWENOX_WS_DUP(d_slot_order, 256 * 4);
+    QWENOX_WS_DUP(d_guvb, B * g_cfg.topk * (moe_deterministic ? 2560 : 1280) * 4);
+    QWENOX_WS_DUP(d_hidb, B * g_cfg.topk * 640 * 4);
+    QWENOX_WS_DUP(d_moeaccb, B * 2560 * 4);
+    QWENOX_WS_DUP(d_eyb, B * 2560 * 4);
+    QWENOX_WS_DUP(d_sgb, B * 4);
+    QWENOX_WS_DUP(d_eb, B * 2560 * 4);
+    QWENOX_WS_DUP(d_xbf16, B * 10240 * 2);
+    QWENOX_WS_DUP(d_xbf16b, B * 6144 * 2);
+    QWENOX_WS_DUP(d_tokidx, B * g_cfg.topk * 4);
+    QWENOX_WS_DUP(d_pweight, B * g_cfg.topk * 4);
+    QWENOX_WS_DUP(d_pairids, B * g_cfg.topk * 4);
+    QWENOX_WS_DUP(d_convb, B * 10240 * 4);
+    QWENOX_WS_DUP(d_keysb, B * 10240 * 4);
+    QWENOX_WS_DUP(d_plevb, B * 2560 * 4);
+    QWENOX_WS_DUP(d_qnb, B * 10240 * 4);
+    QWENOX_WS_DUP(d_Ub, B * 10240 * 4);
+    QWENOX_WS_DUP(d_Unb, B * 10240 * 4);
+    QWENOX_WS_DUP(d_convoutb, B * 10240 * 4);
+    QWENOX_WS_DUP(d_tokarr, B * 4);
+    QWENOX_WS_DUP(d_img_inj, B * sizeof(int2));
     if (d_iproj) {  // !qsa_dense indexer block
       DALLOC(&ws_small_.d_iproj, B * 640 * 4);
       DALLOC(&ws_small_.d_iq, B * 512 * 4);
@@ -8490,10 +8490,10 @@ struct GpuModel {
       DALLOC(&ws_small_.d_iscores,
              (size_t)std::min(R, INDEX_BATCH) * 4 * index_blocks * 4);
     }
-    GDEC_WS_DUP(d_mRb, B * 10240 * 4);
-    GDEC_WS_DUP(d_mRhatb, B * 10240 * 4);
-    GDEC_WS_DUP(d_mtap, B * 10240 * 4);
-#undef GDEC_WS_DUP
+    QWENOX_WS_DUP(d_mRb, B * 10240 * 4);
+    QWENOX_WS_DUP(d_mRhatb, B * 10240 * 4);
+    QWENOX_WS_DUP(d_mtap, B * 10240 * 4);
+#undef QWENOX_WS_DUP
     if (d_injp[0]) {
       DALLOC(&ws_small_.d_injp0, B * 16 * 4);
       DALLOC(&ws_small_.d_injp1, B * 16 * 4);
@@ -8510,11 +8510,11 @@ struct GpuModel {
   }
 
   void ws_lend() {  // members -> small set; big pointers saved in ws_saved_
-#define GDEC_WS_SAVE(f) \
+#define QWENOX_WS_SAVE(f) \
     ws_saved_.f = f;    \
     if (ws_small_.f) f = ws_small_.f;
-    GDEC_WS_FIELDS(GDEC_WS_SAVE)
-#undef GDEC_WS_SAVE
+    QWENOX_WS_FIELDS(QWENOX_WS_SAVE)
+#undef QWENOX_WS_SAVE
     ws_saved_.d_injp0 = d_injp[0];
     ws_saved_.d_injp1 = d_injp[1];
     if (ws_small_.d_injp0) {
@@ -8530,10 +8530,10 @@ struct GpuModel {
     ws_lent_ = true;
   }
   void ws_takeback() {  // members -> big set (exact inverse of ws_lend)
-#define GDEC_WS_REST(f) \
+#define QWENOX_WS_REST(f) \
     if (ws_small_.f) f = ws_saved_.f;
-    GDEC_WS_FIELDS(GDEC_WS_REST)
-#undef GDEC_WS_REST
+    QWENOX_WS_FIELDS(QWENOX_WS_REST)
+#undef QWENOX_WS_REST
     if (ws_small_.d_injp0) {
       d_injp[0] = ws_saved_.d_injp0;
       d_injp[1] = ws_saved_.d_injp1;
@@ -8598,7 +8598,7 @@ struct GpuModel {
   void slots_init(int n) {
     if (n <= 1) return;
     if (!kv_paged) {
-      fprintf(stderr, "gdec: GDEC_PARALLEL=%d needs paged KV (GDEC_KV_PAGED); "
+      fprintf(stderr, "qwenox: QWENOX_PARALLEL=%d needs paged KV (QWENOX_KV_PAGED); "
                       "running 1 slot\n", n);
       return;
     }
@@ -8648,16 +8648,16 @@ struct GpuModel {
       }
     }
     nslots = n;
-    if (!env_zero("GDEC_CONC_PREFILL")) {  // D1b: arm the borrow workspace
-      if (const char* v = getenv("GDEC_CONC_PREFILL_QUANTUM_MS"))
+    if (!env_zero("QWENOX_CONC_PREFILL")) {  // D1b: arm the borrow workspace
+      if (const char* v = getenv("QWENOX_CONC_PREFILL_QUANTUM_MS"))
         conc_quantum_ms_ = (float)atof(v);
-      if (const char* v = getenv("GDEC_CONC_RMAX")) conc_rmax_ = atoi(v);
+      if (const char* v = getenv("QWENOX_CONC_RMAX")) conc_rmax_ = atoi(v);
       ws_alloc_small(conc_rmax_);
       if (ws_ok_)
-        fprintf(stderr, "gdec: prefill borrow armed (R<=%d rows, quantum %.0f ms)\n",
+        fprintf(stderr, "qwenox: prefill borrow armed (R<=%d rows, quantum %.0f ms)\n",
                 conc_rmax_, (double)conc_quantum_ms_);
     }
-    fprintf(stderr, "gdec: %d sequence slots (shared KV pool %d pages = %d tokens)\n",
+    fprintf(stderr, "qwenox: %d sequence slots (shared KV pool %d pages = %d tokens)\n",
             n, kv_pool_pages, kv_pool_pages * KV_PAGE);
   }
   // Pages the slot's live sequence maps (bound slot: the members).
@@ -8700,7 +8700,7 @@ struct GpuModel {
       *p_token = token;
       auto g0 = std::chrono::steady_clock::now();
       CK(hipGraphLaunch(g1_exec, 0));
-      dump_decode_step(pos);  // debug only (GDEC_MROPE_DUMP); syncs the stream
+      dump_decode_step(pos);  // debug only (QWENOX_MROPE_DUMP); syncs the stream
       double g1_ms;
       if (ple_on) {
         ple_host(token, ple_e);  // host hash+read overlaps G1 on GPU
@@ -8718,7 +8718,7 @@ struct GpuModel {
       double sync_ms =
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sync0)
               .count();
-      if (getenv("GDEC_TIME")) {
+      if (getenv("QWENOX_TIME")) {
         t_enq += g1_ms;
         t_sync += sync_ms;
         if (t_n % 16 == 15)
@@ -8737,7 +8737,7 @@ struct GpuModel {
     tock(0, T0);
     // layer 0 enqueued first so PLE host reads overlap with GPU work
     enq_layer(0);
-    dump_decode_step(pos);  // debug only (GDEC_MROPE_DUMP); syncs the stream
+    dump_decode_step(pos);  // debug only (QWENOX_MROPE_DUMP); syncs the stream
     if (ple_on) {
       auto t1 = tick();
       ple_host(token, ple_e);
@@ -8759,7 +8759,7 @@ struct GpuModel {
     double sync_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sync0)
             .count();
-    if (getenv("GDEC_TIME")) {
+    if (getenv("QWENOX_TIME")) {
       t_enq += enq_ms;
       t_sync += sync_ms;
       if (t_n % 16 == 15)

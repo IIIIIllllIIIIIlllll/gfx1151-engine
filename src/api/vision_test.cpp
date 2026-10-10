@@ -143,7 +143,7 @@ int main(int argc, char** argv) {
               error.find("file_id") != std::string::npos,
           "file-id-rejected", error);
 
-    gdec::Tokenizer tokenizer;
+    qwenox::Tokenizer tokenizer;
     error.clear();
     check(tokenizer.load(argv[2], &error), "tokenizer-load", error);
     vision::Frame placeholder;

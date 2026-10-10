@@ -2,7 +2,7 @@
 # 一键 B0 验证（MTP KV 进共享页池 + rckpt 恢复后保持 MTP 投机），前台运行，
 # 最后一行 B0 VERIFY: PASS/FAIL。全部跑完约 60-80 分钟。
 #   bash tools/b0_verify.sh
-#   NEW_BIN=build/gdec.conc REF_BIN=build/gdec.ref bash tools/b0_verify.sh
+#   NEW_BIN=build/qwenox.conc REF_BIN=build/qwenox.ref bash tools/b0_verify.sh
 #   B0_STAGES="mem ab" bash tools/b0_verify.sh     # 只跑某几段
 # REF_BIN = B0 之前的二进制（同一套源码只差 B0 的提交）。四段：
 #   mem  PARALLEL=4 启动 REF 与 NEW，比较 GPU 占用：旧版每个额外槽位按 MAX_CONTEXT
@@ -19,8 +19,8 @@
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 source tools/probe_lib.sh
-NEW_BIN="${NEW_BIN:-build/gdec}"
-REF_BIN="${REF_BIN:-build/gdec.ref}"
+NEW_BIN="${NEW_BIN:-build/qwenox-engine}"
+REF_BIN="${REF_BIN:-build/qwenox.ref}"
 B0_STAGES=" ${B0_STAGES:-mem conc a5 ab} "
 want() { [[ "$B0_STAGES" == *" $1 "* ]]; }
 T0=$SECONDS
@@ -51,13 +51,13 @@ crashed() {
 start() {
   local tag=$1 bin=$2; shift 2
   local e cmd=("${BASE[@]}") i
-  for e in $(compgen -e | grep '^GDEC_'); do unset "$e"; done
+  for e in $(compgen -e | grep '^QWENOX_'); do unset "$e"; done
   for e in "${PENV[@]}"; do export "$e"; done
-  export GDEC_KVSNAP=0
+  export QWENOX_KVSNAP=0
   for e in "$@"; do export "$e"; done
-  # D1a：并发引擎的 prefill 分段是 GDEC_CONC_PREFILL_CHUNK，单路是 GDEC_PREFILL_CHUNK。
+  # D1a：并发引擎的 prefill 分段是 QWENOX_CONC_PREFILL_CHUNK，单路是 QWENOX_PREFILL_CHUNK。
   # 本脚本的引擎一律用并发分段，保证单路/并发/旧二进制在同一分段下逐位对比。
-  [[ "${GDEC_CONC_PREFILL_CHUNK:-0}" -gt 0 ]] && export GDEC_PREFILL_CHUNK="$GDEC_CONC_PREFILL_CHUNK"
+  [[ "${QWENOX_CONC_PREFILL_CHUNK:-0}" -gt 0 ]] && export QWENOX_PREFILL_CHUNK="$QWENOX_CONC_PREFILL_CHUNK"
   cmd[0]="$bin"
   for i in "${!cmd[@]}"; do [[ "${cmd[$i]}" == --port ]] && cmd[$((i + 1))]=8732; done
   probe_start "$tag" "${cmd[@]}"
@@ -76,7 +76,7 @@ if want mem; then
   declare -A MEM
   for t in ref new; do
     b="$REF_BIN"; [[ $t == new ]] && b="$NEW_BIN"
-    if start "b0-mem-$t" "$b" GDEC_PARALLEL=4; then
+    if start "b0-mem-$t" "$b" QWENOX_PARALLEL=4; then
       sleep 3
       MEM[$t]="$(gpu_used)"
       echo "[b0-mem-$t] GPU 占用（VRAM+GTT）${MEM[$t]} GiB"
@@ -88,7 +88,7 @@ if want mem; then
   # 预期节省：3 个额外槽位 ×（MTP K+V：maxctx×512×2×元素字节 + keys：maxctx/4×128×4）
   mc=262144 kb=4 i
   for i in "${!BASE[@]}"; do [[ "${BASE[$i]}" == --maxctx ]] && mc="${BASE[$((i + 1))]}"; done
-  printf '%s\n' "${PENV[@]}" | grep -q '^GDEC_QSA_KV_BF16=' && kb=2
+  printf '%s\n' "${PENV[@]}" | grep -q '^QWENOX_QSA_KV_BF16=' && kb=2
   exp="$(awk -v m="$mc" -v k="$kb" 'BEGIN{printf "%.2f", 3 * (m*512*2*k + m/4*128*4) / 1073741824}')"
   a="${MEM[ref]:-}"; b="${MEM[new]:-}"
   if [[ -n "$a" && -n "$b" && "$a" != 0.00 ]]; then
@@ -118,9 +118,9 @@ if want ab; then
   echo; echo "================ ab：切换对话 + MTP 投机（tools/b0_ab.py） ================"
   python3 tools/b0_ab.py reset
   for t in ck nock ref; do
-    b="$NEW_BIN"; ex=(GDEC_RCKPT_MIN=1024)
+    b="$NEW_BIN"; ex=(QWENOX_RCKPT_MIN=1024)
     [[ $t == ref ]] && b="$REF_BIN"
-    [[ $t == nock ]] && ex=(GDEC_RCKPT=0)
+    [[ $t == nock ]] && ex=(QWENOX_RCKPT=0)
     if start "b0-ab-$t" "$b" "${ex[@]}"; then
       python3 tools/b0_ab.py run --tag "$t" || note "ab $t 请求" "FAIL（请求异常）"
       echo "[b0-ab-$t] rckpt restored $(cnt 'rckpt: restored' "$PROBE_LOG") 次（mtp live $(cnt '(mtp live)' "$PROBE_LOG") 次），cow $(cnt '\[kvpage\] cow' "$PROBE_LOG") 次"

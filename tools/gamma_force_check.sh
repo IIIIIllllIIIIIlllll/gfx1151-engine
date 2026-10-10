@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # gamma_force_check.sh — 固定轨迹下比较 γ 策略（greedy MTP）。最后一行 GAMMA FORCE CHECK: PASS/FAIL。
 #   bash tools/gamma_force_check.sh                       # 首次约 30 分钟（含参考序列），之后每个配置约 6 分钟
-#   CFGS="4 3 5 0 0:GDEC_SPEC_ADAPT_R=0.26" bash tools/gamma_force_check.sh
-#   BIN=build/gdec CTX=8192 SPEC=512 OFFS="..." XSET="1 2 3" MIN_RATIO=0.99 bash tools/gamma_force_check.sh
+#   CFGS="4 3 5 0 0:QWENOX_SPEC_ADAPT_R=0.26" bash tools/gamma_force_check.sh
+#   BIN=build/qwenox-engine CTX=8192 SPEC=512 OFFS="..." XSET="1 2 3" MIN_RATIO=0.99 bash tools/gamma_force_check.sh
 # 为什么要固定轨迹：换 γ 会让 greedy 在近并列处翻转、生成内容分叉，单样本 tok/s 差 ±15–27%
 # （gamma_real_check 6 起点汇总仍有 ±7% 噪声）。这里先用普通 greedy 解码（--gen）生成参考序列，
-# 再让每个配置带 GDEC_SPEC_FORCE=参考序列 跑 --spec-gen：验收对照参考 id（verify 照常跑、耗时真实，
+# 再让每个配置带 QWENOX_SPEC_FORCE=参考序列 跑 --spec-gen：验收对照参考 id（verify 照常跑、耗时真实，
 # 草稿接受与否仍由 MTP 决定），所有配置提交完全相同的 token —— 成对比较，只剩计时噪声。
 # 上下文：data/qsa-oracle/131072.tokens 的 OFFS 起点（真实长文）+ XSET（x1 = tok8192 重复多的基准文本，
 #   x2 = src/gpu/parts/40_model.inc 一段 C++，x3 = src/api/*.cpp），各取 CTX 个 token。
@@ -14,7 +14,7 @@
 # 日志：logs/gfc/*.log，汇总 logs/gamma_force_check.out；参考序列缓存 logs/gfc/ref_*.txt（删掉即重做）。
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
-BIN="${BIN:-build/gdec}"
+BIN="${BIN:-build/qwenox-engine}"
 SRC="${SRC:-data/qsa-oracle/131072.tokens}"
 CTX="${CTX:-8192}"
 NS="${SPEC:-512}"
@@ -93,10 +93,10 @@ for c in $CTXS; do
     G=${cfg%%:*}; KV=(); [[ $cfg == *:* ]] && IFS=, read -ra KV <<<"${cfg#*:}"
     tag=$(echo "$cfg" | tr ':=,.' '____'); L="gfc/${c}_$tag"
     printf '  .. %-6s %-28s（%s）' "$c" "$cfg" "$(date +%T)"
-    SPEC=$NS GAMMA=$G BIN=$BIN bash tools/pp_prod.sh "$T" "$L" "GDEC_SPEC_FORCE=$ROOT/$REF" "${KV[@]}" > "logs/$L.stdout" 2>&1 \
+    SPEC=$NS GAMMA=$G BIN=$BIN bash tools/pp_prod.sh "$T" "$L" "QWENOX_SPEC_FORCE=$ROOT/$REF" "${KV[@]}" > "logs/$L.stdout" 2>&1 \
       || die " 运行失败，见 logs/$L.stdout"
     svm_check
-    grep -aq 'spec-gen force:' "logs/$L.log" || die " 日志没有 'spec-gen force:'（$BIN 不含 GDEC_SPEC_FORCE？）"
+    grep -aq 'spec-gen force:' "logs/$L.log" || die " 日志没有 'spec-gen force:'（$BIN 不含 QWENOX_SPEC_FORCE？）"
     got=$(ids "$L" | tr ' ' '\n' | grep -v '^$' | tail -n +$((NP + 2)) | head -n "$NS" | md5sum)
     want=$(head -n "$NS" "$REF" | md5sum)
     [[ $got == "$want" ]] || die " ids 与参考不一致（强制轨迹失效）"
@@ -112,7 +112,7 @@ minr = float(sys.argv[1]); ctxs = sys.argv[2].split(); cfgs = sys.argv[3].split(
 spec_re = re.compile(r'^spec: (\d+) tokens in ([\d.]+) s = ([\d.]+) tok/s \| rounds=(\d+) commit/round=([\d.]+)')
 ad_re = re.compile(r'gamma-adapt: rounds per γ ([\d: ]+)\|')
 tag = lambda c: c.translate(str.maketrans(':=,.', '____'))
-show = lambda c: c.replace('GDEC_SPEC_ADAPT_', '').replace('GDEC_SPEC_', '')
+show = lambda c: c.replace('QWENOX_SPEC_ADAPT_', '').replace('QWENOX_SPEC_', '')
 R = {}
 for c in ctxs:
     for g in cfgs:

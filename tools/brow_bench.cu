@@ -5,8 +5,8 @@
 // 同时逐 bit 比对 brow_r 与 brow（mism 必须为 0）。
 // 编译/运行：hipcc -O3 --offload-arch=gfx1151 -I src/gpu tools/brow_bench.cu \
 //              -lrocblas -lhipblaslt -o build/brow_bench && build/brow_bench
-#define main gdec_real_main
-#include "gdec.cpp"
+#define main qwenox_real_main
+#include "qwenox.cpp"
 #undef main
 
 #include <random>

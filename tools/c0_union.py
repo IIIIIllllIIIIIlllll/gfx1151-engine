@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """D0-M3: 跨序列专家并集比 u（HANDOFF-CONCURRENCY §4-M3）。
 
-输入：GDEC_MOE_TOPIDS_DUMP 产出的 dump 文件，每个文件 = 一个不同 prompt 的
+输入：QWENOX_MOE_TOPIDS_DUMP 产出的 dump 文件，每个文件 = 一个不同 prompt 的
 一次串行 spec 运行。行格式：L <layer> B <base> P <P> 后接 P*k 个专家 id
 （k 由 (字段数-6)/P 推得）。
 

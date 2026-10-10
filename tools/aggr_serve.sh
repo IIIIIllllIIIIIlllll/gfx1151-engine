@@ -16,6 +16,6 @@ start)
 stop)
   p=$(cat logs/aggr_serve.pid 2>/dev/null)
   [ -n "$p" ] && kill -TERM -- "-$p" 2>/dev/null
-  sleep 5; pgrep -af 'build/gdec' || echo STOPPED ;;
-status) pgrep -af 'build/gdec' || echo none ;;
+  sleep 5; pgrep -af 'build/qwenox-engine' || echo STOPPED ;;
+status) pgrep -af 'build/qwenox-engine' || echo none ;;
 esac

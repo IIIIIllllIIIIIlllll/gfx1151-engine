@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """B0: MTP KV in the page pool — speculation survives rckpt restores.
 
-Usage (repo root, one fresh engine on 127.0.0.1:8732 per run; GDEC_KVSNAP=0,
-GDEC_RCKPT_MIN=1024 — tools/b0_verify.sh drives all of this):
+Usage (repo root, one fresh engine on 127.0.0.1:8732 per run; QWENOX_KVSNAP=0,
+QWENOX_RCKPT_MIN=1024 — tools/b0_verify.sh drives all of this):
   python3 tools/b0_ab.py run --tag ck|nock|ref
   python3 tools/b0_ab.py compare
 
@@ -12,7 +12,7 @@ Scenario (MTP drafter 1 / chain 4, greedy unless noted):
   s2/s4/s5/s6 restore A's prompt-end checkpoint, s8/s10 restore the SNAPS-cut
   checkpoint taken mid-prefill. With B0 those restores keep the MTP layer live:
   spec rounds > 0, and the repeat restores (s4 vs s2, s10 vs s8) match exactly.
-  `nock` (GDEC_RCKPT=0) recomputes every prompt and runs spec from a fresh MTP
+  `nock` (QWENOX_RCKPT=0) recomputes every prompt and runs spec from a fresh MTP
   ingest: the restored runs' draft acceptance must be close to it (a stale or
   misaddressed MTP KV collapses acceptance). `ref` (the pre-B0 binary) restores
   with plain decode (rounds == 0): from the same restored trunk state, greedy

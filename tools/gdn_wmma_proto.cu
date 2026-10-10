@@ -1,5 +1,5 @@
 // gdn_wmma_proto.cu — fp16 WMMA prototype for the k_gdn_intra matrix phases
-// (src/gpu/gdec.cpp:5586). Replicates the per-(chunk,head) workflow at the
+// (src/gpu/qwenox.cpp:5586). Replicates the per-(chunk,head) workflow at the
 // production geometry (NT=1024, grid (nchunks,48), CH=64, DK=128):
 //   phase 0: k tile + gate staging (identical both variants)
 //   phase 1: attn = -beta[r]*(K.K^T)*exp(gcum[r]-gcum[j]), j<r   [WMMA-able]
@@ -8,7 +8,7 @@
 //   phase 4: attn2 = (Q.K^T)*exp(gcum[r]-gcum[j]), j<=r          [WMMA-able]
 // Variant 0 keeps the production scalar code verbatim; variant 1 does 1/3/4
 // with __builtin_amdgcn_wmma_f32_16x16x16_f16_w32 (fp32 accum, fp32 gating
-// epilogues; fragment layouts per gdec.cpp:3416).
+// epilogues; fragment layouts per qwenox.cpp:3416).
 // fp16 LDS plan (fits the ~63 KiB block budget): k16 [64][72] + bT [128][72]
 // (v*beta pass, then k*beta*eg pass — bT is reused), attn16 overlaid on
 // s_extra, q16 overlaid on bT in phase 4. Row stride 72 halves = 144 B =
@@ -69,7 +69,7 @@ __device__ __forceinline__ uint16_t gp_f2h(float f) {
 
 constexpr int CH = 64, DK = 128, NT = 1024;
 constexpr int LDS16 = 72;  // fp16 tile row stride (elems), see header
-// ws layout per chunk-head (mirrors gdec.cpp:5537)
+// ws layout per chunk-head (mirrors qwenox.cpp:5537)
 constexpr int WS_ATTN2 = 64, WS_VP = WS_ATTN2 + 64 * 64,
               WS_KCD = WS_VP + 64 * 128, WS_FLOATS = WS_KCD + 64 * 128;
 
@@ -216,7 +216,7 @@ __global__ void __launch_bounds__(NT) k_gdn_proto(
   PH_ACC(V, 1, t1);
   PH_DECL(t2);
 
-  // ---- phase 2: Ut5 solve (verbatim fp32 copy from gdec.cpp:5657) ----
+  // ---- phase 2: Ut5 solve (verbatim fp32 copy from qwenox.cpp:5657) ----
   if (V == 3) {  // null+solve-ablation: keep only the bracketing barriers
     BAR();
   } else {

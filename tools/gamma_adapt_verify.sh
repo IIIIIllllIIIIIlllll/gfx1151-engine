@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# gamma_adapt_verify.sh — 自适应 γ（Model::GammaCtl，--gamma 0 / API 未设 GDEC_SPEC_GAMMA）一键验证
+# gamma_adapt_verify.sh — 自适应 γ（Model::GammaCtl，--gamma 0 / API 未设 QWENOX_SPEC_GAMMA）一键验证
 #   1. 固定 γ 路径不变：BIN vs BASE（改动前二进制），8K greedy γ=4（MTP、chain）+ 采样 γ=3，ids 必须一致
 #   2. 速度：自适应 vs 旧 auto 默认（greedy γ=4 / 采样 γ=3），SPEC=512，多样本汇总
 #      greedy 5 个上下文（32K 文本的 6k..22k 前缀）× γ{4,7,自适应}；采样 8K × 6 seed × γ{3,4,7,自适应}
 #      汇总 tok/s（总 token / 总秒）自适应 ≥ 0.98× 旧默认；64K（重复 prompt，接受率差）单样本 ≥ 0.95× γ=4
-#   3. 采样分布自检：自适应下 GDEC_SMS_CHECK=1（MTP、chain），bad 必须为 0
+#   3. 采样分布自检：自适应下 QWENOX_SMS_CHECK=1（MTP、chain），bad 必须为 0
 # 生产 HQ 权重（日志须含 "dense: 8-bit"）。用法: bash tools/gamma_adapt_verify.sh （约 16 分钟，结尾 PASS / FAIL）
-#   BIN=build/gdec  BASE=build/gdec.pre-adapt  SKIP_64K=1（跳过 64K）
+#   BIN=build/qwenox-engine  BASE=build/qwenox.pre-adapt  SKIP_64K=1（跳过 64K）
 #   PROMPTS="6000 10000 14000 18000 22000"  SEEDS="1 2 3 4 5 6"
 # 注：64K 用的 tok65536.txt 是 tok32768.txt 重复两遍，接受率偏低（正好用来测"接受率差时不掉速"）
 # 日志: logs/gav_*.log，汇总 logs/gamma_adapt_verify.out
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
-BIN="${BIN:-build/gdec}"
-BASE="${BASE:-build/gdec.pre-adapt}"
+BIN="${BIN:-build/qwenox-engine}"
+BASE="${BASE:-build/qwenox.pre-adapt}"
 OUT=logs/gamma_adapt_verify.out
 mkdir -p logs
 exec > >(tee "$OUT") 2>&1
@@ -22,7 +22,7 @@ bad() { echo "  FAIL: $*"; fail=1; }
 ok() { echo "  OK: $*"; }
 SMP="0.7,20,0.8"
 [[ -x "$BIN" ]] || { echo "缺二进制: $BIN"; echo FAIL; exit 1; }
-[[ -x "$BASE" ]] || { echo "缺二进制: $BASE（改动前的 build/gdec 备份）"; echo FAIL; exit 1; }
+[[ -x "$BASE" ]] || { echo "缺二进制: $BASE（改动前的 build/qwenox-engine 备份）"; echo FAIL; exit 1; }
 echo "== gamma_adapt_verify  $(date '+%F %T')  BIN=$BIN BASE=$BASE"
 
 # run LABEL BIN LEN SPEC GAMMA [K=V...] -> logs/LABEL.log
@@ -43,7 +43,7 @@ cpr() { specline "$1" | sed -E 's/.*commit\/round=([0-9.]+).*/\1/'; }
 adline() { grep -ah 'gamma-adapt:' "logs/$1.log" | tail -1 | sed 's/^.*gamma-adapt: //'; }
 
 echo "-- 1. 固定 γ 路径与改动前逐 token 一致（8K，SPEC=256）"
-for spec in "mtp_g4:4:GDEC_SPEC_CHAIN=0" "chain_g4:4:GDEC_SPEC_CHAIN=1" "smp_g3:3:GDEC_SPEC_SAMPLE=$SMP,1"; do
+for spec in "mtp_g4:4:QWENOX_SPEC_CHAIN=0" "chain_g4:4:QWENOX_SPEC_CHAIN=1" "smp_g3:3:QWENOX_SPEC_SAMPLE=$SMP,1"; do
   IFS=: read nm g ex <<<"$spec"
   if run gav_fix_${nm}_new "$BIN" 8k 256 "$g" $ex && run gav_fix_${nm}_base "$BASE" 8k 256 "$g" $ex; then
     if [[ -n "$(ids gav_fix_${nm}_new)" && "$(ids gav_fix_${nm}_new)" == "$(ids gav_fix_${nm}_base)" ]]; then
@@ -78,7 +78,7 @@ pool() {
     for x in $samples; do
       L=gav_${nm}_${x}_g$G
       if [[ $kind == greedy ]]; then run $L "$BIN" "$PD/p$x.txt" 512 "$G" || { bad "$L 运行失败"; continue; }
-      else run $L "$BIN" 8k 512 "$G" "GDEC_SPEC_SAMPLE=$SMP,$x" || { bad "$L 运行失败"; continue; }; fi
+      else run $L "$BIN" 8k 512 "$G" "QWENOX_SPEC_SAMPLE=$SMP,$x" || { bad "$L 运行失败"; continue; }; fi
       tt=$((tt + $(ntok $L))); ts=$(awk "BEGIN{print $ts+$(tsec $L)}")
       row+=" $(tps $L)"
     done
@@ -107,11 +107,11 @@ if [[ "${SKIP_64K:-0}" != 1 ]]; then
   fi
 fi
 
-echo "-- 3. 自适应下采样分布自检（GDEC_SMS_CHECK=1）"
+echo "-- 3. 自适应下采样分布自检（QWENOX_SMS_CHECK=1）"
 for spec in "mtp:0" "chain:1"; do
   IFS=: read nm c <<<"$spec"
   L=gav_chk_$nm
-  if run $L "$BIN" 8k 256 0 GDEC_SPEC_CHAIN=$c GDEC_SMS_CHECK=1 "GDEC_SPEC_SAMPLE=1.0,20,0.95,7"; then
+  if run $L "$BIN" 8k 256 0 QWENOX_SPEC_CHAIN=$c QWENOX_SMS_CHECK=1 "QWENOX_SPEC_SAMPLE=1.0,20,0.95,7"; then
     last=$(grep -ah '^\[sms-check\] n=' "logs/$L.log" | tail -1)
     nmis=$(grep -ac 'MISMATCH' "logs/$L.log")
     n=$(sed -E 's/.* n=([0-9]+) .*/\1/' <<<"$last")

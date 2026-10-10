@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# 并发（GDEC_PARALLEL）一键验证：前台依次起 3~4 个测试引擎（端口 8732），最后一行 PASS/FAIL。
+# 并发（QWENOX_PARALLEL）一键验证：前台依次起 3~4 个测试引擎（端口 8732），最后一行 PASS/FAIL。
 #   bash tools/conc_verify.sh
-#   OLD_BIN=build/gdec.old bash tools/conc_verify.sh      # 另外对拍一个旧二进制的单路结果
-#   NEW_BIN=build/gdec.conc OLD_BIN=build/gdec bash tools/conc_verify.sh
-#   STAGES="ovf" CONC_ENV="GDEC_KV_ZERO=1" bash tools/conc_verify.sh   # 调试：只跑某几段 / 附加引擎环境
+#   OLD_BIN=build/qwenox.old bash tools/conc_verify.sh      # 另外对拍一个旧二进制的单路结果
+#   NEW_BIN=build/qwenox.conc OLD_BIN=build/qwenox-engine bash tools/conc_verify.sh
+#   STAGES="ovf" CONC_ENV="QWENOX_KV_ZERO=1" bash tools/conc_verify.sh   # 调试：只跑某几段 / 附加引擎环境
 # 需要先停掉生产服务。生产环境变量取自 start_hgn.sh --check；kvsnap 关闭，ngram verify
 # 分块固定为 16（自适应分块跨请求共享，会让结果依赖执行顺序）。
 #   1. [OLD_BIN 单路] 与 新二进制单路：同一组请求串行跑，逐 token + spec 统计一致
@@ -15,7 +15,7 @@
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 source tools/probe_lib.sh
-NEW_BIN="${NEW_BIN:-build/gdec}"
+NEW_BIN="${NEW_BIN:-build/qwenox-engine}"
 OLD_BIN="${OLD_BIN:-}"
 STAGES=" ${STAGES:-seq par ovf} "
 read -ra CONC_ENV <<<"${CONC_ENV:-}"
@@ -41,12 +41,12 @@ note() { NAMES+=("$1"); RES+=("$2"); [[ $2 == PASS* ]] || fails=$((fails + 1)); 
 # start <tag> <binary> <parallel> <maxctx|""> [extra env...]
 start() {
   local tag=$1 bin=$2 par=$3 mc=$4; shift 4
-  for e in $(compgen -e | grep '^GDEC_'); do unset "$e"; done
+  for e in $(compgen -e | grep '^QWENOX_'); do unset "$e"; done
   for e in "${PENV[@]}"; do export "$e"; done
-  export GDEC_KVSNAP=0 GDEC_NGRAM_CHUNK=16 GDEC_PARALLEL="$par"
-  # D1a：并发引擎的 prefill 分段是 GDEC_CONC_PREFILL_CHUNK，单路是 GDEC_PREFILL_CHUNK。
+  export QWENOX_KVSNAP=0 QWENOX_NGRAM_CHUNK=16 QWENOX_PARALLEL="$par"
+  # D1a：并发引擎的 prefill 分段是 QWENOX_CONC_PREFILL_CHUNK，单路是 QWENOX_PREFILL_CHUNK。
   # 本脚本的引擎一律用并发分段，保证单路/并发/旧二进制在同一分段下逐位对比。
-  [[ "${GDEC_CONC_PREFILL_CHUNK:-0}" -gt 0 ]] && export GDEC_PREFILL_CHUNK="$GDEC_CONC_PREFILL_CHUNK"
+  [[ "${QWENOX_CONC_PREFILL_CHUNK:-0}" -gt 0 ]] && export QWENOX_PREFILL_CHUNK="$QWENOX_CONC_PREFILL_CHUNK"
   for e in "${CONC_ENV[@]}" "$@"; do export "$e"; done
   local cmd=("${BASE[@]}") i
   cmd[0]="$bin"
@@ -93,7 +93,7 @@ elif start par4 "$NEW_BIN" 4 ""; then
 else note "4 路" "FAIL（引擎启动失败）"; fi
 
 if ! want ovf; then :
-elif start ovf2 "$NEW_BIN" 2 16384 GDEC_RCKPT_MAX=0 GDEC_KV_RESERVE_DECODE=256; then
+elif start ovf2 "$NEW_BIN" 2 16384 QWENOX_RCKPT_MAX=0 QWENOX_KV_RESERVE_DECODE=256; then
   if python3 tools/conc_verify.py ovf; then
     if grep -q 'aborting the later request' "$PROBE_LOG"; then note "池溢出中断后来者" PASS
     else note "池溢出中断后来者" "FAIL（日志里没有 aborting the later request）"; fi

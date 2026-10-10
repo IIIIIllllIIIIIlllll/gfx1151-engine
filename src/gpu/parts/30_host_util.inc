@@ -11,7 +11,7 @@
 static void* g_devarena = nullptr;
 static size_t g_devarena_sz = 0, g_devarena_off = 0;
 static hipError_t dalloc_arena(void** p, size_t bytes, const char* name) {
-  static const bool dbg = getenv("GDEC_ARENA_DEBUG") != nullptr;
+  static const bool dbg = getenv("QWENOX_ARENA_DEBUG") != nullptr;
   size_t off = (g_devarena_off + 255) & ~(size_t)255;
   if (!g_devarena || off + bytes > g_devarena_sz) {
     if (g_devarena) {
@@ -42,16 +42,16 @@ static hipError_t dalloc_arena(void** p, size_t bytes, const char* name) {
 #endif
 
 // 与 devarena_estimate 共享的 maxbatch 决策。32K 是 Linux 上实测能与 68 GiB
-// 模型及长上下文 KV 共存的最大批（GDEC_PREFILL_CHUNK 可压低）；Windows 受
+// 模型及长上下文 KV 共存的最大批（QWENOX_PREFILL_CHUNK 可压低）；Windows 受
 // 96 GiB VRAM 硬门槛限制默认 8192（见 PORTING-WINDOWS.md）。
 // 并发 serve 的 prefill 分段覆盖（D1a）：main 的 serve 分支在 eff_parallel()>1 且
-// GDEC_CONC_PREFILL_CHUNK>0 时设置为 min(它, 单路分段)，之后取代单路值。prefill 只在层间把 GPU
+// QWENOX_CONC_PREFILL_CHUNK>0 时设置为 min(它, 单路分段)，之后取代单路值。prefill 只在层间把 GPU
 // 让给别的会话（D1b），分段越小每层越短、别的会话卡得越短。0 = 不覆盖。
 static int g_maxbatch_override = 0;
 
 static int eff_maxbatch(int maxctx) {
   if (g_maxbatch_override > 0) return std::min(maxctx, g_maxbatch_override);
-  if (const char* e = getenv("GDEC_PREFILL_CHUNK")) {
+  if (const char* e = getenv("QWENOX_PREFILL_CHUNK")) {
     int v = atoi(e);
     if (v > 0) return std::min(maxctx, v);
     return maxctx;
@@ -67,7 +67,7 @@ static int eff_maxbatch(int maxctx) {
 // token，则并入前一个 chunk（该 chunk 最大 maxbatch+slack）。workspace
 // 按 maxbatch+slack 分配。0 禁用。Windows arena 有 95 GiB 硬顶，默认关。
 static int eff_tail_slack() {
-  if (const char* e = getenv("GDEC_PREFILL_TAIL_SLACK"))
+  if (const char* e = getenv("QWENOX_PREFILL_TAIL_SLACK"))
     return std::max(0, atoi(e));
 #ifdef _WIN32
   return 0;
@@ -76,26 +76,26 @@ static int eff_tail_slack() {
 #endif
 }
 
-// 并发序列槽数（GDEC_PARALLEL，serve 模式；1..8）。槽共享同一个 KV 页池，
+// 并发序列槽数（QWENOX_PARALLEL，serve 模式；1..8）。槽共享同一个 KV 页池，
 // 每多一个槽只多 GDN/卷积/环形状态、页表和 MTP KV（见 GpuModel::slots_init）。
 static int eff_parallel() {
-  const char* e = getenv("GDEC_PARALLEL");
+  const char* e = getenv("QWENOX_PARALLEL");
   return e ? std::max(1, std::min(8, atoi(e))) : 1;
 }
 
 // hgn q4cp 路由专家 prefill 走 LUT 解码 WMMA kernel（27_kernels_moe_lut.inc）。
-// 默认开；GDEC_MOE_Q4W=0 恢复旧路径（GDEC_MOE_LT / tiled k_moe_w4）。开启时
-// GDEC_MOE_LT 不生效，其 dequant/gather 缓冲也不分配。
+// 默认开；QWENOX_MOE_Q4W=0 恢复旧路径（QWENOX_MOE_LT / tiled k_moe_w4）。开启时
+// QWENOX_MOE_LT 不生效，其 dequant/gather 缓冲也不分配。
 static bool moe_q4w_env() {
-  const char* s = getenv("GDEC_MOE_Q4W");
+  const char* s = getenv("QWENOX_MOE_Q4W");
   return !(s && *s == '0');
 }
 
 // B1 w4b f16 pairs（k_moe_lut<kQ4CP,...,kF16Pairs> 写 + k_moe_reduce_pw*<K,
-// __half> 读）。默认开（KLD 过线后翻转），GDEC_W4B_PAIRS_F16=0 回退 f32。
+// __half> 读）。默认开（KLD 过线后翻转），QWENOX_W4B_PAIRS_F16=0 回退 f32。
 // 与 40_model.inc moe_q4w_run 的 pairs_f16 必须保持同一语义。
 static bool w4b_pairs_f16_env() {
-  const char* s = getenv("GDEC_W4B_PAIRS_F16");
+  const char* s = getenv("QWENOX_W4B_PAIRS_F16");
   return !s || !(s[0] == '0' && s[1] == 0);
 }
 // d_guvb 可按 f16 pairs 尺寸分配的条件（40_model.inc 构造函数同款）：v2+w4b
@@ -104,13 +104,13 @@ static bool w4b_pairs_f16_env() {
 // 与 f16 pairs 相同（naive gemv 部分积 / 共享专家 scratch / decode 小 P），
 // 没有全尺寸 f32 读者。
 static bool guvb_f16_env() {
-  const char* v2 = getenv("GDEC_V2_PAIRS_F16");
-  const char* nm = getenv("GDEC_MOE_NAIVE_MAX");
+  const char* v2 = getenv("QWENOX_V2_PAIRS_F16");
+  const char* nm = getenv("QWENOX_MOE_NAIVE_MAX");
   return w4b_pairs_f16_env() && !(v2 && v2[0] == '0' && v2[1] == 0) &&
-         moe_q4w_env() && !getenv("GDEC_MOE_NAIVE") &&
-         getenv("GDEC_MOE_ATOMIC") == nullptr &&
-         !getenv("GDEC_MOE_HOST_ROUTE") && !getenv("GDEC_MOE_ORDERED") &&
-         !getenv("GDEC_MOE_UNTILED") && getenv("GDEC_GGUF") == nullptr &&
+         moe_q4w_env() && !getenv("QWENOX_MOE_NAIVE") &&
+         getenv("QWENOX_MOE_ATOMIC") == nullptr &&
+         !getenv("QWENOX_MOE_HOST_ROUTE") && !getenv("QWENOX_MOE_ORDERED") &&
+         !getenv("QWENOX_MOE_UNTILED") && getenv("QWENOX_GGUF") == nullptr &&
          (!nm || atoi(nm) <= 16) && g_cfg.topk == 10 && g_cfg.moe_mid % 64 == 0;
 }
 
@@ -125,49 +125,49 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
     if (t.dtype == 10 || t.dtype == 11 || t.dtype == 4) continue;
     add(t.data_size);
   }
-  const bool qsa_dense = getenv("GDEC_QSA_DENSE") != nullptr;
-  const bool kv_fp32 = getenv("GDEC_QSA_KV_BF16") == nullptr;
-  const bool index_f32 = getenv("GDEC_INDEX_BF16") == nullptr;
-  const bool btv = getenv("GDEC_QSA_WMMA") && !kv_fp32 &&
-                   getenv("GDEC_QSA_WMMA_BTV");
-  const bool fused = getenv("GDEC_PREFILL_UNFUSED") == nullptr;
-  const bool moe_det = getenv("GDEC_MOE_ATOMIC") == nullptr;  // 与 40_model.inc 同步
-  const bool moe_lt_ok = getenv("GDEC_MOE_LT") && !moe_q4w_env() && g_cfg.topk == 10 && moe_det &&
-                         !getenv("GDEC_MOE_HOST_ROUTE") &&
-                         !getenv("GDEC_MOE_ORDERED");
-  const bool lt_cmp = getenv("GDEC_MOE_LT_CMP") != nullptr;
-  const bool lt_ovl = getenv("GDEC_MOE_LT_OVL") != nullptr;
+  const bool qsa_dense = getenv("QWENOX_QSA_DENSE") != nullptr;
+  const bool kv_fp32 = getenv("QWENOX_QSA_KV_BF16") == nullptr;
+  const bool index_f32 = getenv("QWENOX_INDEX_BF16") == nullptr;
+  const bool btv = getenv("QWENOX_QSA_WMMA") && !kv_fp32 &&
+                   getenv("QWENOX_QSA_WMMA_BTV");
+  const bool fused = getenv("QWENOX_PREFILL_UNFUSED") == nullptr;
+  const bool moe_det = getenv("QWENOX_MOE_ATOMIC") == nullptr;  // 与 40_model.inc 同步
+  const bool moe_lt_ok = getenv("QWENOX_MOE_LT") && !moe_q4w_env() && g_cfg.topk == 10 && moe_det &&
+                         !getenv("QWENOX_MOE_HOST_ROUTE") &&
+                         !getenv("QWENOX_MOE_ORDERED");
+  const bool lt_cmp = getenv("QWENOX_MOE_LT_CMP") != nullptr;
+  const bool lt_ovl = getenv("QWENOX_MOE_LT_OVL") != nullptr;
   const bool gdn_split =
-      !getenv("GDEC_GDN_NOSPLIT") && !getenv("GDEC_GDN_LOOP") &&
-      !getenv("GDEC_GDN_FUSED");
-  const bool gdn_str = getenv("GDEC_GDN_STREAM") != nullptr;
-  const bool gdn_pipe = getenv("GDEC_GDN_PIPE") != nullptr;
+      !getenv("QWENOX_GDN_NOSPLIT") && !getenv("QWENOX_GDN_LOOP") &&
+      !getenv("QWENOX_GDN_FUSED");
+  const bool gdn_str = getenv("QWENOX_GDN_STREAM") != nullptr;
+  const bool gdn_pipe = getenv("QWENOX_GDN_PIPE") != nullptr;
   const int gdn_window_chunks = [] {
-    const char* e = getenv("GDEC_GDN_WINDOW_CHUNKS");
+    const char* e = getenv("QWENOX_GDN_WINDOW_CHUNKS");
     return e ? std::max(1, atoi(e)) : 4;
   }();
   const size_t mc = (size_t)maxctx,
                BP = (size_t)(eff_maxbatch(maxctx) + eff_tail_slack());
   const size_t ngdn = g_cfg.layers - g_cfg.layers / 4, nqsa = g_cfg.layers / 4;
   const size_t ib = (mc + 3) / 4, rb = (size_t)g_cfg.branches * g_cfg.d;
-  // GDEC_KV_PAGED：KV/ik（BF16 时含 d_vcbt）按整页（256 token）取整，另加页表与
+  // QWENOX_KV_PAGED：KV/ik（BF16 时含 d_vcbt）按整页（256 token）取整，另加页表与
   // ik gather 缓冲。BF16 KV 的可分页条件与构造函数一致（A1c）
-  const char* kvpe = getenv("GDEC_KV_PAGED");
+  const char* kvpe = getenv("QWENOX_KV_PAGED");
   const bool kv_bf16_pg_ok =
-      qsa_dense || (getenv("GDEC_QSA_WMMA") && !(btv && getenv("GDEC_QSA_WMMA6")) &&
-                    !(btv && getenv("GDEC_QSA_UNION")));
+      qsa_dense || (getenv("QWENOX_QSA_WMMA") && !(btv && getenv("QWENOX_QSA_WMMA6")) &&
+                    !(btv && getenv("QWENOX_QSA_UNION")));
   const bool kv_paged = (kv_fp32 || kv_bf16_pg_ok) && kvpe && atoi(kvpe) != 0;
   const size_t kvpg = (mc + KV_PAGE - 1) / KV_PAGE;
-  // A2/A3：物理页池 = kv_pool_pages_for(mc) 页（默认 kvpg，GDEC_KV_POOL_TOKENS 可加大）
+  // A2/A3：物理页池 = kv_pool_pages_for(mc) 页（默认 kvpg，QWENOX_KV_POOL_TOKENS 可加大）
   // + 1 个 guard 页；页表仍是每序列 kvpg 项
   const size_t kvpool = (size_t)kv_pool_pages_for((int)mc);
   const size_t kv_rows = kv_paged ? (kvpool + 1) * KV_PAGE : mc;
   const size_t ik_rows = kv_paged ? (kvpool + 1) * KV_PAGE_BLOCKS : ib;
   // MTP draft head（构造函数同款开启条件）
-  const bool moe_default = moe_det && !getenv("GDEC_MOE_ORDERED") &&
-                           !getenv("GDEC_MOE_HOST_ROUTE") &&
-                           !getenv("GDEC_MOE_UNTILED") &&
-                           !getenv("GDEC_MOE_FP32_IO");
+  const bool moe_default = moe_det && !getenv("QWENOX_MOE_ORDERED") &&
+                           !getenv("QWENOX_MOE_HOST_ROUTE") &&
+                           !getenv("QWENOX_MOE_UNTILED") &&
+                           !getenv("QWENOX_MOE_FP32_IO");
   const bool mtp_on = ck.find("mtp.fc_hidden.weight") && moe_default;
   // B0：MTP 层是 KV/ik 数组的第 nqsa 层（与 trunk 共用页池，无 d_vcbt）
   const size_t nkv = nqsa + (mtp_on ? 1 : 0);
@@ -193,14 +193,14 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
     add(nkv * ik_rows * 128 * 4);           // d_ik（含 MTP 层）
     if (kv_paged) add(ib * 128 * 4);        // d_ikg
     // C1 f16 twins（与 40_model.inc 的分配门控同步）
-    if (!(getenv("GDEC_INDEX_F16") && getenv("GDEC_INDEX_F16")[0] == '0' &&
-          getenv("GDEC_INDEX_F16")[1] == 0) &&
-        !(getenv("GDEC_INDEX_SCORE64") &&
-          getenv("GDEC_INDEX_SCORE64")[0] == '0' &&
-          getenv("GDEC_INDEX_SCORE64")[1] == 0) &&
-        !(getenv("GDEC_INDEX_SEL2P") && getenv("GDEC_INDEX_SEL2P")[0] == '0' &&
-          getenv("GDEC_INDEX_SEL2P")[1] == 0) &&
-        getenv("GDEC_INDEX_OLDSEL") == nullptr) {
+    if (!(getenv("QWENOX_INDEX_F16") && getenv("QWENOX_INDEX_F16")[0] == '0' &&
+          getenv("QWENOX_INDEX_F16")[1] == 0) &&
+        !(getenv("QWENOX_INDEX_SCORE64") &&
+          getenv("QWENOX_INDEX_SCORE64")[0] == '0' &&
+          getenv("QWENOX_INDEX_SCORE64")[1] == 0) &&
+        !(getenv("QWENOX_INDEX_SEL2P") && getenv("QWENOX_INDEX_SEL2P")[0] == '0' &&
+          getenv("QWENOX_INDEX_SEL2P")[1] == 0) &&
+        getenv("QWENOX_INDEX_OLDSEL") == nullptr) {
       add(bc * 512 * 2);                // d_iqh
       add(nkv * ik_rows * 128 * 2);     // d_ikh
       if (kv_paged) add(ib * 128 * 2);  // d_ikgh
@@ -216,8 +216,8 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   } else {
     add(2 * nkv * kv_rows * 512 * 2);       // d_kcb + d_vcb（含 MTP 层）
     if (btv) add(nqsa * ((kv_rows + 3) / 4) * 2 * 256 * 4 * 2);  // d_vcbt
-    // GDEC_QSA_UNION: d_ublk + d_umask + d_ucount（按单 chunk 组数）
-    if (btv && getenv("GDEC_QSA_UNION")) {
+    // QWENOX_QSA_UNION: d_ublk + d_umask + d_ucount（按单 chunk 组数）
+    if (btv && getenv("QWENOX_QSA_UNION")) {
       const size_t ng = (size_t)BP / 4 + 1;
       add(ng * QSA_UCAP * 4 + ng * 4);
     }
@@ -239,10 +239,10 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   add(BP * g_cfg.topk * 640 * 4);                    // hidb
   add(BP * 10240 * 2 + BP * 6144 * 2);               // xbf16 xbf16b
   // d_skx（B3 split-K，与 GpuModel::gemm_splitk_on 同步）
-  if (getenv("GDEC_GEMM_WMMA") && !getenv("GDEC_GEMM_NO_K64") &&
-      !getenv("GDEC_GEMM_RB") &&
-      !(getenv("GDEC_GEMM_SPLITK") && getenv("GDEC_GEMM_SPLITK")[0] == '0' &&
-        getenv("GDEC_GEMM_SPLITK")[1] == 0))
+  if (getenv("QWENOX_GEMM_WMMA") && !getenv("QWENOX_GEMM_NO_K64") &&
+      !getenv("QWENOX_GEMM_RB") &&
+      !(getenv("QWENOX_GEMM_SPLITK") && getenv("QWENOX_GEMM_SPLITK")[0] == '0' &&
+        getenv("QWENOX_GEMM_SPLITK")[1] == 0))
     add(BP * 6144 * 2);
   if (fused) add(BP * 10240 * 2);                    // Rhatbf16
   add(BP * g_cfg.topk * 4 * 2);                      // tokidx pweight
@@ -297,8 +297,8 @@ static void devarena_init(const Checkpoint& ck, int maxctx) {
 #ifdef _WIN32
   size_t need = devarena_estimate(ck, maxctx);
   double slack_gb = 4.0, cap_gb = 95.0;  // bigalloc 实测 95 GiB 成功 / 96 失败
-  if (const char* e = getenv("GDEC_ARENA_SLACK_GB")) slack_gb = atof(e);
-  if (const char* e = getenv("GDEC_ARENA_CAP_GB")) cap_gb = atof(e);
+  if (const char* e = getenv("QWENOX_ARENA_SLACK_GB")) slack_gb = atof(e);
+  if (const char* e = getenv("QWENOX_ARENA_CAP_GB")) cap_gb = atof(e);
   size_t target = need + (size_t)(slack_gb * 1073741824.0);
   size_t cap = (size_t)(cap_gb * 1073741824.0);
   if (target > cap) {
@@ -317,7 +317,7 @@ static void devarena_init(const Checkpoint& ck, int maxctx) {
             "  this is the process's first large allocation and must land entirely\n"
             "  in VRAM as one block. Check:\n"
             "  1) BIOS VRAM carve-out (256K config needs ~95 GiB; assign 96 GiB),\n"
-            "     or shrink MAX_CONTEXT / GDEC_ARENA_CAP_GB to fit a smaller carve-out\n"
+            "     or shrink MAX_CONTEXT / QWENOX_ARENA_CAP_GB to fit a smaller carve-out\n"
             "  2) no other process holding VRAM (single engine; close browsers/games)\n"
             "  3) TheRock DLLs from build/ sit next to the exe — stale HIP SDK DLLs\n"
             "     in System32 cap one allocation at 41 GiB and fail here\n",
@@ -333,7 +333,7 @@ static void devarena_init(const Checkpoint& ck, int maxctx) {
 #endif
 }
 
-// --- GGUF routed experts (hgn -> GGUF transition, GDEC_GGUF=<first shard>) --
+// --- GGUF routed experts (hgn -> GGUF transition, QWENOX_GGUF=<first shard>) --
 // Trunk routed experts come straight from a llama.cpp GGUF (e.g. Unsloth
 // UD-Q4_K_XL: gate/up Q4_K|Q5_K, down Q5_1|Q8_0) and run on the WMMA kernels
 // of 26_kernels_moe_gguf.inc; everything else still comes from hgn. The
@@ -343,14 +343,14 @@ static void devarena_init(const Checkpoint& ck, int maxctx) {
 // so page-rounded ranges are merged first. The hgn trunk experts are then
 // never registered or touched (their page cache ages out). MTP experts
 // (mtp.layers.0.mlp.experts.*) are not in the main GGUF: with
-// GDEC_GGUF_MTP=<sidecar> they come from its blk.<layers>.ffn_*_exps (Q8_0,
-// same kernels; GDEC_GGUF_MTP_EXPERTS=0 keeps the hgn ones).
+// QWENOX_GGUF_MTP=<sidecar> they come from its blk.<layers>.ffn_*_exps (Q8_0,
+// same kernels; QWENOX_GGUF_MTP_EXPERTS=0 keeps the hgn ones).
 struct GgExperts {
   const uint8_t *gate = nullptr, *up = nullptr, *down = nullptr;
   int tgu = 0, tdn = 0;  // gguf::Type of gate/up and of down
 };
 static gguf::File* g_gguf = nullptr;
-static gguf::File* g_gguf_mtp = nullptr;  // GDEC_GGUF_MTP sidecar
+static gguf::File* g_gguf_mtp = nullptr;  // QWENOX_GGUF_MTP sidecar
 static std::vector<GgExperts> g_ggx;  // per trunk layer; empty = hgn experts
 static GgExperts g_ggx_mtp;           // gate == nullptr: MTP experts from hgn
 static bool gg_on() { return !g_ggx.empty(); }
@@ -364,16 +364,16 @@ static bool is_gguf_experts(const std::string& n) {
 }
 
 static void gguf_experts_open() {
-  const char* path = getenv("GDEC_GGUF");
+  const char* path = getenv("QWENOX_GGUF");
   if (!path || !*path || gg_on()) return;
-  // GDEC_GGUF_EXPERTS=0: keep the hgn routed experts (trunk + MTP) and take
-  // only the dense tensors from the GGUF (GDEC_GGUF_DENSE=1). Quality probe.
-  if (const char* e = getenv("GDEC_GGUF_EXPERTS"); e && !strcmp(e, "0")) {
-    fprintf(stderr, "gguf experts: off (GDEC_GGUF_EXPERTS=0), hgn experts\n");
+  // QWENOX_GGUF_EXPERTS=0: keep the hgn routed experts (trunk + MTP) and take
+  // only the dense tensors from the GGUF (QWENOX_GGUF_DENSE=1). Quality probe.
+  if (const char* e = getenv("QWENOX_GGUF_EXPERTS"); e && !strcmp(e, "0")) {
+    fprintf(stderr, "gguf experts: off (QWENOX_GGUF_EXPERTS=0), hgn experts\n");
     return;
   }
 #ifdef _WIN32
-  throw std::runtime_error("GDEC_GGUF: not supported on Windows yet");
+  throw std::runtime_error("QWENOX_GGUF: not supported on Windows yet");
 #else
   auto t0 = std::chrono::steady_clock::now();
   if (!g_gguf) g_gguf = new gguf::File(path);  // may be open already (gguf_dense_apply)
@@ -394,14 +394,14 @@ static void gguf_experts_open() {
     if (t[0]->ne[0] != D || t[0]->ne[1] != M || t[0]->ne[2] != E || t[1]->type != t[0]->type ||
         t[1]->ne[0] != D || t[1]->ne[1] != M || t[1]->ne[2] != E || t[2]->ne[0] != M ||
         t[2]->ne[1] != D || t[2]->ne[2] != E)
-      throw std::runtime_error("GDEC_GGUF: unexpected expert shapes/types at layer " +
+      throw std::runtime_error("QWENOX_GGUF: unexpected expert shapes/types at layer " +
                                std::to_string(l));
     if (t[0]->type != gguf::Q4_K && t[0]->type != gguf::Q5_K &&
         !(mtp && t[0]->type == gguf::Q8_0))
-      throw std::runtime_error(std::string("GDEC_GGUF: gate/up type ") +
+      throw std::runtime_error(std::string("QWENOX_GGUF: gate/up type ") +
                                gguf::type_name(t[0]->type) + " unsupported");
     if (t[2]->type != gguf::Q5_1 && t[2]->type != gguf::Q8_0)
-      throw std::runtime_error(std::string("GDEC_GGUF: down type ") +
+      throw std::runtime_error(std::string("QWENOX_GGUF: down type ") +
                                gguf::type_name(t[2]->type) + " unsupported");
     for (auto* x : t) {
       const uintptr_t a = (uintptr_t)x->data & ~(uintptr_t)4095;
@@ -418,8 +418,8 @@ static void gguf_experts_open() {
     n_q80 += trunk.back().tdn == gguf::Q8_0;
   }
   GgExperts mtpx;
-  const char* mp = getenv("GDEC_GGUF_MTP");
-  const char* mx = getenv("GDEC_GGUF_MTP_EXPERTS");
+  const char* mp = getenv("QWENOX_GGUF_MTP");
+  const char* mx = getenv("QWENOX_GGUF_MTP_EXPERTS");
   if (mp && *mp && !(mx && !strcmp(mx, "0"))) {
     if (!g_gguf_mtp) g_gguf_mtp = new gguf::File(mp);
     mtpx = take(*g_gguf_mtp, g_cfg.layers, true);  // the MTP block follows the trunk
@@ -437,7 +437,7 @@ static void gguf_experts_open() {
   for (const Range& r : merged) {
     hipError_t re = hipHostRegister((void*)r.a, r.b - r.a, hipHostRegisterMapped);
     if (re != hipSuccess)
-      throw std::runtime_error(std::string("GDEC_GGUF: hipHostRegister: ") +
+      throw std::runtime_error(std::string("QWENOX_GGUF: hipHostRegister: ") +
                                hipGetErrorString(re));
   }
   g_ggx = std::move(trunk);
@@ -451,14 +451,14 @@ static void gguf_experts_open() {
 #endif
 }
 
-// --- GGUF non-expert weights (G3.1, GDEC_GGUF + GDEC_GGUF_DENSE=1) ----------
+// --- GGUF non-expert weights (G3.1, QWENOX_GGUF + QWENOX_GGUF_DENSE=1) ----------
 // Dense/norm/router/HC/PLE-projection tensors are rebuilt from the GGUF under
 // their hgn names (src/gguf_map.h: Q8_0 -> dtype 8 q8g32, F32 vectors ->
 // dtype 1) and override the hgn records, so everything downstream (arena,
-// gemv/gemm dispatch, small fp32 uploads) is unchanged. GDEC_GGUF_MTP=<mtp
+// gemv/gemm dispatch, small fp32 uploads) is unchanged. QWENOX_GGUF_MTP=<mtp
 // sidecar gguf> also replaces the MTP head's non-expert tensors. The PLE
 // n-gram table becomes a view of the GGUF IQ4_NL table when there is no hgn
-// base (pure GGUF start) or GDEC_GGUF_PLE=1. The synthetic host copies of
+// base (pure GGUF start) or QWENOX_GGUF_PLE=1. The synthetic host copies of
 // large tensors are dropped after upload (gguf_dense_release).
 static bool g_gguf_dense = false;
 // 8-bit dense weights (GGUF dense, or an hgn overlay with q8g32 dense tensors,
@@ -474,21 +474,21 @@ static void gguf_dense_apply(Checkpoint& ck) {
         fprintf(stderr, "dense: 8-bit (q8g32) weights present, few-row bf16 gemv on\n");
         break;
       }
-  const char* on = getenv("GDEC_GGUF_DENSE");
+  const char* on = getenv("QWENOX_GGUF_DENSE");
   if (!on || !*on || !strcmp(on, "0")) return;
-  const char* path = getenv("GDEC_GGUF");
-  if (!path || !*path) throw std::runtime_error("GDEC_GGUF_DENSE needs GDEC_GGUF=<first shard>");
+  const char* path = getenv("QWENOX_GGUF");
+  if (!path || !*path) throw std::runtime_error("QWENOX_GGUF_DENSE needs QWENOX_GGUF=<first shard>");
 #ifdef _WIN32
   (void)ck;
-  throw std::runtime_error("GDEC_GGUF_DENSE: not supported on Windows yet");
+  throw std::runtime_error("QWENOX_GGUF_DENSE: not supported on Windows yet");
 #else
   auto t0 = std::chrono::steady_clock::now();
   if (!g_gguf) g_gguf = new gguf::File(path);
-  const char* mp = getenv("GDEC_GGUF_MTP");
+  const char* mp = getenv("QWENOX_GGUF_MTP");
   if (mp && *mp && !g_gguf_mtp) g_gguf_mtp = new gguf::File(mp);
-  // Debug bisect: GDEC_GGUF_DENSE_FILTER=sub1,sub2,...  only hgn names
+  // Debug bisect: QWENOX_GGUF_DENSE_FILTER=sub1,sub2,...  only hgn names
   // containing one of the substrings come from GGUF ("!" prefix = invert).
-  if (const char* f = getenv("GDEC_GGUF_DENSE_FILTER"); f && *f) {
+  if (const char* f = getenv("QWENOX_GGUF_DENSE_FILTER"); f && *f) {
     bool inv = *f == '!';
     std::vector<std::string> subs;
     for (std::string s(f + inv); !s.empty();) {
@@ -505,8 +505,8 @@ static void gguf_dense_apply(Checkpoint& ck) {
   }
   size_t n = gguf_map::build(ck, *g_gguf, g_gguf_mtp);
   // PLE n-gram table: a hgn base keeps its fp8 table by default (KLD 0.0453
-  // vs 0.0511 with the GGUF's IQ4_NL one); pure GGUF / GDEC_GGUF_PLE=1 use IQ4_NL.
-  const char* pe = getenv("GDEC_GGUF_PLE");
+  // vs 0.0511 with the GGUF's IQ4_NL one); pure GGUF / QWENOX_GGUF_PLE=1 use IQ4_NL.
+  const char* pe = getenv("QWENOX_GGUF_PLE");
   const bool ple = (pe && !strcmp(pe, "1")) || !ck.find("layers.1.ple.ngram_embedding.weight");
   if (ple) gguf_map::add_ple_table(ck, *g_gguf);
   size_t bytes = 0;
@@ -933,11 +933,11 @@ static void ht_gemv_p(const WView& w, const void* x, bool xbf16, uint64_t xs, fl
 static bool ht_gemv(const WView& w, const void* x, bool xbf16, uint64_t xs, float* y,
                     uint64_t ys, int P, uint64_t row_off, uint64_t nrows) {
   switch (P) {
-#define GDEC_HTG(PP) \
+#define QWENOX_HTG(PP) \
   case PP: ht_gemv_p<PP>(w, x, xbf16, xs, y, ys, row_off, nrows); return true;
-    GDEC_HTG(1) GDEC_HTG(2) GDEC_HTG(3) GDEC_HTG(4)
-    GDEC_HTG(5) GDEC_HTG(6) GDEC_HTG(7) GDEC_HTG(8)
-#undef GDEC_HTG
+    QWENOX_HTG(1) QWENOX_HTG(2) QWENOX_HTG(3) QWENOX_HTG(4)
+    QWENOX_HTG(5) QWENOX_HTG(6) QWENOX_HTG(7) QWENOX_HTG(8)
+#undef QWENOX_HTG
     default:
       return false;
   }
@@ -958,7 +958,7 @@ static void q6g64_gemv_p(const WView& w, const void* x, bool xbf16, uint64_t xs,
       k_q6g64_gemv<P, float, 8><<<blocks, 256, 0, g_str>>>(wq, (const float*)x, xs, y, ys, R,
                                                            C, st);
   } else if (P >= 2 && C >= 4096 && R <= 2048 && [] {  // P=1: LPR=32 faster (decode -1.7%)
-               const char* e = getenv("GDEC_Q6G_SPLITK");
+               const char* e = getenv("QWENOX_Q6G_SPLITK");
                return !(e && e[0] == '0' && e[1] == 0);
              }()) {
     // aggr 10-05: split-K for long-K small-R (HC mix-down 320x10240)
@@ -981,7 +981,7 @@ static void q6g64_gemv_p(const WView& w, const void* x, bool xbf16, uint64_t xs,
     k_q6g64_skred<P><<<(unsigned)((P * R + 255) / 256), 256, 0, g_str>>>(part, y, ys, R, ns);
   } else if (C >= 8192 && [] {
                // opt-in only: measured slower (P=7 21.4 -> 28.3 ms, 10-05)
-               const char* e = getenv("GDEC_Q6G_ROW256");
+               const char* e = getenv("QWENOX_Q6G_ROW256");
                return e && !(e[0] == '0' && e[1] == 0);
              }()) {
     // aggr 10-05: one row per 256-lane block (see k_q6g64_gemv LPR=256)
@@ -1006,11 +1006,11 @@ static bool q6g64_gemv(const WView& w, const void* x, bool xbf16, uint64_t xs, f
                        uint64_t ys, int P, uint64_t row_off, uint64_t nrows) {
   if (w.cols % 64) return false;
   switch (P) {
-#define GDEC_Q6G(PP) \
+#define QWENOX_Q6G(PP) \
   case PP: q6g64_gemv_p<PP>(w, x, xbf16, xs, y, ys, row_off, nrows); return true;
-    GDEC_Q6G(1) GDEC_Q6G(2) GDEC_Q6G(3) GDEC_Q6G(4)
-    GDEC_Q6G(5) GDEC_Q6G(6) GDEC_Q6G(7) GDEC_Q6G(8)
-#undef GDEC_Q6G
+    QWENOX_Q6G(1) QWENOX_Q6G(2) QWENOX_Q6G(3) QWENOX_Q6G(4)
+    QWENOX_Q6G(5) QWENOX_Q6G(6) QWENOX_Q6G(7) QWENOX_Q6G(8)
+#undef QWENOX_Q6G
     default:
       return false;
   }
@@ -1098,7 +1098,7 @@ static void embed_rows(const WView& et, const int* d_tok, int P, void* out,
                                        et.scale_stride, (float*)out, outstride);
 }
 
-// Multi-row GEMV dispatch (P in 1..8; v2 ht/q6g64 up to GDEC_GEMVMR_MAXP via
+// Multi-row GEMV dispatch (P in 1..8; v2 ht/q6g64 up to QWENOX_GEMVMR_MAXP via
 // chunked ≤8-row passes, weights re-read per pass) for q4cp (dtype 5,
 // fp32/bf16 x), bf16 (dtype 0) and q8g64 (dtype 7) weights: streams the
 // weight once for all P rows. Returns false when the shape/layout is
@@ -1107,14 +1107,14 @@ static int gemvmr_maxp() {
   // 24: gfx1151 A/B crossover (logs/gemvmr_ps*.log, exact-P psweep vs MAXP=8):
   // P=16 -21~-24% wall, P=24 -6.4%, P=32 +8% (chunked re-reads scale P/8).
   static const int v = [] {
-    const char* e = getenv("GDEC_GEMVMR_MAXP");
+    const char* e = getenv("QWENOX_GEMVMR_MAXP");
     return e && *e ? atoi(e) : 24;
   }();
   return v;
 }
 static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
                             uint64_t xstride, bool xbf16 = false) {
-  if (getenv("GDEC_NO_GEMVMR")) return false;
+  if (getenv("QWENOX_NO_GEMVMR")) return false;
   // P > 8: v2 ht/q6g64 only — chunked passes of <= 8 rows re-read the weight
   // (0.5-0.75 B/elem/pass vs ~4.5 B/elem for deq+WMMA, so the crossover is
   // empirical; A/B in logs/gemvmr_sweep_*.log). dtype 0/5/7/8 keep the hard
@@ -1130,7 +1130,7 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
     static bool mrlog = false;
     if (!mrlog) {
       mrlog = true;
-      fprintf(stderr, "gemvmr: v2 chunked ht/q6g64 gemv P<=%d (GDEC_GEMVMR_MAXP)\n",
+      fprintf(stderr, "gemvmr: v2 chunked ht/q6g64 gemv P<=%d (QWENOX_GEMVMR_MAXP)\n",
               gemvmr_maxp());
     }
     for (int off = 0; off < P; off += 8) {
@@ -1154,7 +1154,7 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
       xstride % 8 == 0) {
     // few-row bf16 (HC inject 4x10240 with bf16 x in spec verify, in_proj_a/b
     // 48x2560): one block per row. 8-bit dense only (4-bit hgn unchanged).
-#define GDEC_BROW(PP)                                                          \
+#define QWENOX_BROW(PP)                                                          \
   case PP:                                                                     \
     if (xbf16)                                                                 \
       k_bf16_gemv_row_mp<PP, true><<<(unsigned)w.rows, 256, 0, g_str>>>(      \
@@ -1164,36 +1164,36 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
           (const uint16_t*)w.data, x, y, w.rows, w.cols, xstride);             \
     return true;
     switch (P) {
-      GDEC_BROW(1)
-      GDEC_BROW(2)
-      GDEC_BROW(3)
-      GDEC_BROW(4)
-      GDEC_BROW(5)
-      GDEC_BROW(6)
-      GDEC_BROW(7)
-      GDEC_BROW(8)
+      QWENOX_BROW(1)
+      QWENOX_BROW(2)
+      QWENOX_BROW(3)
+      QWENOX_BROW(4)
+      QWENOX_BROW(5)
+      QWENOX_BROW(6)
+      QWENOX_BROW(7)
+      QWENOX_BROW(8)
       default:
         break;
     }
-#undef GDEC_BROW
+#undef QWENOX_BROW
   }
   if (w.dtype == 0 && !xbf16 && w.cols % 8 == 0) {
     switch (P) {
-#define GDEC_GEMV_MR_CASE(PP)                                              \
+#define QWENOX_GEMV_MR_CASE(PP)                                              \
   case PP:                                                                 \
     k_bf16_gemv_mr<PP><<<(unsigned)blocks, threads, 0, g_str>>>(           \
         (const uint16_t*)w.data, (const float*)x, y, w.rows, w.cols,       \
         xstride);                                                          \
     break;
-      GDEC_GEMV_MR_CASE(1)
-      GDEC_GEMV_MR_CASE(2)
-      GDEC_GEMV_MR_CASE(3)
-      GDEC_GEMV_MR_CASE(4)
-      GDEC_GEMV_MR_CASE(5)
-      GDEC_GEMV_MR_CASE(6)
-      GDEC_GEMV_MR_CASE(7)
-      GDEC_GEMV_MR_CASE(8)
-#undef GDEC_GEMV_MR_CASE
+      QWENOX_GEMV_MR_CASE(1)
+      QWENOX_GEMV_MR_CASE(2)
+      QWENOX_GEMV_MR_CASE(3)
+      QWENOX_GEMV_MR_CASE(4)
+      QWENOX_GEMV_MR_CASE(5)
+      QWENOX_GEMV_MR_CASE(6)
+      QWENOX_GEMV_MR_CASE(7)
+      QWENOX_GEMV_MR_CASE(8)
+#undef QWENOX_GEMV_MR_CASE
       default:
         return false;
     }
@@ -1201,38 +1201,38 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
   }
   if (w.dtype == 7 && w.cols % 64 == 0) {
     if (xbf16) switch (P) {
-#define GDEC_GEMV_MR_CASE(PP)                                              \
+#define QWENOX_GEMV_MR_CASE(PP)                                              \
   case PP:                                                                 \
     k_q8g64_gemv_mr<PP, true><<<(unsigned)blocks, threads, 0, g_str>>>(    \
         w.data, x, y, w.rows, w.cols, xstride);                            \
     break;
-      GDEC_GEMV_MR_CASE(1)
-      GDEC_GEMV_MR_CASE(2)
-      GDEC_GEMV_MR_CASE(3)
-      GDEC_GEMV_MR_CASE(4)
-      GDEC_GEMV_MR_CASE(5)
-      GDEC_GEMV_MR_CASE(6)
-      GDEC_GEMV_MR_CASE(7)
-      GDEC_GEMV_MR_CASE(8)
-#undef GDEC_GEMV_MR_CASE
+      QWENOX_GEMV_MR_CASE(1)
+      QWENOX_GEMV_MR_CASE(2)
+      QWENOX_GEMV_MR_CASE(3)
+      QWENOX_GEMV_MR_CASE(4)
+      QWENOX_GEMV_MR_CASE(5)
+      QWENOX_GEMV_MR_CASE(6)
+      QWENOX_GEMV_MR_CASE(7)
+      QWENOX_GEMV_MR_CASE(8)
+#undef QWENOX_GEMV_MR_CASE
       default:
         return false;
     }
     else switch (P) {
-#define GDEC_GEMV_MR_CASE(PP)                                              \
+#define QWENOX_GEMV_MR_CASE(PP)                                              \
   case PP:                                                                 \
     k_q8g64_gemv_mr<PP><<<(unsigned)blocks, threads, 0, g_str>>>(          \
         w.data, (const float*)x, y, w.rows, w.cols, xstride);              \
     break;
-      GDEC_GEMV_MR_CASE(1)
-      GDEC_GEMV_MR_CASE(2)
-      GDEC_GEMV_MR_CASE(3)
-      GDEC_GEMV_MR_CASE(4)
-      GDEC_GEMV_MR_CASE(5)
-      GDEC_GEMV_MR_CASE(6)
-      GDEC_GEMV_MR_CASE(7)
-      GDEC_GEMV_MR_CASE(8)
-#undef GDEC_GEMV_MR_CASE
+      QWENOX_GEMV_MR_CASE(1)
+      QWENOX_GEMV_MR_CASE(2)
+      QWENOX_GEMV_MR_CASE(3)
+      QWENOX_GEMV_MR_CASE(4)
+      QWENOX_GEMV_MR_CASE(5)
+      QWENOX_GEMV_MR_CASE(6)
+      QWENOX_GEMV_MR_CASE(7)
+      QWENOX_GEMV_MR_CASE(8)
+#undef QWENOX_GEMV_MR_CASE
       default:
         return false;
     }
@@ -1249,7 +1249,7 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
     // verify): one 128-thread block per row (bench P=4: 39->23 / 113->93 us).
     if (xbf16 && w.cols >= 4096 && w.rows <= 4096) {
       // Row-tiled (RPB=4): x fetched once per (group, block) instead of once
-      // per row; bit-exact vs brow (ktest brow_r_bitexact). GDEC_BROW_R=0
+      // per row; bit-exact vs brow (ktest brow_r_bitexact). QWENOX_BROW_R=0
       // opt-out. Only for kBrowRMinP <= P <= kBrowRMaxP: it keeps x[P][32]
       // bf16 and RPB x P accumulators in registers (VGPR 221 at P=4, 256 +
       // spill from P=5; P=6/7/8 spill 98/181/240 regs), so at P >= 6 (γ >= 5
@@ -1261,123 +1261,123 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
       // below (bit-identical results, so the range only changes speed).
       constexpr int kBrowRMinP = 3, kBrowRMaxP = 5;
       static const bool brow_r = [] {
-        const char* e = getenv("GDEC_BROW_R");
+        const char* e = getenv("QWENOX_BROW_R");
         return !e || e[0] != '0';
       }();
       if (brow_r && P >= kBrowRMinP && P <= kBrowRMaxP) {
         switch (P) {
-#define GDEC_Q8BR(PP)                                                          \
+#define QWENOX_Q8BR(PP)                                                          \
   case PP:                                                                     \
     k_q8g32_gemv_brow_r<PP, 128, 4>                                            \
         <<<(unsigned)((w.rows + 3) / 4), 128, 0, g_str>>>(                     \
             q, s, x, y, w.rows, w.cols, xstride);                              \
     return true;
-          GDEC_Q8BR(1)
-          GDEC_Q8BR(2)
-          GDEC_Q8BR(3)
-          GDEC_Q8BR(4)
-          GDEC_Q8BR(5)
-          GDEC_Q8BR(6)
-          GDEC_Q8BR(7)
-          GDEC_Q8BR(8)
+          QWENOX_Q8BR(1)
+          QWENOX_Q8BR(2)
+          QWENOX_Q8BR(3)
+          QWENOX_Q8BR(4)
+          QWENOX_Q8BR(5)
+          QWENOX_Q8BR(6)
+          QWENOX_Q8BR(7)
+          QWENOX_Q8BR(8)
           default:
             return false;
         }
-#undef GDEC_Q8BR
+#undef QWENOX_Q8BR
       }
       switch (P) {
-#define GDEC_Q8B(PP)                                                           \
+#define QWENOX_Q8B(PP)                                                           \
   case PP:                                                                     \
     k_q8g32_gemv_brow<PP, true, 128><<<(unsigned)w.rows, 128, 0, g_str>>>(    \
         q, s, x, y, w.rows, w.cols, xstride);                                  \
     return true;
-        GDEC_Q8B(1)
-        GDEC_Q8B(2)
-        GDEC_Q8B(3)
-        GDEC_Q8B(4)
-        GDEC_Q8B(5)
-        GDEC_Q8B(6)
-        GDEC_Q8B(7)
-        GDEC_Q8B(8)
-#undef GDEC_Q8B
+        QWENOX_Q8B(1)
+        QWENOX_Q8B(2)
+        QWENOX_Q8B(3)
+        QWENOX_Q8B(4)
+        QWENOX_Q8B(5)
+        QWENOX_Q8B(6)
+        QWENOX_Q8B(7)
+        QWENOX_Q8B(8)
+#undef QWENOX_Q8B
         default:
           return false;
       }
     }
-#define GDEC_Q8M(PP, XB, L) \
+#define QWENOX_Q8M(PP, XB, L) \
   q8g32_gemv_multi<PP, XB, L, 256>(q, s, x, y, w.rows, w.cols, xstride, g_str)
-#define GDEC_Q8M_P(PP, XB)                  \
+#define QWENOX_Q8M_P(PP, XB)                  \
   case PP:                                  \
-    if (lpr == 8) GDEC_Q8M(PP, XB, 8);      \
-    else if (lpr == 16) GDEC_Q8M(PP, XB, 16); \
-    else GDEC_Q8M(PP, XB, 32);              \
+    if (lpr == 8) QWENOX_Q8M(PP, XB, 8);      \
+    else if (lpr == 16) QWENOX_Q8M(PP, XB, 16); \
+    else QWENOX_Q8M(PP, XB, 32);              \
     break;
     if (xbf16) switch (P) {
-      GDEC_Q8M_P(1, true)
-      GDEC_Q8M_P(2, true)
-      GDEC_Q8M_P(3, true)
-      GDEC_Q8M_P(4, true)
-      GDEC_Q8M_P(5, true)
-      GDEC_Q8M_P(6, true)
-      GDEC_Q8M_P(7, true)
-      GDEC_Q8M_P(8, true)
+      QWENOX_Q8M_P(1, true)
+      QWENOX_Q8M_P(2, true)
+      QWENOX_Q8M_P(3, true)
+      QWENOX_Q8M_P(4, true)
+      QWENOX_Q8M_P(5, true)
+      QWENOX_Q8M_P(6, true)
+      QWENOX_Q8M_P(7, true)
+      QWENOX_Q8M_P(8, true)
       default:
         return false;
     }
     else switch (P) {
-      GDEC_Q8M_P(1, false)
-      GDEC_Q8M_P(2, false)
-      GDEC_Q8M_P(3, false)
-      GDEC_Q8M_P(4, false)
-      GDEC_Q8M_P(5, false)
-      GDEC_Q8M_P(6, false)
-      GDEC_Q8M_P(7, false)
-      GDEC_Q8M_P(8, false)
+      QWENOX_Q8M_P(1, false)
+      QWENOX_Q8M_P(2, false)
+      QWENOX_Q8M_P(3, false)
+      QWENOX_Q8M_P(4, false)
+      QWENOX_Q8M_P(5, false)
+      QWENOX_Q8M_P(6, false)
+      QWENOX_Q8M_P(7, false)
+      QWENOX_Q8M_P(8, false)
       default:
         return false;
     }
-#undef GDEC_Q8M_P
-#undef GDEC_Q8M
+#undef QWENOX_Q8M_P
+#undef QWENOX_Q8M
     return true;
   }
   if (w.dtype != 5) return false;
   const uint8_t* codes = w.data + 64;
   const uint8_t* scales = w.data + 64 + w.rows * w.cols / 2;
   if (xbf16) switch (P) {
-#define GDEC_GEMV_MR_CASE(PP)                                              \
+#define QWENOX_GEMV_MR_CASE(PP)                                              \
   case PP:                                                                 \
     k_q4cp_gemv_mr<PP, true><<<(unsigned)blocks, threads, 0, g_str>>>(     \
         codes, scales, (const float*)w.data, x, y, w.rows, w.cols,         \
         w.scale_stride, xstride);                                          \
     break;
-    GDEC_GEMV_MR_CASE(1)
-    GDEC_GEMV_MR_CASE(2)
-    GDEC_GEMV_MR_CASE(3)
-    GDEC_GEMV_MR_CASE(4)
-    GDEC_GEMV_MR_CASE(5)
-    GDEC_GEMV_MR_CASE(6)
-    GDEC_GEMV_MR_CASE(7)
-    GDEC_GEMV_MR_CASE(8)
-#undef GDEC_GEMV_MR_CASE
+    QWENOX_GEMV_MR_CASE(1)
+    QWENOX_GEMV_MR_CASE(2)
+    QWENOX_GEMV_MR_CASE(3)
+    QWENOX_GEMV_MR_CASE(4)
+    QWENOX_GEMV_MR_CASE(5)
+    QWENOX_GEMV_MR_CASE(6)
+    QWENOX_GEMV_MR_CASE(7)
+    QWENOX_GEMV_MR_CASE(8)
+#undef QWENOX_GEMV_MR_CASE
     default:
       return false;
   }
   else switch (P) {
-#define GDEC_GEMV_MR_CASE(PP)                                              \
+#define QWENOX_GEMV_MR_CASE(PP)                                              \
   case PP:                                                                 \
     k_q4cp_gemv_mr<PP, false><<<(unsigned)blocks, threads, 0, g_str>>>(    \
         codes, scales, (const float*)w.data, x, y, w.rows, w.cols,         \
         w.scale_stride, xstride);                                          \
     break;
-    GDEC_GEMV_MR_CASE(1)
-    GDEC_GEMV_MR_CASE(2)
-    GDEC_GEMV_MR_CASE(3)
-    GDEC_GEMV_MR_CASE(4)
-    GDEC_GEMV_MR_CASE(5)
-    GDEC_GEMV_MR_CASE(6)
-    GDEC_GEMV_MR_CASE(7)
-    GDEC_GEMV_MR_CASE(8)
-#undef GDEC_GEMV_MR_CASE
+    QWENOX_GEMV_MR_CASE(1)
+    QWENOX_GEMV_MR_CASE(2)
+    QWENOX_GEMV_MR_CASE(3)
+    QWENOX_GEMV_MR_CASE(4)
+    QWENOX_GEMV_MR_CASE(5)
+    QWENOX_GEMV_MR_CASE(6)
+    QWENOX_GEMV_MR_CASE(7)
+    QWENOX_GEMV_MR_CASE(8)
+#undef QWENOX_GEMV_MR_CASE
     default:
       return false;
   }

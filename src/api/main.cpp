@@ -1,4 +1,4 @@
-// main.cpp — gdec-api: C++ OpenAI-compatible front-end.
+// main.cpp — qwenox-api: C++ OpenAI-compatible front-end.
 //
 // Independently implements the OpenAI-compatible front-end from public API
 // schemas and project-owned black-box conformance fixtures. The tokenizer and
@@ -39,10 +39,16 @@
 
 #ifdef _WIN32
 #include "../gpu/os_win32.h"  // wsa_init()
+#include <direct.h>           // _chdir
+#else
+#include <unistd.h>           // chdir, readlink
 #endif
 
+#include "../service_conf.h"
+#include "../engine_net.h"
 #include "chat_template.h"
 #include "engine_client.h"
+#include "engine_sup.h"
 #include "http.h"
 #include "json_py.h"
 #include "power.h"
@@ -52,6 +58,10 @@
 #include "toolparse.h"
 #include "vision.h"
 #include "../rope.h"
+
+#ifdef _WIN32
+#include "tray_win.h"
+#endif
 
 namespace {
 
@@ -69,24 +79,33 @@ struct Config {
     // Server-side sampling/thinking overrides (see apply_overrides). Relative
     // to the working directory, which every launcher sets to the repo root.
     std::string overrides_path = "data/api-overrides.json";
-    std::string admin_key;  // env GDEC_API_ADMIN_KEY; empty = POST open (LAN)
+    std::string admin_key;  // env QWENOX_API_ADMIN_KEY; empty = POST open (LAN)
+    // service.conf 路径：--service-conf > QWENOX_SERVICE_CONF > 自动探测
+    //（CWD 的 service.conf，否则 exe 上一级的 service.conf——build/ 里的
+    // qwenox-api 直接运行也能找到项目根）。
+    std::string service_conf;
 };
 
 Config g_cfg;
-gdec::Tokenizer g_tok;
+svcconf::Conf g_svc_conf;     // service.conf 有效值（env > conf）
+std::mutex g_svc_conf_mtx;    // /admin/config 写与引擎 start 读之间互斥
+std::string g_conf_path;      // 实际使用的 conf 路径
+std::string g_conf_root = ".";  // conf 所在目录（引擎 exe/logs 的基准）
+qwenox::Tokenizer g_tok;
+bool g_tok_ready = false;  // 词表缺失降级：控制台/配置/引擎管理可用，推理 503
 std::mutex g_conn_mtx;  // serialize (re)connects
 std::atomic<long long> g_req_seq{0};
 
-// The engine runs INFO kv_slots sequences at once (GDEC_PARALLEL, sharing
+// The engine runs INFO kv_slots sequences at once (QWENOX_PARALLEL, sharing
 // one KV pool; 1 = batch-1) and takes one GEN per connection.  Up to g_slots
 // generations are in flight here, each on its own pooled engine connection;
 // the rest wait in this front-end queue until a slot is released.  Control
 // queries (MEM/CSTAT) use g_ctl and never wait for a generation slot.
 int g_slots = 1;
 int g_kv_pool = 0;  // shared KV pool tokens from INFO (0 = old engine, unknown)
-std::vector<std::unique_ptr<gdec::EngineClient>> g_pool;  // g_slots clients
-std::vector<gdec::EngineClient*> g_pool_free;             // under g_slot_mtx
-gdec::EngineClient g_ctl;
+std::vector<std::unique_ptr<qwenox::EngineClient>> g_pool;  // g_slots clients
+std::vector<qwenox::EngineClient*> g_pool_free;             // under g_slot_mtx
+qwenox::EngineClient g_ctl;
 std::mutex g_slot_mtx;
 std::condition_variable g_slot_cv;
 int g_in_flight = 0;
@@ -167,16 +186,16 @@ class SlotGuard {
         g_slot_cv.notify_all();
     }
     bool acquired() const { return acquired_; }
-    gdec::EngineClient& engine() const { return *eng_; }
+    qwenox::EngineClient& engine() const { return *eng_; }
     SlotGuard(const SlotGuard&) = delete;
     SlotGuard& operator=(const SlotGuard&) = delete;
 
   private:
     bool acquired_ = false;
-    gdec::EngineClient* eng_ = nullptr;
+    qwenox::EngineClient* eng_ = nullptr;
 };
 
-bool engine_ready(gdec::EngineClient& eng, std::string* err) {
+bool engine_ready(qwenox::EngineClient& eng, std::string* err) {
     std::lock_guard<std::mutex> lk(g_conn_mtx);
     if (eng.connected()) return true;
     return eng.connect(g_cfg.engine_addr, err);
@@ -257,7 +276,7 @@ std::string take_utf8(std::string* pending, bool final) {
 // tokens until it is complete (decode() would otherwise emit U+FFFD first).
 class Detokenizer {
   public:
-    explicit Detokenizer(const gdec::Tokenizer* tok) : tok_(tok) {}
+    explicit Detokenizer(const qwenox::Tokenizer* tok) : tok_(tok) {}
     std::string push(int id) {
         pending_ += tok_->decode_bytes(std::vector<int>{id}, /*skip_special=*/false);
         return take_utf8(&pending_, /*final=*/false);
@@ -265,7 +284,7 @@ class Detokenizer {
     std::string flush() { return take_utf8(&pending_, /*final=*/true); }
 
   private:
-    const gdec::Tokenizer* tok_;
+    const qwenox::Tokenizer* tok_;
     std::string pending_;
 };
 
@@ -276,7 +295,7 @@ class Detokenizer {
 // long reply therefore diverges inside the reply and the next turn re-prefills
 // everything. So every request's sent + generated ids are remembered, and a
 // prompt whose text starts with the same bytes reuses those ids; only the rest
-// is encoded. GDEC_API_TOKCACHE=<tokens> sizes the cache (0 = off).
+// is encoded. QWENOX_API_TOKCACHE=<tokens> sizes the cache (0 = off).
 
 constexpr int kImagePadId = 248056, kVideoPadId = 248057;
 constexpr const char* kVisionPadSpan = "<|vision_start|><|image_pad|><|vision_end|>";
@@ -299,7 +318,7 @@ class TokenCache {
         autosave();
     }
 
-    // Persistence (GDEC_API_TOKCACHE_FILE, default data/tcache.bin, "" = off).
+    // Persistence (QWENOX_API_TOKCACHE_FILE, default data/tcache.bin, "" = off).
     // Layout, little-endian: magic "GDTC1\0\0\0" | u32 version(2) | u32 vocab
     // | u64 count | per entry u64 n_ids + n_ids*i32. Byte offsets and pad runs
     // are rebuilt from the ids at load, so the only compatibility guard is the
@@ -330,7 +349,7 @@ class TokenCache {
         }
         ok = fclose(f) == 0 && ok;
         if (!ok) {
-            fprintf(stderr, "gdec-api: tcache: save %s failed: %s\n", tmp.c_str(),
+            fprintf(stderr, "qwenox-api: tcache: save %s failed: %s\n", tmp.c_str(),
                     strerror(errno));
             remove(tmp.c_str());
             return;
@@ -370,10 +389,10 @@ class TokenCache {
             entries = entries_.size();
         }
         if (!ok)
-            fprintf(stderr, "gdec-api: tcache: %s truncated/mismatched, loaded what parsed\n",
+            fprintf(stderr, "qwenox-api: tcache: %s truncated/mismatched, loaded what parsed\n",
                     file_.c_str());
         if (entries)
-            fprintf(stderr, "gdec-api: tcache: loaded %zu entries (%zu tokens) from %s\n",
+            fprintf(stderr, "qwenox-api: tcache: loaded %zu entries (%zu tokens) from %s\n",
                     entries, tokens, file_.c_str());
     }
 
@@ -545,11 +564,11 @@ TokenCache g_tcache;
 // (<tool_call>, </think>): the TokenCache slices a next-turn prefix there, so
 // a checkpoint at the same spot turns a template-roundtrip mismatch from a
 // full reply re-prefill into re-decoding only the tool call + tool result.
-// GDEC_CKPT_TOKENS=0 disables; the engine ignores unknown/empty hints.
+// QWENOX_CKPT_TOKENS=0 disables; the engine ignores unknown/empty hints.
 std::vector<int> g_ckpt_ids;
 
 std::vector<int> default_ckpt_tokens() {
-    if (const char* e = std::getenv("GDEC_CKPT_TOKENS"))
+    if (const char* e = std::getenv("QWENOX_CKPT_TOKENS"))
         if (!strcmp(e, "0")) return {};
     std::vector<int> ids;
     for (const char* s : {"<tool_call>", "</think>"}) {
@@ -562,7 +581,7 @@ std::vector<int> default_ckpt_tokens() {
             if (!names.empty()) names += ",";
             names += std::to_string(id);
         }
-        fprintf(stderr, "gdec-api: ckpt tokens: %s\n", names.c_str());
+        fprintf(stderr, "qwenox-api: ckpt tokens: %s\n", names.c_str());
     }
     return ids;
 }
@@ -677,7 +696,7 @@ GenOutcome run_generation(GenSpec& spec,
         out.client_gone = true;
         return out;
     }
-    gdec::EngineClient& eng = slot.engine();
+    qwenox::EngineClient& eng = slot.engine();
     std::string err;
     if (!engine_ready(eng, &err)) {
         fprintf(stderr, "REQ %s 502 engine connect failed: %s\n", log_tag.c_str(), err.c_str());
@@ -686,7 +705,7 @@ GenOutcome run_generation(GenSpec& spec,
 
     const long long req_id = ++g_req_seq;
 
-    gdec::GenParams p;
+    qwenox::GenParams p;
     p.req = req_id;
     p.ids = spec.ids;
     const long long budget = static_cast<long long>(g_cfg.context) -
@@ -768,7 +787,7 @@ GenOutcome run_generation(GenSpec& spec,
         return deliver(delta);
     };
 
-    gdec::GenResult r = eng.generate(p, [&](int tok, float lp) {
+    qwenox::GenResult r = eng.generate(p, [&](int tok, float lp) {
         (void)lp;
         ++emitted;
         return emit(detok.push(tok));
@@ -1199,20 +1218,20 @@ void load_overrides() {
     if (!f) return;  // no file yet: every field follows the client
     try {
         g_overrides = validate_overrides(json::parse(f));
-        fprintf(stderr, "gdec-api: overrides from %s: %s\n", g_cfg.overrides_path.c_str(),
+        fprintf(stderr, "qwenox-api: overrides from %s: %s\n", g_cfg.overrides_path.c_str(),
                 g_overrides.dump().c_str());
     } catch (const http::Error& e) {
-        fprintf(stderr, "gdec-api: ignoring %s: %s\n", g_cfg.overrides_path.c_str(),
+        fprintf(stderr, "qwenox-api: ignoring %s: %s\n", g_cfg.overrides_path.c_str(),
                 e.message.c_str());
     } catch (const std::exception& e) {
-        fprintf(stderr, "gdec-api: ignoring %s: %s\n", g_cfg.overrides_path.c_str(), e.what());
+        fprintf(stderr, "qwenox-api: ignoring %s: %s\n", g_cfg.overrides_path.c_str(), e.what());
     }
 }
 
 enum class Api { Completions, Chat, Responses };
 
 // Rewrites `body` per the override table and reports the fields it changed in
-// the X-Gdec-Overrides response header.
+// the X-Qwenox-Overrides response header.
 void apply_overrides(json* body, Api api, http::Response* r) {
     json table;
     {
@@ -1273,7 +1292,7 @@ void apply_overrides(json* body, Api api, http::Response* r) {
     if (changed.empty()) return;
     std::string list;
     for (const auto& c : changed) list += (list.empty() ? "" : ",") + c;
-    r->set("X-Gdec-Overrides", list);
+    r->set("X-Qwenox-Overrides", list);
 }
 
 bool admin_ok(const http::Request& q) {
@@ -1311,12 +1330,157 @@ void handle_overrides_post(const http::Request& q, http::Response* r, http::Stre
         g_overrides = table;
     }
     const bool saved = save_overrides(table, &err);
-    fprintf(stderr, "gdec-api: overrides set by %s: %s%s\n", q.remote.c_str(),
+    fprintf(stderr, "qwenox-api: overrides set by %s: %s%s\n", q.remote.c_str(),
             table.dump().c_str(), saved ? "" : (" (NOT persisted: " + err + ")").c_str());
     json j = overrides_state();
     j["saved"] = saved;
     if (!saved) j["save_error"] = err;
     r->body = json_py::dumps(j, /*spaced=*/false);
+}
+
+// ------------------------------------------------------ service.conf 管理 --
+// /admin/config：网页前端读写 service.conf 的受管键（与托盘面板同款，
+// svcconf::kManagedKeys）。写回只改 conf 文件：运行中的引擎与 API 监听端口
+// 不受影响，下次启动生效（响应 applied:"next_start"）。
+
+std::string eff_engine_host() {
+    std::lock_guard<std::mutex> lk(g_svc_conf_mtx);
+    return svcconf::cfg(g_svc_conf, "ENGINE_HOST", "127.0.0.1");
+}
+
+int eff_engine_port() {
+    std::lock_guard<std::mutex> lk(g_svc_conf_mtx);
+    long p = 8730;
+    svcconf::parse_int(svcconf::cfg(g_svc_conf, "ENGINE_PORT", "8730"), &p);
+    return static_cast<int>(p);
+}
+
+json engine_status_json() {
+    const enginesup::Status st = enginesup::status(eff_engine_host(), eff_engine_port());
+    json j;
+    j["state"] = st.state;
+    j["pid"] = st.pid;
+    j["exit_code"] = st.exit_code;
+    j["log"] = st.log;
+    j["external"] = st.external;
+    j["detail"] = st.detail;
+    j["can_control"] = enginesup::supported();
+    return j;
+}
+
+// GET /admin/config
+void handle_config_get(const http::Request&, http::Response* r, http::Stream*) {
+    json j;
+    j["path"] = g_conf_path;
+    j["can_control_engine"] = enginesup::supported();
+#ifdef _WIN32
+    j["platform"] = "windows";
+#else
+    j["platform"] = "linux";
+#endif
+    j["admin_key_required"] = !g_cfg.admin_key.empty();
+    json vals = json::object();
+    json env_ovr = json::array();
+    {
+        std::lock_guard<std::mutex> lk(g_svc_conf_mtx);
+        for (size_t i = 0; i < svcconf::kManagedKeysCount; ++i) {
+            const char* key = svcconf::kManagedKeys[i];
+            if (getenv(key)) env_ovr.push_back(key);  // 环境变量覆盖：conf 改了也不生效
+            vals[key] = svcconf::cfg_optional(g_svc_conf, key, "");
+        }
+    }
+    j["values"] = vals;
+    j["env_overridden"] = env_ovr;
+    j["engine"] = engine_status_json();
+    r->set("Cache-Control", "no-store");
+    r->body = json_py::dumps(j, /*spaced=*/false);
+}
+
+// POST /admin/config — {"values": {KEY: "value", ...}}，只接受受管键。
+void handle_config_post(const http::Request& q, http::Response* r, http::Stream*) {
+    if (!admin_ok(q))
+        http::fail(401, "admin key required (Authorization: Bearer <key> or X-Admin-Key)");
+    const json body = parse_body(q);
+    const json& vals_j = body.contains("values") ? body["values"] : body;
+    if (!vals_j.is_object()) http::fail(400, "expected {\"values\": {KEY: \"value\"}}");
+    std::map<std::string, std::string> vals;
+    for (auto it = vals_j.begin(); it != vals_j.end(); ++it) {
+        if (!svcconf::is_managed_key(it.key()))
+            http::fail(400, "unknown or unmanaged key: " + it.key());
+        if (!it.value().is_string()) http::fail(400, "value must be a string: " + it.key());
+        vals[it.key()] = it.value().get<std::string>();
+    }
+    if (vals.empty()) http::fail(400, "no keys to save");
+    std::string err;
+    json env_ovr = json::array();
+    {
+        std::lock_guard<std::mutex> lk(g_svc_conf_mtx);
+        // 合并到当前有效值后整表校验（端口互异、YaRN 上限、KV 池上限等）
+        svcconf::Conf merged = g_svc_conf;
+        for (const auto& kv : vals) merged[kv.first] = kv.second;
+        if (!svcconf::validate_conf(merged, &err)) http::fail(400, err);
+        if (!svcconf::save_conf(g_conf_path, vals, &err)) http::fail(500, err);
+        g_svc_conf = merged;  // 内存有效值同步（引擎 start 端点用）
+        for (const auto& kv : vals)
+            if (getenv(kv.first.c_str())) env_ovr.push_back(kv.first);
+    }
+    fprintf(stderr, "qwenox-api: service.conf updated by %s (%zu keys)\n", q.remote.c_str(),
+            vals.size());
+    json j;
+    j["saved"] = true;
+    j["applied"] = "next_start";  // 运行中的引擎/API 不受影响，下次启动生效
+    if (!env_ovr.empty())
+        j["env_overridden"] = env_ovr;  // 这些键被环境变量覆盖，conf 改动不生效
+    j["engine"] = engine_status_json();
+    r->body = json_py::dumps(j, /*spaced=*/false);
+}
+
+// GET /admin/engine/status
+void handle_engine_status(const http::Request&, http::Response* r, http::Stream*) {
+    r->set("Cache-Control", "no-store");
+    r->body = json_py::dumps(engine_status_json(), /*spaced=*/false);
+}
+
+// POST /admin/engine/start — 仅 Windows；Linux 返回 501（改配置后由启动脚本生效）。
+void handle_engine_start(const http::Request& q, http::Response* r, http::Stream*) {
+    if (!admin_ok(q))
+        http::fail(401, "admin key required (Authorization: Bearer <key> or X-Admin-Key)");
+    if (!enginesup::supported())
+        http::fail(501,
+                   "engine start/stop is only supported on Windows; on Linux edit the "
+                   "config and restart via start_hgn.sh / start_gguf.sh");
+    const enginesup::Status st = enginesup::status(eff_engine_host(), eff_engine_port());
+    if (st.state == "running" || st.state == "starting")
+        http::fail(409, st.external ? "engine already running (started externally)"
+                                    : "engine already running");
+    svcconf::Conf conf;
+    {
+        std::lock_guard<std::mutex> lk(g_svc_conf_mtx);
+        conf = g_svc_conf;
+    }
+    std::string err;
+    if (!svcconf::validate_conf(conf, &err)) http::fail(400, err);
+    if (!enginesup::start(g_conf_root, conf, &err)) http::fail(400, err);
+    fprintf(stderr, "qwenox-api: engine start requested by %s\n", q.remote.c_str());
+    r->body = json_py::dumps(engine_status_json(), /*spaced=*/false);
+}
+
+// POST /admin/engine/stop — 仅 Windows；外部引擎（非本进程拉起）返回 409。
+void handle_engine_stop(const http::Request& q, http::Response* r, http::Stream*) {
+    if (!admin_ok(q))
+        http::fail(401, "admin key required (Authorization: Bearer <key> or X-Admin-Key)");
+    if (!enginesup::supported())
+        http::fail(501,
+                   "engine start/stop is only supported on Windows; on Linux edit the "
+                   "config and restart via start_hgn.sh / start_gguf.sh");
+    const enginesup::Status st = enginesup::status(eff_engine_host(), eff_engine_port());
+    if (st.external)
+        http::fail(409, "engine was not started by this API process; stop it from its "
+                        "own launcher");
+    std::string err;
+    if (!enginesup::stop(&err)) http::fail(409, err);
+    fprintf(stderr, "qwenox-api: engine stop requested by %s\n", q.remote.c_str());
+    r->body = json_py::dumps(engine_status_json(), /*spaced=*/false);
 }
 
 struct ToolSetup {
@@ -1924,6 +2088,7 @@ void handle_health(const http::Request&, http::Response* r, http::Stream*) {
     json j;
     j["status"] = "ok";
     j["model"] = g_cfg.model;
+    j["tokenizer"] = g_tok_ready;  // false = 词表缺失，推理端点 503
     j["endpoints"] = json::array(
         {"/v1/chat/completions", "/v1/completions", "/v1/models", "/v1/responses",
          "/dashboard", "/reqstat/summary", "/reqstat/tail", "/reqstat/page"});
@@ -1956,6 +2121,11 @@ void handle_health(const http::Request&, http::Response* r, http::Stream*) {
         std::lock_guard<std::mutex> lk(g_slot_mtx);
         j["queued"] = g_queued;
     }
+    // 引擎状态给控制台指示灯用（ENG 灯）：stopped/starting/running/exited；
+    // external = 外部拉起的引擎（脚本/旧启动器），不可由 API 停止
+    const enginesup::Status est = enginesup::status(eff_engine_host(), eff_engine_port());
+    j["engine"] = est.state;
+    j["engine_external"] = est.external;
     j["decode"] = std::string(
         "greedy at explicit temperature 0; Qwen-default sampling (temp 1.0, top_k 20, "
         "top_p 0.95) when temperature is omitted; sampled at temperature > 0");
@@ -2008,6 +2178,9 @@ void handle_health(const http::Request&, http::Response* r, http::Stream*) {
 
 // POST /v1/completions — raw prompt, no chat template.
 void handle_completions(const http::Request& q, http::Response* r, http::Stream* st) {
+    if (!g_tok_ready)
+        http::fail(503, "tokenizer not loaded (" + g_cfg.tokenizer_dir +
+                        "); check TOKENIZER_DIR in service.conf");
     json mutable_body = parse_body(q);
     apply_overrides(&mutable_body, Api::Completions, r);
     const json& body = mutable_body;
@@ -2278,6 +2451,9 @@ std::vector<long long> compute_snap_cuts(const json& messages,
 
 // POST /v1/chat/completions
 void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
+    if (!g_tok_ready)
+        http::fail(503, "tokenizer not loaded (" + g_cfg.tokenizer_dir +
+                        "); check TOKENIZER_DIR in service.conf");
     json mutable_body = parse_body(q);
     apply_overrides(&mutable_body, Api::Chat, r);
     const json& body = mutable_body;
@@ -2496,6 +2672,9 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
 
 // POST /v1/responses -- stateless text and function-call subset.
 void handle_responses(const http::Request& q, http::Response* r, http::Stream* st) {
+    if (!g_tok_ready)
+        http::fail(503, "tokenizer not loaded (" + g_cfg.tokenizer_dir +
+                        "); check TOKENIZER_DIR in service.conf");
     json mutable_body = parse_body(q);
     apply_overrides(&mutable_body, Api::Responses, r);
     const json& body = mutable_body;
@@ -2861,9 +3040,11 @@ void probe_engine() {
     // wedged engine falls back to the configured defaults (and one slot)
     // instead of blocking the listen socket for minutes. The control
     // connection keeps the short timeouts: MEM/CSTAT answer at once.
+    // The connect itself is bounded too: on some machines a refused loopback
+    // connect takes ~2s to come back (filter driver), delaying startup.
     g_ctl.set_timeouts(5.0, 5.0);
-    if (!g_ctl.connect(g_cfg.engine_addr, &err)) {
-        fprintf(stderr, "gdec-api: engine connect failed: %s\n", err.c_str());
+    if (!g_ctl.connect(g_cfg.engine_addr, &err, 0.3)) {
+        fprintf(stderr, "qwenox-api: engine connect failed: %s\n", err.c_str());
     } else if (g_ctl.info(&line, &err)) {
         // I mtp draft_head ctx spec_rows default drafter_weights dflash2
         //   cache_mb cache_align kv_slots slot_ctx cache_mode sampling
@@ -2879,16 +3060,16 @@ void probe_engine() {
         }
         if (f.size() >= 10 && f[9] >= 1 && f[9] <= 64) g_slots = (int)f[9];
         if (f.size() >= 14 && f[13] > 0) g_kv_pool = (int)f[13];
-        fprintf(stderr, "gdec-api: engine INFO: %s\n", line.c_str());
+        fprintf(stderr, "qwenox-api: engine INFO: %s\n", line.c_str());
     } else {
-        fprintf(stderr, "gdec-api: engine INFO unavailable (%s); continuing with "
+        fprintf(stderr, "qwenox-api: engine INFO unavailable (%s); continuing with "
                         "ctx=%d\n", err.c_str(), g_cfg.context);
     }
     for (int i = 0; i < g_slots; ++i) {
-        g_pool.push_back(std::make_unique<gdec::EngineClient>());
+        g_pool.push_back(std::make_unique<qwenox::EngineClient>());
         g_pool_free.push_back(g_pool.back().get());
     }
-    fprintf(stderr, "gdec-api: %d concurrent generation slot%s (per-slot context %d,"
+    fprintf(stderr, "qwenox-api: %d concurrent generation slot%s (per-slot context %d,"
             " shared KV pool %d)\n",
             g_slots, g_slots > 1 ? "s" : "", g_cfg.context,
             g_kv_pool > 0 ? g_kv_pool : g_cfg.context);
@@ -2896,72 +3077,266 @@ void probe_engine() {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+// exe 所在目录：service.conf 自动探测的兜底基准（build/ 里的 exe → 上一级项目根）。
+static std::string exe_dir() {
 #ifdef _WIN32
-    if (!wsa_init()) {
-        std::fprintf(stderr, "WSAStartup failed\n");
-        return 1;
+    char buf[MAX_PATH];
+    const DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    std::string p(buf, n ? static_cast<size_t>(n) : 0);
+#else
+    char buf[4096];
+    const ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    std::string p = n > 0 ? std::string(buf, static_cast<size_t>(n)) : std::string();
+#endif
+    const size_t slash = p.find_last_of("\\/");
+    return slash == std::string::npos ? "." : p.substr(0, slash);
+}
+
+// 致命退出：双击运行（独占控制台）时窗口会随进程关闭，暂停一下让错误可读。
+// 从终端运行（共享控制台）时不暂停；托盘模式（无控制台）弹 MessageBox。
+#ifdef _WIN32
+static bool g_tray_mode = true;       // 托盘模式（默认）；--console 时为 false
+static std::string g_api_log_abs;     // 托盘模式 stdout/stderr 重定向的日志（绝对路径）
+
+// UTF-8 → UTF-16 的 MessageBox：A 版弹窗在非中文系统上中文会乱码
+static void mb_qwenox(const char* text, UINT icon) {
+    const int n = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
+    std::wstring w(n > 0 ? n - 1 : 0, L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, text, -1, w.data(), n);
+    MessageBoxW(nullptr, w.c_str(), L"Qwenox", icon | MB_OK | MB_SETFOREGROUND | MB_TOPMOST);
+}
+
+// 本程序是 GUI 子系统（双击不出黑窗）。--console 需要控制台：先尝试挂到调用者
+// （cmd）的控制台上，不行就新开一个窗口。stdout 已被调用方重定向（如
+// start_win.sh 的日志文件）时不抢控制台，保持重定向原样。
+static void console_open() {
+    const DWORD t = GetFileType(GetStdHandle(STD_OUTPUT_HANDLE));
+    if (t == FILE_TYPE_DISK || t == FILE_TYPE_PIPE) return;
+    const bool attached = AttachConsole(ATTACH_PARENT_PROCESS) != 0;
+    if (!attached && !AllocConsole()) return;
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE out = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
+    HANDLE in = CreateFileA("CONIN$", GENERIC_READ | GENERIC_WRITE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
+    if (out != INVALID_HANDLE_VALUE) {
+        SetStdHandle(STD_OUTPUT_HANDLE, out);
+        SetStdHandle(STD_ERROR_HANDLE, out);
+    }
+    if (in != INVALID_HANDLE_VALUE) SetStdHandle(STD_INPUT_HANDLE, in);
+    freopen("CONOUT$", "w", stdout);
+    freopen("CONOUT$", "w", stderr);
+    freopen("CONIN$", "r", stdin);
+    SetConsoleOutputCP(CP_UTF8);
+    if (attached) printf("\n");  // cmd 的提示符已经先打印了，另起一行
+}
+#endif
+
+static int gexit(int code) {
+#ifdef _WIN32
+    if (g_tray_mode) {
+        fflush(stdout);
+        fflush(stderr);
+        mb_qwenox("Qwenox failed to start. See logs\\api-win-*.log for details.\n"
+                  "Qwenox 启动失败，详情见 logs\\api-win-*.log",
+                  MB_ICONERROR);
+        return code;
+    }
+    DWORD ids[8];
+    if (GetConsoleWindow() && GetConsoleProcessList(ids, 8) <= 1) {
+        fflush(stdout);
+        fflush(stderr);
+        system("pause");
     }
 #endif
+    return code;
+}
+
+int main(int argc, char** argv) {
+#ifdef _WIN32
+    // 预扫描 --console：本程序是 GUI 子系统，默认托盘模式（无控制台）；
+    // --console 立即开控制台，让用法/错误输出可见。
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--console") == 0) g_tray_mode = false;
+    if (!g_tray_mode) console_open();
+    if (!wsa_init()) {
+        std::fprintf(stderr, "WSAStartup failed\n");
+        return gexit(1);
+    }
+#endif
+    // 记录 argv 显式给定的项：未给定的由 service.conf 补默认（独立启动自举）。
+    bool arg_tokenizer = false, arg_engine = false, arg_listen = false,
+         arg_context = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : std::string(); };
-        if (a == "--tokenizer") g_cfg.tokenizer_dir = next();
-        else if (a == "--engine") g_cfg.engine_addr = next();
+        if (a == "--tokenizer") { g_cfg.tokenizer_dir = next(); arg_tokenizer = true; }
+        else if (a == "--engine") { g_cfg.engine_addr = next(); arg_engine = true; }
         else if (a == "--port") {
             const std::string p = next();
             g_cfg.listen = g_cfg.listen.substr(0, g_cfg.listen.rfind(':') + 1) + p;
+            arg_listen = true;
         } else if (a == "--host") {
             const std::string h = next();
             g_cfg.listen = h + ":" + g_cfg.listen.substr(g_cfg.listen.rfind(':') + 1);
-        } else if (a == "--context") g_cfg.context = std::atoi(next().c_str());
+            arg_listen = true;
+        } else if (a == "--context") { g_cfg.context = std::atoi(next().c_str()); arg_context = true; }
         else if (a == "--model") g_cfg.model = next();
-        else if (a == "--listen") g_cfg.listen = next();
+        else if (a == "--listen") { g_cfg.listen = next(); arg_listen = true; }
         else if (a == "--overrides") g_cfg.overrides_path = next();  // "" = memory only
+        else if (a == "--service-conf") g_cfg.service_conf = next();
+#ifdef _WIN32
+        else if (a == "--console") g_tray_mode = false;  // 已在 main 开头预扫描并开控制台
+#endif
         else {
             fprintf(stderr,
                     "usage: %s [--tokenizer DIR] [--engine H:P] [--listen H:P] "
                     "[--port N] [--host H] [--context N] [--model NAME] "
-                    "[--overrides FILE]\n",
+                    "[--overrides FILE] [--service-conf FILE]"
+#ifdef _WIN32
+                    " [--console]"
+#endif
+                    "\n",
                     argv[0]);
-            return 2;
+            return gexit(2);
         }
     }
+    // ---- service.conf：独立启动（无 argv）时从 conf 自举 ----------------------
+    {
+        std::string path = g_cfg.service_conf;
+        if (path.empty())
+            if (const char* e = std::getenv("QWENOX_SERVICE_CONF")) path = e;
+        bool from_exe_fallback = false;
+        if (path.empty()) {
+            path = "service.conf";
+            std::string probe;
+            if (!svcconf::read_text_file(path, &probe)) {
+                // build/ 里的 exe 直接运行：CWD 没有 conf 时找 exe 上一级的项目根
+                const std::string dir = exe_dir();
+                const std::string alt = dir + "/../service.conf";
+                if (svcconf::read_text_file(alt, &probe)) {
+                    path = alt;
+                    from_exe_fallback = true;
+                }
+            }
+        }
+        g_conf_path = path;
+        const size_t slash = path.find_last_of("\\/");
+        g_conf_root = slash == std::string::npos ? "." : path.substr(0, slash);
+        if (g_conf_root.empty()) g_conf_root = "/";
+        if (from_exe_fallback) {
+            // 相对路径（tokenizer、overrides、logs、模型）都以项目根为基准
+#ifdef _WIN32
+            _chdir(g_conf_root.c_str());
+#else
+            chdir(g_conf_root.c_str());
+#endif
+        }
+        svcconf::load_conf(path, &g_svc_conf);
+        // 优先级 argv > env > conf > 内置（svcconf::cfg 已含 env > conf）
+        if (!arg_tokenizer)
+            g_cfg.tokenizer_dir =
+                svcconf::cfg(g_svc_conf, "TOKENIZER_DIR", g_cfg.tokenizer_dir);
+        if (!arg_engine)
+            g_cfg.engine_addr =
+                engine_net::connect_host(svcconf::cfg(g_svc_conf, "ENGINE_HOST",
+                                                      engine_net::kDefaultHost)) +
+                ":" + svcconf::cfg(g_svc_conf, "ENGINE_PORT", "8730");
+        if (!arg_listen)
+            g_cfg.listen = svcconf::cfg(g_svc_conf, "API_HOST", "0.0.0.0") + ":" +
+                           svcconf::cfg(g_svc_conf, "API_PORT", "8731");
+        if (!arg_context) {
+            long c = 0;
+            if (svcconf::parse_int(svcconf::cfg(g_svc_conf, "MAX_CONTEXT", ""), &c) &&
+                c > 0)
+                g_cfg.context = static_cast<int>(c);
+        }
+    }
+#ifdef _WIN32
+    // 托盘模式没有控制台：stdout/stderr 重定向到 logs\api-win-<时间戳>.log。
+    // 放在 conf 探测之后：CWD 已是项目根，日志落在根的 logs\ 下。
+    if (g_tray_mode) {
+        // 防多开（--console 不受限：脚本场景由端口占用兜底）。必须在 listen 之前：
+        // Windows 的 SO_REUSEADDR 允许后启动的实例抢绑同一端口。句柄不关，退出回收。
+        CreateMutexW(nullptr, FALSE, L"Local\\gfx1151-qwenox-api");
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            mb_qwenox("Qwenox is already running (check the tray icon in the "
+                      "taskbar corner, possibly under the ^ overflow).\n"
+                      "Qwenox 已经在运行了（看任务栏右下角的托盘图标，"
+                      "可能藏在 ^ 展开区里）。",
+                      MB_ICONWARNING);
+            return 1;
+        }
+        CreateDirectoryA("logs", nullptr);
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        char stamp[32];
+        snprintf(stamp, sizeof(stamp), "%04d%02d%02d-%02d%02d%02d", st.wYear, st.wMonth,
+                 st.wDay, st.wHour, st.wMinute, st.wSecond);
+        const std::string lp = std::string("logs\\api-win-") + stamp + ".log";
+        char cwd[MAX_PATH];
+        GetCurrentDirectoryA(MAX_PATH, cwd);
+        g_api_log_abs = std::string(cwd) + "\\" + lp;
+        FILE* f = fopen(lp.c_str(), "wb");  // 先清空，再以追加方式共用
+        if (f) fclose(f);
+        if (freopen(lp.c_str(), "ab", stdout)) setvbuf(stdout, nullptr, _IONBF, 0);
+        if (freopen(lp.c_str(), "ab", stderr)) setvbuf(stderr, nullptr, _IONBF, 0);
+    }
+#endif
     std::string rope_error;
     if (!rope_from_env(g_cfg.rope, rope_error) || !rope_config_valid(g_cfg.rope)) {
         if (rope_error.empty()) rope_error = "invalid YaRN configuration";
-        fprintf(stderr, "gdec-api: %s\n", rope_error.c_str());
-        return 2;
+        fprintf(stderr, "qwenox-api: %s\n", rope_error.c_str());
+        return gexit(2);
     }
     // Environment, not argv: keeps the key out of `ps`.
-    if (const char* k = std::getenv("GDEC_API_ADMIN_KEY")) g_cfg.admin_key = k;
-    if (const char* t = std::getenv("GDEC_API_TOKCACHE"))
+    if (const char* k = std::getenv("QWENOX_API_ADMIN_KEY")) g_cfg.admin_key = k;
+    if (const char* t = std::getenv("QWENOX_API_TOKCACHE"))
         g_tcache.set_capacity(std::strtoull(t, nullptr, 10));
     {
         // "" disables persistence; default keeps the cache across restarts.
-        const char* f = std::getenv("GDEC_API_TOKCACHE_FILE");
+        const char* f = std::getenv("QWENOX_API_TOKCACHE_FILE");
         g_tcache.set_file(f ? f : "data/tcache.bin");
-        if (const char* s = std::getenv("GDEC_API_TOKCACHE_SAVE_S"))
+        if (const char* s = std::getenv("QWENOX_API_TOKCACHE_SAVE_S"))
             g_tcache.set_save_interval(std::atoi(s));
     }
     load_overrides();
 
     std::string err;
-    if (!g_tok.load(g_cfg.tokenizer_dir, &err)) {
-        fprintf(stderr, "gdec-api: tokenizer: %s\n", err.c_str());
-        return 1;
+    // 词表缺失不再是致命错误：独立运行时控制台、配置与引擎管理照常可用，
+    // 仅推理端点返回 503。TOKENIZER_DIR 指向的目录不可用时回退到仓库内置的
+    // data/tokenizer（随项目分发的兜底词表）；显式 --tokenizer 失败则不回退。
+    g_tok_ready = g_tok.load(g_cfg.tokenizer_dir, &err);
+    if (!g_tok_ready && !arg_tokenizer) {
+        const std::string fb = g_conf_root + "/data/tokenizer";
+        std::string err2;
+        if (g_tok.load(fb, &err2)) {
+            fprintf(stderr,
+                    "qwenox-api: tokenizer: %s unavailable (%s); using bundled %s\n",
+                    g_cfg.tokenizer_dir.c_str(), err.c_str(), fb.c_str());
+            g_tok_ready = true;
+        }
     }
+    if (!g_tok_ready)
+        fprintf(stderr,
+                "qwenox-api: WARNING: tokenizer not loaded: %s\n"
+                "qwenox-api: console/config/engine endpoints work; inference returns 503\n",
+                err.c_str());
     g_tcache.load_file();
     g_ckpt_ids = default_ckpt_tokens();
     probe_engine();
 
     http::Server srv;
     if (!srv.listen(g_cfg.listen, &err)) {
-        fprintf(stderr, "gdec-api: listen: %s\n", err.c_str());
-        return 1;
+        fprintf(stderr, "qwenox-api: listen: %s\n", err.c_str());
+        return gexit(1);
     }
-    fprintf(stderr, "gdec-api: listening on :%d model=%s ctx=%d slots=%d\n", srv.port(),
+    fprintf(stderr, "qwenox-api: listening on :%d model=%s ctx=%d slots=%d\n", srv.port(),
             g_cfg.model.c_str(), g_cfg.context, g_slots);
+    // 双击运行时给用户一个可直接点的入口
+    fprintf(stderr, "qwenox-api: console: http://127.0.0.1:%d/\n", srv.port());
 
     for (const StaticAsset& a : kStaticAssets) srv.on("GET", a.url, make_static_handler(a));
     srv.on("GET", "/v1/models", handle_models);
@@ -2974,10 +3349,32 @@ int main(int argc, char** argv) {
     srv.on("GET", "/reqstat/page", handle_reqstat_page);
     srv.on("GET", "/admin/overrides", handle_overrides_get);
     srv.on("POST", "/admin/overrides", handle_overrides_post);
+    srv.on("GET", "/admin/config", handle_config_get);
+    srv.on("POST", "/admin/config", handle_config_post);
+    srv.on("GET", "/admin/engine/status", handle_engine_status);
+    srv.on("POST", "/admin/engine/start", handle_engine_start);
+    srv.on("POST", "/admin/engine/stop", handle_engine_stop);
     srv.on("POST", "/v1/completions", handle_completions);
     srv.on("POST", "/v1/chat/completions", handle_chat);
     srv.on("POST", "/v1/responses", handle_responses);
 
+#ifdef _WIN32
+    if (g_tray_mode) {
+        // 托盘模式：worker 线程跑 HTTP 服务，主线程跑托盘消息循环
+        TrayHooks hooks;
+        hooks.api_port = srv.port();
+        hooks.api_host = g_cfg.listen.substr(0, g_cfg.listen.rfind(':'));
+        hooks.api_log = g_api_log_abs;
+        hooks.conf_snapshot = [] {
+            std::lock_guard<std::mutex> lk(g_svc_conf_mtx);
+            return g_svc_conf;
+        };
+        hooks.engine_endpoint = [] {
+            return std::make_pair(eff_engine_host(), eff_engine_port());
+        };
+        return tray_run(srv, hooks);
+    }
+#endif
     srv.run();
     return 0;
 }

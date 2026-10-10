@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # G3.1 验证：除 PLE n-gram 表和 MTP 路由专家外，全部权重来自 llama.cpp GGUF
-# （UD-Q4_K_XL 主体 + MTP Q8_0 sidecar；GDEC_GGUF + GDEC_GGUF_DENSE=1 + GDEC_GGUF_MTP）。
+# （UD-Q4_K_XL 主体 + MTP Q8_0 sidecar；QWENOX_GGUF + QWENOX_GGUF_DENSE=1 + QWENOX_GGUF_MTP）。
 # 一键跑完，最后打印 PASS / FAIL。
 #   bash tools/g3_verify.sh
 #     GGDIR=<GGUF 目录>    默认 ~/App/llama.cpp/models/Qwen3.8-Flash-Next-UD-Q4_K_XL
-#     BIN=build/gdec-gguf  REF=build/gdec（hgn 生产二进制）
-#       REF 必须是改动前那个提交编出来的二进制：09-24 的旧 build/gdec 逐 token decode
-#       本身不确定（同一输入 3 次 3 个 NLL），第 3 项会误报。例如 REF=build/gdec-head
+#     BIN=build/qwenox-gguf  REF=build/qwenox-engine（hgn 生产二进制）
+#       REF 必须是改动前那个提交编出来的二进制：09-24 的旧 build/qwenox-engine 逐 token decode
+#       本身不确定（同一输入 3 次 3 个 NLL），第 3 项会误报。例如 REF=build/qwenox-head
 #     QUICK=1              KLD 只跑 16 chunk，跳过速度
 # 检查项：
 #   1. KLD（BF16 基准 data/kld/bf16_c512.kld，64×512）< G2 的 0.1494（dense 从 q4cp 换成 Q8_0 应更好）
@@ -20,12 +20,12 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 D=${GGDIR:-$HOME/App/llama.cpp/models/Qwen3.8-Flash-Next-UD-Q4_K_XL}
 GG=$D/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
 MTP=$D/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
-BIN=${BIN:-build/gdec-gguf}
-REF=${REF:-build/gdec}
+BIN=${BIN:-build/qwenox-gguf}
+REF=${REF:-build/qwenox-engine}
 export PROBE_CAP_GB=${PROBE_CAP_GB:-100}
 KREF=data/kld/bf16_c512.kld
 TOKSRC=$HOME/ppbench/tok8192.txt
-G3=(GDEC_GGUF="$GG" GDEC_GGUF_DENSE=1 GDEC_GGUF_MTP="$MTP")
+G3=(QWENOX_GGUF="$GG" QWENOX_GGUF_DENSE=1 QWENOX_GGUF_MTP="$MTP")
 fail=0
 note() { echo "== $*"; }
 bad() { echo "FAIL: $*" >&2; fail=1; }  # stderr: also visible from inside < <(...)
@@ -33,7 +33,7 @@ bad() { echo "FAIL: $*" >&2; fail=1; }  # stderr: also visible from inside < <(.
 for f in "$GG" "$MTP" "$BIN" "$REF" "$KREF" "$TOKSRC" "$HOME/ppbench/tok32768.txt"; do
   [[ -e "$f" ]] || { echo "缺少 $f"; echo FAIL; exit 1; }
 done
-if pgrep -af '(^|/)(gdec[^/[:space:]]*|flash_serve|serve_api\.py|llama-server|llama-perplexity|llama-cli)([[:space:]]|$)' >/dev/null; then
+if pgrep -af '(^|/)(qwenox[^/[:space:]]*|flash_serve|serve_api\.py|llama-server|llama-perplexity|llama-cli)([[:space:]]|$)' >/dev/null; then
   echo "GPU 上已有引擎/llama.cpp 在跑，请先停掉"; echo FAIL; exit 1
 fi
 mkdir -p logs
@@ -63,8 +63,8 @@ eval "C=($(sed -n 's/^CMD //p' <<<"$chk"))"
 M=${C[1]}; O=${C[2]}; [[ "$O" == --* ]] && O=""
 run_ppl() {  # label bin extra-env...  -> "ppl mean_nll"
   local label=$1 bin=$2; shift 2
-  ( for e in $(compgen -e | grep '^GDEC_'); do unset "$e"; done
-    for e in "${PENV[@]}" GDEC_KVSNAP=0 "$@"; do export "$e"; done
+  ( for e in $(compgen -e | grep '^QWENOX_'); do unset "$e"; done
+    for e in "${PENV[@]}" QWENOX_KVSNAP=0 "$@"; do export "$e"; done
     bash tools/run_capped.sh "$PROBE_CAP_GB" -- "$bin" "$M" ${O:+"$O"} --tokens-file "$TOK" \
       --ppl --maxctx 4096 >"logs/$label.log" 2>&1 )
   grep -qE 'hipError|Segmentation|Aborted|FATAL|what\(\)' "logs/$label.log" && bad "$label 崩溃（logs/$label.log）"
@@ -72,7 +72,7 @@ run_ppl() {  # label bin extra-env...  -> "ppl mean_nll"
 }
 note "2. PPL：逐 token decode vs batched prefill（1024 token，G3）"
 read -r pp_b nb < <(run_ppl g3_ppl_prefill "$BIN" "${G3[@]}")
-read -r pp_d nd < <(run_ppl g3_ppl_decode "$BIN" "${G3[@]}" GDEC_NOPREFILLBATCH=1)
+read -r pp_d nd < <(run_ppl g3_ppl_decode "$BIN" "${G3[@]}" QWENOX_NOPREFILLBATCH=1)
 echo "PPL prefill=$pp_b decode=$pp_d  (G2 6.941 / 6.929)"
 if [[ -z "${pp_b:-}" || -z "${pp_d:-}" ]]; then bad "PPL 没有输出（见 logs/g3_ppl_*.log）"
 elif awk -v a="$pp_b" -v b="$pp_d" 'BEGIN{d=(a-b)/a; if(d<0)d=-d; exit !(d < 0.01)}'; then echo "相对差 < 1%  OK"
@@ -81,8 +81,8 @@ else bad "decode 与 prefill PPL 相差 >= 1%"; fi
 note "3. hgn 路径不变：$BIN vs $REF（不设 GGUF 变量）"
 read -r r_b rnb < <(run_ppl g3_hgn_ref_prefill "$REF")
 read -r n_b nnb < <(run_ppl g3_hgn_new_prefill "$BIN")
-read -r r_d rnd < <(run_ppl g3_hgn_ref_decode "$REF" GDEC_NOPREFILLBATCH=1)
-read -r n_d nnd < <(run_ppl g3_hgn_new_decode "$BIN" GDEC_NOPREFILLBATCH=1)
+read -r r_d rnd < <(run_ppl g3_hgn_ref_decode "$REF" QWENOX_NOPREFILLBATCH=1)
+read -r n_d nnd < <(run_ppl g3_hgn_new_decode "$BIN" QWENOX_NOPREFILLBATCH=1)
 echo "prefill mean_nll ref=${rnb:-?} new=${nnb:-?}   decode ref=${rnd:-?} new=${nnd:-?}"
 if [[ -n "${rnb:-}" && "${rnb:-}" == "${nnb:-}" && -n "${rnd:-}" && "${rnd:-}" == "${nnd:-}" ]]; then
   echo "逐位相同  OK"
@@ -117,13 +117,13 @@ speed() {  # label bin tok gen extra...
 }
 if [[ -z ${QUICK:-} ]]; then
   note "5a. pp 8K @ chunk 2048（最后一个 chunk 的 tok/s）"
-  read -r a _ < <(speed g3_pp8k_hgn "$REF" 8k 1 GDEC_PREFILL_CHUNK=2048)
-  read -r b _ < <(speed g3_pp8k_g2 "$BIN" 8k 1 GDEC_PREFILL_CHUNK=2048 GDEC_GGUF="$GG")
-  read -r c _ < <(speed g3_pp8k_g3 "$BIN" 8k 1 GDEC_PREFILL_CHUNK=2048 "${G3[@]}")
+  read -r a _ < <(speed g3_pp8k_hgn "$REF" 8k 1 QWENOX_PREFILL_CHUNK=2048)
+  read -r b _ < <(speed g3_pp8k_g2 "$BIN" 8k 1 QWENOX_PREFILL_CHUNK=2048 QWENOX_GGUF="$GG")
+  read -r c _ < <(speed g3_pp8k_g3 "$BIN" 8k 1 QWENOX_PREFILL_CHUNK=2048 "${G3[@]}")
   echo "hgn=$a  G2=$b  G3=$c tok/s"
   note "5b. pp 32K @ chunk 16384 + decode 128"
   read -r a ad < <(speed g3_pp32k_hgn "$REF" 32k 128)
-  read -r b bd < <(speed g3_pp32k_g2 "$BIN" 32k 128 GDEC_GGUF="$GG")
+  read -r b bd < <(speed g3_pp32k_g2 "$BIN" 32k 128 QWENOX_GGUF="$GG")
   read -r c cd < <(speed g3_pp32k_g3 "$BIN" 32k 128 "${G3[@]}")
   echo "pp     hgn=$a  G2=$b  G3=$c tok/s"
   echo "decode hgn=$ad G2=$bd G3=$cd tok/s"

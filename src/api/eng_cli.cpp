@@ -21,8 +21,8 @@
 
 using nlohmann::json;
 
-static gdec::GenParams params_from_json(const json& q, gdec::Tokenizer* tok) {
-    gdec::GenParams p;
+static qwenox::GenParams params_from_json(const json& q, qwenox::Tokenizer* tok) {
+    qwenox::GenParams p;
     p.req = q.value("req", 1LL);
     p.max_tokens = q.value("max_tokens", 8);
     if (q.contains("eos")) p.eos = q["eos"].get<std::vector<int>>();
@@ -72,21 +72,21 @@ int main(int argc, char** argv) {
     }
     json q = json::parse(req_line);
 
-    gdec::Tokenizer tok;
+    qwenox::Tokenizer tok;
     std::string err;
     if (!tok.load(tok_dir, &err)) {
         std::fprintf(stderr, "tokenizer: %s\n", err.c_str());
         return 1;
     }
-    gdec::GenParams p = params_from_json(q, &tok);
+    qwenox::GenParams p = params_from_json(q, &tok);
 
     if (dump_only) {
-        std::fputs(gdec::build_gen_request(p).c_str(), stdout);
+        std::fputs(qwenox::build_gen_request(p).c_str(), stdout);
         std::fprintf(stderr, "ids=%zu vimg=%zu\n", p.ids.size(), p.patches.size());
         return 0;
     }
 
-    gdec::EngineClient eng;
+    qwenox::EngineClient eng;
     if (!eng.connect(host, &err)) {
         std::fprintf(stderr, "connect: %s\n", err.c_str());
         return 1;
@@ -95,7 +95,7 @@ int main(int argc, char** argv) {
     if (eng.info(&line, &err)) std::fprintf(stderr, "engine INFO: %s\n", line.c_str());
     else std::fprintf(stderr, "engine INFO failed: %s\n", err.c_str());
 
-    gdec::GenResult r = eng.generate(p, nullptr);
+    qwenox::GenResult r = eng.generate(p, nullptr);
     if (!r.transport_ok) {
         std::fprintf(stderr, "transport failure\n");
         return 1;

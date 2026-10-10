@@ -1,4 +1,4 @@
-// ============ MoE prefill via dequant + hipBLASLt (GDEC_MOE_LT, opt-in) ======
+// ============ MoE prefill via dequant + hipBLASLt (QWENOX_MOE_LT, opt-in) ======
 // Batched-GEMM prefill pipeline: per layer, dequant Q4C-P expert weights to
 // bf16 in small expert groups (scratch reused, MALL-hot), gather pair rows,
 // per-expert bf16 GEMM via hipBLASLt, silu, per-expert down GEMM,
@@ -180,7 +180,7 @@ __global__ void k_moe_reduce_pw_bf16(const __hip_bfloat16* __restrict__ pairs,
   out[(size_t)t * Dd + d] = sum;
 }
 
-// Debug instrumentation (GDEC_MOE_LT_CMP): block-reduced max abs diff of the
+// Debug instrumentation (QWENOX_MOE_LT_CMP): block-reduced max abs diff of the
 // LT path's intermediates against the fused W4 reference run in the same
 // process on identical inputs. out = [max|diff|, max|ref|] as ordered ints
 // (non-negative floats order like their int bit patterns).

@@ -7,7 +7,7 @@
 // validity guard. kvsnap (51_host_cfg.inc) is the self-contained SSD tier:
 // slower and sparse, but survives restarts and KV clobbering.
 //
-// A3 (GDEC_KV_PAGED): a checkpoint also pins the physical KV pages of its
+// A3 (QWENOX_KV_PAGED): a checkpoint also pins the physical KV pages of its
 // prefix (refcount), so it stays valid after the live stream diverges —
 // switching back to an earlier conversation remaps its pages instead of
 // re-prefilling. Live writes into a shared page copy it first (kv_cow).
@@ -37,7 +37,7 @@ namespace rckpt {
 // kernels that overwrite d_S run after the DMA). The old pageable
 // std::vector path (resize = 113 MB zero-fill + page faults, then a bounced
 // synchronous D2H) cost ~38 ms per save, twice per request on the TTFT path
-// (snapshot cut + prompt end). GDEC_RCKPT_SYNC=1 restores synchronous saves.
+// (snapshot cut + prompt end). QWENOX_RCKPT_SYNC=1 restores synchronous saves.
 struct PinBuf {
   float* p = nullptr;
   size_t n = 0;
@@ -110,7 +110,7 @@ void PinBuf::put() {
   n = 0;
 }
 static bool d2h(PinBuf& b, const void* src, size_t cnt) {
-  static const bool sync = getenv("GDEC_RCKPT_SYNC") != nullptr;
+  static const bool sync = getenv("QWENOX_RCKPT_SYNC") != nullptr;
   if (!b.get(cnt)) return false;
   if (sync) return hipMemcpy(b.p, src, cnt * 4, hipMemcpyDeviceToHost) == hipSuccess;
   return hipMemcpyAsync(b.p, src, cnt * 4, hipMemcpyDeviceToHost, g_str) == hipSuccess;
@@ -135,15 +135,15 @@ struct Ck {
 };
 
 static const size_t g_cap = [] {
-  const char* v = getenv("GDEC_RCKPT_MAX");
+  const char* v = getenv("QWENOX_RCKPT_MAX");
   return v ? (size_t)std::max(0, atoi(v)) : 8;
 }();
 static const bool g_on = [] {
-  const char* v = getenv("GDEC_RCKPT");
+  const char* v = getenv("QWENOX_RCKPT");
   return g_cap != 0 && (!v || atoi(v) != 0);
 }();
 static const size_t g_min_tokens = [] {
-  const char* v = getenv("GDEC_RCKPT_MIN");
+  const char* v = getenv("QWENOX_RCKPT_MIN");
   return v ? (size_t)atol(v) : 4096;
 }();
 static std::deque<Ck> g_list;  // front = oldest
@@ -190,7 +190,7 @@ bool enabled() { return g_on; }
 // Background-fill the pinned pool with g_cap + 2 buffer sets (the LRU keeps at
 // most g_cap checkpoints; +2 covers a save before the evicted one is freed).
 void prewarm(bool with_mtp) {
-  if (!g_on || getenv("GDEC_RCKPT_SYNC")) return;
+  if (!g_on || getenv("QWENOX_RCKPT_SYNC")) return;
   const int nqsa = g_cfg.layers / 4, ngdn = g_cfg.layers - nqsa;
   std::vector<size_t> sizes = {(size_t)ngdn * 48 * 128 * 128, (size_t)ngdn * 3 * 10240,
                                9 * 10240, (size_t)nqsa * 512};
@@ -272,7 +272,7 @@ bool save(GpuModel& m, const std::vector<int>& toks, bool mtp = false) {
     ck.img_hash = m.img_hash_;
     ck.grids = m.mrope_grids_;
   }
-  if (getenv("GDEC_RCKPT_HASH")) {  // debug: hash the saved state (after the async D2H)
+  if (getenv("QWENOX_RCKPT_HASH")) {  // debug: hash the saved state (after the async D2H)
     CK(hipStreamSynchronize(g_str));
     auto fnv = [](const PinBuf& b) {
       uint64_t h = 1469598103934665603ULL;

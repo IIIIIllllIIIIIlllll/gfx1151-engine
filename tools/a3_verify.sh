@@ -9,7 +9,7 @@
 #   2. bash build.sh engine
 #   3. a1_verify.sh prod prodp1 prodp2：snapshot_regress 9 个用例逐字一致（回归）
 #   4. 切换对话场景（tools/rckpt_ab.py switch），4 个引擎：
-#        off=prod 不分页 / p1=prodp1 / p2=prodp2 / p1big=prodp1+GDEC_KV_POOL_TOKENS=81920
+#        off=prod 不分页 / p1=prodp1 / p2=prodp2 / p1big=prodp1+QWENOX_KV_POOL_TOKENS=81920
 #      A → A+问题2 → A+问题3 → B → A+问题2 → A+问题3 → C → A+问题2
 #      分页时切走再切回也必须命中 A 的检查点（restored 5 次，不分页只有 2 次），
 #      且输出与第一次恢复逐 token 一致；p2 日志里要有写时复制（cow）记录
@@ -80,17 +80,17 @@ fi
 
 # ---- 4/5 步的引擎：与 a1_verify.sh prod* 相同的生产 kernel 环境，关 kvsnap，检查点门槛 1024 ----
 MODEL_DIR="${MODEL_DIR:-models}"
-PROD_VARS=(GDEC_QSA_KV_BF16 GDEC_QSA_WMMA GDEC_QSA_WMMA_BTV GDEC_GEMM_WMMA GDEC_GDN_FUSED
-           GDEC_MOE_LT GDEC_MOE_LT_BF16 GDEC_GR_BF16 GDEC_GDN_STREAM GDEC_GDN_WAVE
-           GDEC_NOWARMUP GDEC_INDEX_FUSED2 GDEC_PP_MOE_OUT GDEC_INDEX_STREAM_SELECT)
+PROD_VARS=(QWENOX_QSA_KV_BF16 QWENOX_QSA_WMMA QWENOX_QSA_WMMA_BTV QWENOX_GEMM_WMMA QWENOX_GDN_FUSED
+           QWENOX_MOE_LT QWENOX_MOE_LT_BF16 QWENOX_GR_BF16 QWENOX_GDN_STREAM QWENOX_GDN_WAVE
+           QWENOX_NOWARMUP QWENOX_INDEX_FUSED2 QWENOX_PP_MOE_OUT QWENOX_INDEX_STREAM_SELECT)
 set_env() {  # <off|p1|p2|p1big>
-  unset GDEC_KV_PAGED GDEC_KV_POOL_TOKENS GDEC_PREFILL_CHUNK GDEC_RCKPT GDEC_RCKPT_MAX "${PROD_VARS[@]}"
+  unset QWENOX_KV_PAGED QWENOX_KV_POOL_TOKENS QWENOX_PREFILL_CHUNK QWENOX_RCKPT QWENOX_RCKPT_MAX "${PROD_VARS[@]}"
   local v; for v in "${PROD_VARS[@]}"; do export "$v=1"; done
-  export GDEC_PREFILL_CHUNK=16384 GDEC_KVSNAP=0 GDEC_RCKPT_MIN=1024
+  export QWENOX_PREFILL_CHUNK=16384 QWENOX_KVSNAP=0 QWENOX_RCKPT_MIN=1024
   case "$1" in
-    p1) export GDEC_KV_PAGED=1 ;;
-    p2) export GDEC_KV_PAGED=2 ;;
-    p1big) export GDEC_KV_PAGED=1 GDEC_KV_POOL_TOKENS=81920 ;;
+    p1) export QWENOX_KV_PAGED=1 ;;
+    p2) export QWENOX_KV_PAGED=2 ;;
+    p1big) export QWENOX_KV_PAGED=1 QWENOX_KV_POOL_TOKENS=81920 ;;
   esac
 }
 # run_scn <switch|evict> <tag> <maxctx>
@@ -99,8 +99,8 @@ run_scn() {
   lt="a3-${scn:0:2}-$tag"
   set_env "$tag"
   echo
-  echo "---- $scn / $tag（GDEC_KV_PAGED=${GDEC_KV_PAGED:-未设置}，POOL_TOKENS=${GDEC_KV_POOL_TOKENS:-默认}，maxctx $ctx）----"
-  probe_start "$lt" build/gdec "$MODEL_DIR/qwen38-flash-next-w4b.hgn" \
+  echo "---- $scn / $tag（QWENOX_KV_PAGED=${QWENOX_KV_PAGED:-未设置}，POOL_TOKENS=${QWENOX_KV_POOL_TOKENS:-默认}，maxctx $ctx）----"
+  probe_start "$lt" build/qwenox-engine "$MODEL_DIR/qwen38-flash-next-w4b.hgn" \
       "$MODEL_DIR/qwen38-flash-next-w4b.overlay.hgn" --serve --port 8732 --maxctx "$ctx" \
     || { echo "[$lt] 启动失败" >&2; return 1; }
   echo "[$lt] 页表日志: $(grep '\[kvpage\]' "$PROBE_LOG" | head -n 2 | tr '\n' ' ')"

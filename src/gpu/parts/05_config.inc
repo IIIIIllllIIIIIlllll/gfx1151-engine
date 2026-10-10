@@ -24,7 +24,7 @@ struct Cfg {
 static Cfg g_cfg;
 static hipStream_t g_str = nullptr;  // capture stream during graph build, else default
 // D1b: >0 while the GPU is lent out mid-prefill-chunk; during the window only
-// light rounds (chunks of at most GDEC_CONC_RMAX rows) may start on it.
+// light rounds (chunks of at most QWENOX_CONC_RMAX rows) may start on it.
 static std::atomic<int> g_borrow_light{0};
 
 static bool is_qsa(int layer) { return layer % 4 == 3; }

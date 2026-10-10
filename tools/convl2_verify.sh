@@ -3,17 +3,17 @@
 # 25_kernels_gdn.inc；40_model.inc gdn_b 调用处，替掉 k_gdn_conv_b + k_l2norm_qk_b）
 #   1. 原型 tools/convl2_proto.cu（kernel 从当前 25_kernels_gdn.inc 现抽）：
 #      融合 vs 生产两 kernel，P x 10240 输出逐 bit 一致（含 P=1/3 尾块、极端行）+ 速度
-#   2. 端到端 --ppl：同一个二进制，旧路径 (GDEC_GDN_CONVL2=0) vs 新路径（默认），
+#   2. 端到端 --ppl：同一个二进制，旧路径 (QWENOX_GDN_CONVL2=0) vs 新路径（默认），
 #      2051 和 32K 两个长度的 ppl_token 行 + ppl_summary 必须逐字节一致
 #   3. 32K prefill 速度（pp.sh 同款 env，KVSNAP 关）：新旧交替各 2 次取最快，
 #      整体需快 ≥0.3%（预期 ~0.8%：每 8K chunk 省 ~45 ms）
 # 用法: bash tools/convl2_verify.sh        （约 7 分钟，结尾输出 PASS / FAIL）
-#   BIN=build/gdec-cl2（默认）  SKIP_PPL=1 只测速度
+#   BIN=build/qwenox-cl2（默认）  SKIP_PPL=1 只测速度
 # 日志: logs/clv_*.log（stderr）/ *.stdout（ppl 行单独存），汇总 logs/convl2_verify.out
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-BIN="${BIN:-build/gdec-cl2}"
+BIN="${BIN:-build/qwenox-cl2}"
 CHUNK=8192
 OUT=logs/convl2_verify.out
 mkdir -p logs
@@ -21,7 +21,7 @@ exec > >(tee "$OUT") 2>&1
 fail=0
 bad() { echo "  FAIL: $*"; fail=1; }
 ok() { echo "  OK: $*"; }
-OLD_ENV="GDEC_GDN_CONVL2=0"
+OLD_ENV="QWENOX_GDN_CONVL2=0"
 
 for f in "$BIN" data/qsa-oracle/2051.tokens data/qsa-oracle/32768.tokens \
          models/qwen38-flash-next-w4b.hgn models/qwen38-flash-next-w4b.overlay.hgn; do
@@ -33,12 +33,12 @@ run() {  # label len mode(ppl|pp) extra-env...
   local label=$1 len=$2 mode=$3; shift 3
   local args=(--gen 1)
   [[ $mode == ppl ]] && args=(--ppl)
-  env GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1 \
-      GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1 \
-      GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 \
-      GDEC_PREFILL_CHUNK=$CHUNK GDEC_GEMM_WMMA=1 GDEC_GDN_FUSED=1 \
-      GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1 \
-      GDEC_KVSNAP=0 GDEC_PROF=1 GDEC_PHASE=1 "$@" \
+  env QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1 \
+      QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1 \
+      QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 \
+      QWENOX_PREFILL_CHUNK=$CHUNK QWENOX_GEMM_WMMA=1 QWENOX_GDN_FUSED=1 \
+      QWENOX_INDEX_FUSED2=1 QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1 \
+      QWENOX_KVSNAP=0 QWENOX_PROF=1 QWENOX_PHASE=1 "$@" \
       "$BIN" models/qwen38-flash-next-w4b.hgn models/qwen38-flash-next-w4b.overlay.hgn \
       --tokens-file "data/qsa-oracle/$len.tokens" "${args[@]}" --maxctx $((len + 8192)) \
       >"logs/clv_$label.stdout" 2>"logs/clv_$label.log"

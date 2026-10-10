@@ -84,7 +84,7 @@ static const char* log_ts() {
 struct NgramMod {
   using token_t=int32_t; static constexpr token_t EMPTY=-1;
   int n=8,n_min=8,n_max=64; size_t learned=0; std::vector<token_t> table;
-  NgramMod(){ if(const char* e=getenv("GDEC_NGRAM_MATCH")) n=std::max(4,std::min(64,atoi(e))); if(const char* e=getenv("GDEC_NGRAM_MIN")) n_min=std::max(1,std::min(64,atoi(e))); if(const char* e=getenv("GDEC_NGRAM_MAX")) n_max=std::max(1,std::min(64,atoi(e))); table.resize((size_t)4*1024*1024,EMPTY); }
+  NgramMod(){ if(const char* e=getenv("QWENOX_NGRAM_MATCH")) n=std::max(4,std::min(64,atoi(e))); if(const char* e=getenv("QWENOX_NGRAM_MIN")) n_min=std::max(1,std::min(64,atoi(e))); if(const char* e=getenv("QWENOX_NGRAM_MAX")) n_max=std::max(1,std::min(64,atoi(e))); table.resize((size_t)4*1024*1024,EMPTY); }
   size_t slot(const std::vector<int64_t>&h,size_t off)const{uint64_t z=0;for(int i=0;i<n;i++) z=z*6364136223846793005ULL+(uint32_t)h[off+i];return(size_t)(z%table.size());}
   void reset(){std::fill(table.begin(),table.end(),EMPTY);learned=0;}
   void observe(const std::vector<int64_t>&h){if(h.size()<=(size_t)n)return;size_t lim=h.size()-n;if(learned>lim)learned=lim;for(size_t i=learned;i<lim;i++)table[slot(h,i)]=(token_t)h[i+n];learned=lim;}

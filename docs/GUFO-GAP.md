@@ -34,7 +34,7 @@ dense 0.246，注意力 0.092，HC 0.069，GDN 0.068。
 
 ## 3. 根因：小 chunk 的 MoE kernel 没有用矩阵核
 
-- chunk < `GDEC_MOE_LT_MIN`(4096) 时走 `k_moe_w4_up/down`（23_kernels_moe_w4.inc）。
+- chunk < `QWENOX_MOE_LT_MIN`(4096) 时走 `k_moe_w4_up/down`（23_kernels_moe_w4.inc）。
 - 它在 LDS 里存反量化后的 bf16，然后做**标量 `v_dot2_f32_bf16`**。注释里自己也写着受 LDS 带宽限制。
 - 实测：约 7 TFLOPS；每层 1.26 GB 权重读了 28 ms，折合 45 GB/s。**既不在算力上限，也不在带宽上限。**
 - gufo 的 `RoutedF16GEMMKernel`（kernels.hip.cpp:3637）做法：

@@ -14,7 +14,7 @@
 - `<N>.tokens` — 对应 prompt 的原始 token 列表(纯文本,一行一个),
   便于人工查看和复用;`65536` / `131072` 两份是超长 prompt 素材,
   供生成未来的长上下文基准使用。
-- `<N>.gdec.log` — 采集基准时引擎侧逐步 top-5 logit 记录,输出分歧时
+- `<N>.qwenox.log` — 采集基准时引擎侧逐步 top-5 logit 记录,输出分歧时
   用来定位第一个分叉点。
 - `server-health.json` — API `/health` 响应形状的参考样本。
 

@@ -6,6 +6,7 @@
 #define poll WSAPoll
 #else
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -22,7 +23,7 @@
 #include <limits>
 #include <sstream>
 
-namespace gdec {
+namespace qwenox {
 namespace {
 
 #ifdef _WIN32
@@ -103,7 +104,8 @@ void EngineClient::invalidate(sock_t bad_fd) {
     sock_close_fd(bad_fd);
 }
 
-bool EngineClient::connect(const std::string& host_port, std::string* err) {
+bool EngineClient::connect(const std::string& host_port, std::string* err,
+                           double timeout_s) {
     auto fail = [&](const std::string& m) {
         if (err) *err = m;
         return false;
@@ -120,11 +122,49 @@ bool EngineClient::connect(const std::string& host_port, std::string* err) {
     if (int rc = getaddrinfo(host.c_str(), port.c_str(), &hints, &res); rc != 0)
         return fail("getaddrinfo(" + host_port + "): " + gai_strerror(rc));
 
+    // Bounded connect: non-blocking + poll(POLLOUT). Returns true on success.
+    auto connect_timed = [&](sock_t fd, const addrinfo* ai) {
+#ifdef _WIN32
+        u_long nb = 1;
+        ioctlsocket((SOCKET)fd, FIONBIO, &nb);
+#else
+        const int fl = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+#endif
+        bool ok = ::connect(fd, ai->ai_addr, (int)ai->ai_addrlen) == 0;
+#ifdef _WIN32
+        if (!ok && WSAGetLastError() == WSAEWOULDBLOCK) {
+#else
+        if (!ok && errno == EINPROGRESS) {
+#endif
+            pollfd pfd{};
+            pfd.fd = (decltype(pfd.fd))fd;
+            pfd.events = POLLOUT;
+            if (::poll(&pfd, 1, (int)(timeout_s * 1000.0)) > 0) {
+                int soerr = 0;
+                socklen_t sl = sizeof soerr;
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, (char*)&soerr, &sl);
+                ok = soerr == 0;
+            }
+        }
+        // 恢复阻塞模式：后续读写依赖阻塞 + SO_RCVTIMEO 语义
+#ifdef _WIN32
+        nb = 0;
+        ioctlsocket((SOCKET)fd, FIONBIO, &nb);
+#else
+        fcntl(fd, F_SETFL, fl);
+#endif
+        return ok;
+    };
+
     sock_t fd = -1;
     for (addrinfo* ai = res; ai != nullptr; ai = ai->ai_next) {
         fd = (sock_t)::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
-        if (::connect(fd, ai->ai_addr, (int)ai->ai_addrlen) == 0) break;
+        const bool ok = timeout_s > 0
+                            ? connect_timed(fd, ai)
+                            : ::connect(fd, ai->ai_addr, (int)ai->ai_addrlen) == 0;
+        if (ok) break;
         sock_close_fd(fd);
         fd = -1;
     }
@@ -430,4 +470,4 @@ GenResult EngineClient::generate(const GenParams& p, const TokenFn& on_token,
     }
 }
 
-}  // namespace gdec
+}  // namespace qwenox

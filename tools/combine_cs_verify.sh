@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# combine_cs_verify.sh — 一键验证 gr_combine_b_hc_bf16 列分块（GDEC_COMBINE_CS，默认开）：
+# combine_cs_verify.sh — 一键验证 gr_combine_b_hc_bf16 列分块（QWENOX_COMBINE_CS，默认开）：
 #   P<=8 时从 P 块改成 dim3(P,4) 块（每块 d/4 列）。每列单线程独立计算，逐 bit 等价。
-#   关闭：GDEC_COMBINE_CS=0
+#   关闭：QWENOX_COMBINE_CS=0
 # 检查：
 #   1. ktest 单测：gr_combine_colsplit 必须 mismatches=0（build.sh test）
 #   2. greedy ids：8K MTP / 32K MTP，BIN vs BASE 完全一致；opt-out 一致
 # 用法: bash tools/combine_cs_verify.sh   （约 5 分钟，结尾输出 PASS / FAIL）
-#   BIN=build/gdec（默认）  BASE=build/gdec.base（默认）  SKIP_KTEST=1 跳过单测
+#   BIN=build/qwenox-engine（默认）  BASE=build/qwenox.base（默认）  SKIP_KTEST=1 跳过单测
 # 日志: logs/ccv_*.log，汇总 logs/combine_cs_verify.out
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
-BIN="${BIN:-build/gdec}"
-BASE="${BASE:-build/gdec.base}"
+BIN="${BIN:-build/qwenox-engine}"
+BASE="${BASE:-build/qwenox.base}"
 OUT=logs/combine_cs_verify.out
 mkdir -p logs
 exec > >(tee "$OUT") 2>&1
@@ -57,9 +57,9 @@ for P in 8k 32k; do
 done
 
 echo "-- 3. opt-out 与 BASE 一致"
-if run ccv_off "$BIN" 8k GDEC_COMBINE_CS=0; then
+if run ccv_off "$BIN" 8k QWENOX_COMBINE_CS=0; then
   [[ "$(ids ccv_off)" == "$(ids ccv_8k_base)" ]] \
-    && ok "GDEC_COMBINE_CS=0 ids 一致" || bad "opt-out ids 不一致"
+    && ok "QWENOX_COMBINE_CS=0 ids 一致" || bad "opt-out ids 不一致"
 else
   bad "opt-out 运行失败"
 fi

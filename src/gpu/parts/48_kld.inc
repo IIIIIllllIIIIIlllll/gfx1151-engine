@@ -8,8 +8,8 @@
 // [max-16, max]. Every chunk starts from an empty state; positions
 // n_ctx/2 .. n_ctx-2 are scored against token[pos+1]. The model's GGUF has
 // add_bos_token=false, so tokens are fed verbatim (no BOS substitution).
-//   gdec BASE OVL --kld-base REF [--kld-chunks N] [--kld-save OUT]
-//   gdec BASE OVL --tokens-file IDS --kld-save OUT [--kld-ctx 512] [--kld-chunks N]
+//   qwenox BASE OVL --kld-base REF [--kld-chunks N] [--kld-save OUT]
+//   qwenox BASE OVL --tokens-file IDS --kld-save OUT [--kld-ctx 512] [--kld-chunks N]
 namespace kld {
 
 static inline int nearest_int(float fval) {
@@ -162,7 +162,7 @@ static int run(GpuModel& m, std::vector<int> tokens, const Opts& o) {
     n_chunk = (int)(tokens.size() / n_ctx);
   }
   if (o.chunks >= 0) n_chunk = std::min(n_chunk, o.chunks);
-  // n_ctx > maxbatch（如 GDEC_PREFILL_CHUNK=8192 跑 16K）：按生产 prefill_batch 的方式分段，
+  // n_ctx > maxbatch（如 QWENOX_PREFILL_CHUNK=8192 跑 16K）：按生产 prefill_batch 的方式分段，
   // logits 只能读最后一段的行，所以被统计的后半段必须整段落在最后一段里。
   int last = 0;
   for (int off = 0; off < (int)n_ctx;) {

@@ -966,7 +966,7 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
     m.mtp_pos = h.mtp_pos;
     CK(hipMemcpy(m.d_mpos, &m.mtp_pos, 4, hipMemcpyHostToDevice));
   }
-  // GDEC_QSA_WMMA_BTV: the transposed prefill V cache is derived state (not
+  // QWENOX_QSA_WMMA_BTV: the transposed prefill V cache is derived state (not
   // saved); rebuild it for [0, n) from the restored row-major V, or sparse
   // prefill after the restore would read stale V for the prefix. Paged:
   // per physically contiguous run; a page holds whole 4-token blocks, so
@@ -1630,11 +1630,11 @@ struct HostSampler {
 // takes the rounds where the table has nothing, for greedy and sampled
 // requests alike (sampled ngram rounds re-draw from the target distribution
 // and accept by token-id match, llama.cpp-style; only the pure-ngram
-// default stays greedy-only, see parse_gen). GDEC_DRAFTER overrides:
+// default stays greedy-only, see parse_gen). QWENOX_DRAFTER overrides:
 // "serial"/"0" forces serial, "ngram"/"3" pure ngram, "chain"/"4" explicit
 // chain, "mtp" the legacy MTP default.
 static int env_default_drafter() {
-  const char* e = getenv("GDEC_DRAFTER");
+  const char* e = getenv("QWENOX_DRAFTER");
   if (!e) return 4;
   if (!strcmp(e, "serial") || !strcmp(e, "0")) return 0;
   if (!strcmp(e, "ngram") || !strcmp(e, "ngram-mod") || !strcmp(e, "3")) return 3;
@@ -1732,7 +1732,7 @@ static GenReq parse_gen(std::istringstream& ss) {
     }
     // anything else: drop (lenient by design)
   }
-  // Omitted drafter: resolve the GDEC_DRAFTER default. Pure ngram only
+  // Omitted drafter: resolve the QWENOX_DRAFTER default. Pure ngram only
   // drafts greedy requests (sampled ones keep the legacy default); chain
   // covers greedy and sampled alike.
   if (g.drafter < 0) {
@@ -1748,7 +1748,7 @@ static GenReq parse_gen(std::istringstream& ss) {
 }
 
 // ---------------------------------------------------------------------------
-// Concurrent serving (GDEC_PARALLEL=N, paged KV only; 2026-09-24).
+// Concurrent serving (QWENOX_PARALLEL=N, paged KV only; 2026-09-24).
 //
 // N sequence slots (GpuModel::slots_init) time-share the GPU. Every
 // connection gets a reader thread -- PING/INFO/MEM/X answer at once, even
@@ -2196,7 +2196,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // cached prefix is identical to what a recompute would produce —
     // but only when the cached image KV came from the SAME pixels:
     // placeholder ids are pixel-agnostic, so the patch-bytes hash
-    // guards cont; a mismatch (or GDEC_VISION_NOCONT) falls back to a
+    // guards cont; a mismatch (or QWENOX_VISION_NOCONT) falls back to a
     // full recompute. MTP speculation IS allowed for M-RoPE: verify
     // positions come from the d_ropecs table (ensure_rope_cs handles
     // base=q+1 out-of-range rows with rope_delta_), and the drafter
@@ -2212,7 +2212,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
         fnv1a_patches(vpatches, live_g.size()) == m.img_hash_;
     if (!g.mrope_grids.empty() && cont &&
         ((!live_imgs_same && has_image_tok(hist.data(), mcp)) ||
-         getenv("GDEC_VISION_NOCONT"))) {
+         getenv("QWENOX_VISION_NOCONT"))) {
       fprintf(stderr, "%s vision: req %lld: live prefix %zu not reused "
               "(its images differ)\n", log_ts(), (long long)g.req, mcp);
       cont = false;
@@ -2294,12 +2294,12 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // one commits and checkpoint that position (rckpt), so the next turn --
     // whose token-cache splice can only cut right after such an added token --
     // falls back a few tokens instead of to the previous prompt-end cut.
-    // GDEC_CKPT_TOKENS=0 disables; eos membership wins over a ckpt request.
+    // QWENOX_CKPT_TOKENS=0 disables; eos membership wins over a ckpt request.
     std::unordered_set<int> ckpt_toks(g.ckpt.begin(), g.ckpt.end());
     for (int e : g.eos) ckpt_toks.erase(e);
     if (!rckpt::enabled()) ckpt_toks.clear();
     {
-      const char* e = getenv("GDEC_CKPT_TOKENS");
+      const char* e = getenv("QWENOX_CKPT_TOKENS");
       if (e && !atoi(e)) ckpt_toks.clear();
     }
     HostSampler smp;
@@ -2322,22 +2322,22 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // MTP speculation is available for greedy and rejection-sampled
     // requests when its KV can be made complete: a fresh prefill, or a
     // restore (rckpt/kvsnap) of a state saved with the MTP layer live.
-    // GDEC_SPEC_GAMMA 覆盖；未设时按模式自选：greedy 4（09-28 重扫 γ=4：MTP 8K
+    // QWENOX_SPEC_GAMMA 覆盖；未设时按模式自选：greedy 4（09-28 重扫 γ=4：MTP 8K
     // +6%/32K +9%，chain-greedy +5.6%/+11.5%），采样 3（拒绝采样验收率低，
     // 深链不划算：8K 三种子 γ=3 46.7 vs γ=4 44.8 tok/s，32K 持平）。
     // 09-29 起采样 auto = 自适应 γ（spec_gamma 传 0，见 Model::GammaCtl 两状态版；
     // tools/gamma_sample_check.sh 18 样本：真实长文 1.004× γ3，代码/重复文本 1.040×），
-    // GDEC_SPEC_ADAPT=0 退回固定 3。greedy auto 固定 4：固定轨迹成对比较
+    // QWENOX_SPEC_ADAPT=0 退回固定 3。greedy auto 固定 4：固定轨迹成对比较
     // （tools/gamma_force_check.sh）里自适应与 γ4 相差 ±2% 以内，没有可拿的收益，
     // 固定 γ 还让 greedy 输出不随控制器状态变化（gamma_real_check 里的 0.92 是
-    // 换 γ 导致轨迹分叉的噪声）；GDEC_SPEC_ADAPT_GREEDY=1 让 greedy 也走自适应（试验用）。
-    static const char* sg_env = getenv("GDEC_SPEC_GAMMA");
+    // 换 γ 导致轨迹分叉的噪声）；QWENOX_SPEC_ADAPT_GREEDY=1 让 greedy 也走自适应（试验用）。
+    static const char* sg_env = getenv("QWENOX_SPEC_GAMMA");
     static const bool sg_adapt = [] {
-      const char* e = getenv("GDEC_SPEC_ADAPT");
+      const char* e = getenv("QWENOX_SPEC_ADAPT");
       return !e || e[0] != '0';
     }();
     static const bool sg_adapt_greedy = [] {
-      const char* e = getenv("GDEC_SPEC_ADAPT_GREEDY");
+      const char* e = getenv("QWENOX_SPEC_ADAPT_GREEDY");
       return e && e[0] == '1';
     }();
     const int spec_gamma =
@@ -2349,10 +2349,10 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       if (!said[g.sample]) {
         said[g.sample] = true;
         if (spec_gamma == 0)
-          fprintf(stderr, "[gamma] GDEC_SPEC_GAMMA 未设：%s 请求自适应 gamma（起点 %d）\n",
+          fprintf(stderr, "[gamma] QWENOX_SPEC_GAMMA 未设：%s 请求自适应 gamma（起点 %d）\n",
                   g.sample ? "采样" : "greedy", g.sample ? 3 : 4);
         else
-          fprintf(stderr, "[gamma] GDEC_SPEC_GAMMA 未设：%s 请求默认 gamma=%d\n",
+          fprintf(stderr, "[gamma] QWENOX_SPEC_GAMMA 未设：%s 请求默认 gamma=%d\n",
                   g.sample ? "采样" : "greedy", spec_gamma);
       }
     }
@@ -2364,23 +2364,23 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // Chain mode (llama.cpp-style fallback): ngram drafts every round it
     // can, MTP takes the rounds where the table has nothing. Sampled
     // requests run spec_loop_chain_sample (ngram rounds re-draw from the
-    // target distribution; GDEC_NOSPEC_SAMPLE forces plain serial, same
+    // target distribution; QWENOX_NOSPEC_SAMPLE forces plain serial, same
     // as use_spec). The MTP leg requires a complete MTP KV: a fresh
     // prefill always has one; a cont/restored turn only if the previous
     // request (or the restored checkpoint) left MTP live.
     const bool use_chain = g.drafter == 4 &&
                            (!g.sample ||
-                            getenv("GDEC_NOSPEC_SAMPLE") == nullptr);
+                            getenv("QWENOX_NOSPEC_SAMPLE") == nullptr);
     const bool chain_mtp = use_chain && m.mtp_avail &&
                            (!cont || mtp_live) &&
-                           getenv("GDEC_NOSPEC") == nullptr;
+                           getenv("QWENOX_NOSPEC") == nullptr;
     const bool use_spec = !use_ngram && !use_chain && m.mtp_avail &&
                           g.drafter != 0 && g.drafter != 3 &&
                           g.drafter != 4 &&
                           (!cont || mtp_live) &&
                           (!g.sample ||
-                           getenv("GDEC_NOSPEC_SAMPLE") == nullptr) &&
-                          getenv("GDEC_NOSPEC") == nullptr;
+                           getenv("QWENOX_NOSPEC_SAMPLE") == nullptr) &&
+                          getenv("QWENOX_NOSPEC") == nullptr;
     m.last_spec_rounds = m.last_spec_commit = m.last_spec_rollbacks = 0;
     // Prompt ingest. A failure here (or a KvOverflow anywhere below) lands
     // in the catch at the end: the slot is reset, the client gets D error.
@@ -2427,7 +2427,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // speculative one would report the previous request's acceptance
     m.live_spec_rounds = m.live_spec_commits = m.live_spec_proposed = 0;
     std::vector<kvsnap::Pending> pend;  // SSD captures, committed at turn end
-    static const bool cut_prof = getenv("GDEC_PROF") != nullptr;
+    static const bool cut_prof = getenv("QWENOX_PROF") != nullptr;
     auto cut_tp = t0;
     auto cut_lap = [&](const char* what) {
       if (!cut_prof) return;
@@ -2439,7 +2439,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     };
     cut_lap("pre-cuts");
     // aggr 10-05: the LAST cut is taken in-pass (no separate tiny tail pass);
-    // earlier cuts keep the split path. GDEC_CUT_INPASS=0 disables.
+    // earlier cuts keep the split path. QWENOX_CUT_INPASS=0 disables.
     size_t inpass_cc = 0;
     if (!cuts.empty() && m.cut_snap_supported() && g.mrope_grids.empty() && !m.cut_busy) {
       inpass_cc = cuts.back();
@@ -2849,7 +2849,7 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
       //         cache_mb cache_align kv_slots slot_ctx cache_mode sampling
       //         kv_pool_tokens
       // The default drafter is the chain (ngram first, MTP fallback) unless
-      // GDEC_DRAFTER overrides; draft_head is a separate shortlist readout
+      // QWENOX_DRAFTER overrides; draft_head is a separate shortlist readout
       // and is not part of this checkpoint. kv_slots: concurrent sequences.
       // kv_pool_tokens: KV total shared by all slots (paged mode); without
       // paging each sequence owns slot_ctx, so report nslots * slot_ctx.
@@ -3027,8 +3027,8 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
 }
 
 static int run(GpuModel& m, const std::string& host, int port) {
-  if (!kv_admission_decode_cap(getenv("GDEC_KV_RESERVE_DECODE"), g_reserve_decode)) {
-    fprintf(stderr, "serve: GDEC_KV_RESERVE_DECODE must be an integer from 0 to %d\n",
+  if (!kv_admission_decode_cap(getenv("QWENOX_KV_RESERVE_DECODE"), g_reserve_decode)) {
+    fprintf(stderr, "serve: QWENOX_KV_RESERVE_DECODE must be an integer from 0 to %d\n",
             INT_MAX);
     return 2;
   }
@@ -3068,14 +3068,14 @@ static int run(GpuModel& m, const std::string& host, int port) {
           m.maxctx, m.nslots, m.nslots > 1 ? "s" : "");
   static kvsnap::Cfg kvs;  // read-only once serving; workers share it
   kvs.dir = "data/kvsnap";
-  if (const char* v = getenv("GDEC_KVSNAP_DIR")) kvs.dir = v;
-  if (const char* v = getenv("GDEC_KVSNAP"))
+  if (const char* v = getenv("QWENOX_KVSNAP_DIR")) kvs.dir = v;
+  if (const char* v = getenv("QWENOX_KVSNAP"))
     if (!strcmp(v, "0")) kvs.dir.clear();
-  if (const char* v = getenv("GDEC_KVSNAP_MAX_GB"))
+  if (const char* v = getenv("QWENOX_KVSNAP_MAX_GB"))
     kvs.cap_bytes = (uint64_t)(atof(v) * 1073741824.0);
   if (!kvs.cap_bytes) kvs.dir.clear();
-  if (const char* v = getenv("GDEC_KVSNAP_MIN")) kvs.min_tokens = (size_t)atol(v);
-  if (const char* v = getenv("GDEC_KVSNAP_QUEUE_MB"))
+  if (const char* v = getenv("QWENOX_KVSNAP_MIN")) kvs.min_tokens = (size_t)atol(v);
+  if (const char* v = getenv("QWENOX_KVSNAP_QUEUE_MB"))
     kvs.queue_bytes = (uint64_t)std::max(64.0, atof(v)) << 20;
   if (!kvs.dir.empty()) {
     fprintf(stderr, "kvsnap: dir %s, cap %.1f GB, min %zu tokens\n",

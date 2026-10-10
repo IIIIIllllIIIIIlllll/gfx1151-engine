@@ -1,6 +1,6 @@
 # Performance Benchmark
 
-`gdec-bench` is the standalone command-line benchmark for this engine. It
+`qwenox-bench` is the standalone command-line benchmark for this engine. It
 does not start the HTTP service and it does not accept model paths on the
 command line. This keeps a result tied to the model configuration in
 `service.conf` instead of to a temporary shell command.
@@ -13,7 +13,7 @@ Linux (the default build also produces the engine and API artifacts):
 bash build.sh
 ```
 
-The executable is `build/gdec-bench`.
+The executable is `build/qwenox-bench`.
 
 Windows (the default build also produces the engine, API, and launcher artifacts):
 
@@ -21,7 +21,7 @@ Windows (the default build also produces the engine, API, and launcher artifacts
 bash build_win.sh
 ```
 
-The executable is `build/gdec-bench.exe`.
+The executable is `build/qwenox-bench.exe`.
 
 The `bench` target remains available when only the benchmark needs to be
 rebuilt.
@@ -30,8 +30,8 @@ Opening the executable without arguments exits immediately. Run the benchmark
 explicitly with `run`:
 
 ```bash
-build/gdec-bench run       # Linux
-build/gdec-bench.exe run   # Windows
+build/qwenox-bench run       # Linux
+build/qwenox-bench.exe run   # Windows
 ```
 
 Other arguments are rejected; edit `service.conf` or use the documented
@@ -41,7 +41,7 @@ environment overrides instead.
 
 1. **Model loading** — selects one format only. By default it uses the
    configured HGN model when `MODEL_FILE` exists, otherwise the configured
-   GGUF shard. Set `GDEC_BENCH_FORMAT=hgn` or `GDEC_BENCH_FORMAT=gguf` to make
+   GGUF shard. Set `QWENOX_BENCH_FORMAT=hgn` or `QWENOX_BENCH_FORMAT=gguf` to make
    the choice explicit. HGN overlays and MTP weights, or the GGUF MTP sidecar,
    are loaded exactly from `service.conf`. The test stops on file, mapping,
    HIP, arena, graph, or allocation failures.
@@ -64,7 +64,7 @@ These do not change which model files are selected:
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
-| `GDEC_BENCH_FORMAT` | auto | `hgn` or `gguf` |
+| `QWENOX_BENCH_FORMAT` | auto | `hgn` or `gguf` |
 | `BENCH_PREFILL_REPEATS` | `2` | Samples per prefill prompt |
 | `BENCH_DECODE_REPEATS` | `2` | Samples per decode workload |
 | `BENCH_DECODE_TOKENS` | `128` | Generated tokens per decode sample |

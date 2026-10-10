@@ -1,6 +1,6 @@
 // http_selftest.cpp — exercises the hand-written HTTP layer without an engine.
 // Routes mirror the shapes main.cpp serves, so curl output is directly
-// comparable with reference/GDEC-API-SHAPES.md.
+// comparable with reference/QWENOX-API-SHAPES.md.
 #include <chrono>
 #include <cstdio>
 #include <string>

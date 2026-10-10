@@ -16,9 +16,9 @@ declare -A VARIANTS=(
   [nosnap]="||--drafters 4,4,1 --snaps 0"
   [mtp]="||--drafters 1,1,1 --snaps 1"
   [ngram]="||--drafters 3,3,3 --snaps 1"
-  [norckpt]="GDEC_RCKPT_MAX=0||--drafters 4,4,1 --snaps 1"
-  [nokvsnap]="GDEC_KVSNAP=0||--drafters 4,4,1 --snaps 1"
-  [oldsel]="GDEC_INDEX_OLDSEL=1||--drafters 4,4,1 --snaps 1"
+  [norckpt]="QWENOX_RCKPT_MAX=0||--drafters 4,4,1 --snaps 1"
+  [nokvsnap]="QWENOX_KVSNAP=0||--drafters 4,4,1 --snaps 1"
+  [oldsel]="QWENOX_INDEX_OLDSEL=1||--drafters 4,4,1 --snaps 1"
   # 先跑 a5_ab 的 F/S 用例（全部或部分）再跑 C，用来二分是哪个前置请求让 C 分叉
   [full]="||--drafters 4,4,1 --snaps 1 --pre all"
   [preF]="||--drafters 4,4,1 --snaps 1 --pre F"
@@ -27,28 +27,28 @@ declare -A VARIANTS=(
   [l32]="||--drafters 4,4,1 --snaps 1 --pre F-L32-d0"
   [l32ser]="||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
   [l32mtp]="||--drafters 1,1,1 --snaps 1 --pre F-L32-d0"
-  # 调试：GDEC_KV_ZERO=1 让两种模式里"本序列没写过的行"都读成 0
-  [zero]="GDEC_KV_ZERO=1||--drafters 4,4,1 --snaps 1 --pre all"
+  # 调试：QWENOX_KV_ZERO=1 让两种模式里"本序列没写过的行"都读成 0
+  [zero]="QWENOX_KV_ZERO=1||--drafters 4,4,1 --snaps 1 --pre all"
   # 串行 + 32K 前置，只清零某一块 buffer（k/v/t=BTV 转置 V/i=indexer key），看哪块让 off==p1
-  [zk]="GDEC_KV_ZERO=k||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
-  [zv]="GDEC_KV_ZERO=v||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
-  [zt]="GDEC_KV_ZERO=t||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
-  [zi]="GDEC_KV_ZERO=i||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
+  [zk]="QWENOX_KV_ZERO=k||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
+  [zv]="QWENOX_KV_ZERO=v||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
+  [zt]="QWENOX_KV_ZERO=t||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
+  [zi]="QWENOX_KV_ZERO=i||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
   # 每次 prefill 前核对转置 V 与行主序 V 在 [0, base) 是否一致（结果在引擎日志 [vctchk]）
-  [vchk]="GDEC_VCT_CHECK=1||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
+  [vchk]="QWENOX_VCT_CHECK=1||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
   # prefill 写完转置 V 后把尾块里 >= base+P 的 slot 清零（两种模式都做）
-  [vtail]="GDEC_VCT_TAILZERO=1||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
+  [vtail]="QWENOX_VCT_TAILZERO=1||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
   # 投毒：尾块旧 slot 写 bf16 大数(0x7000≈1.6e38) / NaN(0x7fc0)，看是否被读到
-  [vbig]="GDEC_VCT_TAILZERO=1 GDEC_VCT_TAILVAL=7000||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
-  [vone]="GDEC_VCT_TAILZERO=1 GDEC_VCT_TAILVAL=3f80||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
-  [vinf]="GDEC_VCT_TAILZERO=1 GDEC_VCT_TAILVAL=7f80||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
-  [vsub]="GDEC_VCT_TAILZERO=1 GDEC_VCT_TAILVAL=0001||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
-  [ahash]="GDEC_ATTN_HASH=1||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
-  [vneg]="GDEC_VCT_TAILZERO=1 GDEC_VCT_TAILVAL=bf80||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
-  [vrand]="GDEC_VCT_TAILZERO=1 GDEC_VCT_TAILVAL=ffff||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
-  [vnan]="GDEC_VCT_TAILZERO=1 GDEC_VCT_TAILVAL=7fc0||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
+  [vbig]="QWENOX_VCT_TAILZERO=1 QWENOX_VCT_TAILVAL=7000||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
+  [vone]="QWENOX_VCT_TAILZERO=1 QWENOX_VCT_TAILVAL=3f80||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
+  [vinf]="QWENOX_VCT_TAILZERO=1 QWENOX_VCT_TAILVAL=7f80||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
+  [vsub]="QWENOX_VCT_TAILZERO=1 QWENOX_VCT_TAILVAL=0001||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
+  [ahash]="QWENOX_ATTN_HASH=1||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
+  [vneg]="QWENOX_VCT_TAILZERO=1 QWENOX_VCT_TAILVAL=bf80||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
+  [vrand]="QWENOX_VCT_TAILZERO=1 QWENOX_VCT_TAILVAL=ffff||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
+  [vnan]="QWENOX_VCT_TAILZERO=1 QWENOX_VCT_TAILVAL=7fc0||--drafters 0,0,0 --snaps 1 --pre F-L32-d0"
   # 历史依赖：同一引擎里 T1 → 32K 无关 prompt → T1，看同一个全新 prompt 的输出是否变化
-  [hist]="GDEC_RCKPT=0 GDEC_KVSNAP=0|hist|--drafters 0,1,3,4"
+  [hist]="QWENOX_RCKPT=0 QWENOX_KVSNAP=0|hist|--drafters 0,1,3,4"
 )
 ORDER=(base serial t2serial nosnap mtp ngram norckpt nokvsnap oldsel)
 (( $# )) && ORDER=("$@")
@@ -72,10 +72,10 @@ for v in "${ORDER[@]}"; do
   IFS='|' read -r extra cmd pyargs <<<"$spec"
   cmd="${cmd:-run}"
   for t in "${MODES[@]}"; do
-    for e in $(compgen -e | grep '^GDEC_'); do unset "$e"; done
+    for e in $(compgen -e | grep '^QWENOX_'); do unset "$e"; done
     for e in "${PENV[@]}"; do export "$e"; done
-    export GDEC_KVSNAP_DIR="$SNAPDIR"
-    [[ $t == off* ]] && unset GDEC_KV_PAGED GDEC_KV_POOL_TOKENS
+    export QWENOX_KVSNAP_DIR="$SNAPDIR"
+    [[ $t == off* ]] && unset QWENOX_KV_PAGED QWENOX_KV_POOL_TOKENS
     for e in $extra; do export "$e"; done
     rm -rf "$SNAPDIR"; mkdir -p "$SNAPDIR"
     probe_start "a5c-$v-$t" "${ENGINE[@]}" || { RES[$v]="引擎启动失败($t)"; continue 2; }

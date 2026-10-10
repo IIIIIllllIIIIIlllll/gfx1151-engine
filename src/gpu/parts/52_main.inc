@@ -1,18 +1,18 @@
 // ---------------- main -------------------------------------------------------
-// Pure GGUF start (G3.3): `gdec <first shard>.gguf ...` needs no .hgn. Implies
-// GDEC_GGUF=<base> + GDEC_GGUF_DENSE=1; the MTP sidecar defaults to the single
-// mtp-*.gguf next to the shards (GDEC_GGUF_MTP= empty = none).
+// Pure GGUF start (G3.3): `qwenox <first shard>.gguf ...` needs no .hgn. Implies
+// QWENOX_GGUF=<base> + QWENOX_GGUF_DENSE=1; the MTP sidecar defaults to the single
+// mtp-*.gguf next to the shards (QWENOX_GGUF_MTP= empty = none).
 static bool is_gguf_path(const std::string& p) {
   return p.size() > 5 && p.compare(p.size() - 5, 5, ".gguf") == 0;
 }
 static void gguf_base_setup(const std::string& base) {
 #ifdef _WIN32
-  _putenv_s("GDEC_GGUF", base.c_str());
-  _putenv_s("GDEC_GGUF_DENSE", "1");
+  _putenv_s("QWENOX_GGUF", base.c_str());
+  _putenv_s("QWENOX_GGUF_DENSE", "1");
 #else
-  setenv("GDEC_GGUF", base.c_str(), 1);
-  setenv("GDEC_GGUF_DENSE", "1", 1);
-  if (!getenv("GDEC_GGUF_MTP")) {
+  setenv("QWENOX_GGUF", base.c_str(), 1);
+  setenv("QWENOX_GGUF_DENSE", "1", 1);
+  if (!getenv("QWENOX_GGUF_MTP")) {
     const size_t sl = base.find_last_of('/');
     const std::string dir = sl == std::string::npos ? "." : base.substr(0, sl);
     std::string hit;
@@ -24,13 +24,13 @@ static void gguf_base_setup(const std::string& base) {
       }
       closedir(d);
     }
-    if (n == 1) setenv("GDEC_GGUF_MTP", hit.c_str(), 1);
-    else fprintf(stderr, "gguf: %s MTP sidecar (mtp-*.gguf) in %s; set GDEC_GGUF_MTP\n",
+    if (n == 1) setenv("QWENOX_GGUF_MTP", hit.c_str(), 1);
+    else fprintf(stderr, "gguf: %s MTP sidecar (mtp-*.gguf) in %s; set QWENOX_GGUF_MTP\n",
                  n ? "several" : "no", dir.c_str());
   }
 #endif
   fprintf(stderr, "gguf: pure GGUF start from %s (MTP %s)\n", base.c_str(),
-          getenv("GDEC_GGUF_MTP") && *getenv("GDEC_GGUF_MTP") ? getenv("GDEC_GGUF_MTP") : "none");
+          getenv("QWENOX_GGUF_MTP") && *getenv("QWENOX_GGUF_MTP") ? getenv("QWENOX_GGUF_MTP") : "none");
 }
 // Base checkpoint: the .hgn file, or empty when the base is a GGUF (tensors
 // come from gguf_dense_apply).
@@ -53,7 +53,7 @@ static void lmhead_base_capture(const Checkpoint& ck) {
   }
 }
 
-#if !defined(GDEC_NO_MAIN)
+#if !defined(QWENOX_NO_MAIN)
 int main(int argc, char** argv) {
 #ifdef _WIN32
   if (!wsa_init()) {
@@ -63,20 +63,20 @@ int main(int argc, char** argv) {
 #endif
   if (argc < 2) {
     fprintf(stderr,
-            "usage: gdec <base.hgn> [overlay.hgn ...] --tokens 1,2,3 [--gen N] [--dump] "
+            "usage: qwenox <base.hgn> [overlay.hgn ...] --tokens 1,2,3 [--gen N] [--dump] "
             "[--no-ple] [--maxctx N]\n"
-            "       gdec <base.hgn> [overlay.hgn ...] --tokens-file IDS --ppl "
+            "       qwenox <base.hgn> [overlay.hgn ...] --tokens-file IDS --ppl "
             "[--ppl-window N --ppl-stride N] [--maxctx N]\n"
-            "       gdec <base.hgn> [overlay.hgn ...] --kld-base REF.kld "
+            "       qwenox <base.hgn> [overlay.hgn ...] --kld-base REF.kld "
             "[--kld-chunks N] [--kld-save OUT]   (llama.cpp KLD file)\n"
-            "       gdec <base.hgn> [overlay.hgn ...] --tokens-file IDS --kld-save OUT "
+            "       qwenox <base.hgn> [overlay.hgn ...] --tokens-file IDS --kld-save OUT "
             "[--kld-ctx 512] [--kld-chunks N]\n"
-            "       gdec <base.hgn> [overlay.hgn ...] --serve [--host IPv4] [--port N] [--maxctx N] "
+            "       qwenox <base.hgn> [overlay.hgn ...] --serve [--host IPv4] [--port N] [--maxctx N] "
             "[--no-ple]\n"
             "       Serve defaults: --host 127.0.0.1 --port 8730 (IPv4)\n"
             "       M-RoPE: [--mrope-grid t,h,w ...] with --tokens; "
             "--mrope-test K dumps rope tables/decode positions without weights "
-            "(GDEC_MROPE_DUMP=<file>)\n"
+            "(QWENOX_MROPE_DUMP=<file>)\n"
             "       YaRN: [--rope-factor F] [--rope-original-ctx N] "
             "[--rope-beta-fast F] [--rope-beta-slow F] [--rope-attn-scale F]\n"
             "       Vision: --vision-tower <sidecar.hgn> (serve: GEN suffix "
@@ -266,7 +266,7 @@ int main(int argc, char** argv) {
     // Offline ViT parity mode (stage 4a): runs the INTEGRATED vision tower
     // standalone — no main checkpoint, no arena — and dumps vit.cpp-
     // compatible layers under <prefix>.layers/ for tools/vit_cmp.py.
-    //   gdec <ignored-> --vision-test PREFIX --vision-tower S.hgn
+    //   qwenox <ignored-> --vision-test PREFIX --vision-tower S.hgn
     //        --patches x.npy --mrope-grid t,h,w
     if (vision_tower.empty() || vision_patches.empty() ||
         mrope_grids.empty()) {
@@ -317,7 +317,7 @@ int main(int argc, char** argv) {
     // (the global pinned-page ceiling rejects a second 65 GiB expert
     // registration, tools/probe_reg3.cu),
     // and none of the rope machinery touches weights. Use with
-    // GDEC_MROPE_DUMP=<file> and compare via tools/cmp_mrope.py.
+    // QWENOX_MROPE_DUMP=<file> and compare via tools/cmp_mrope.py.
     Checkpoint ckpt(base.c_str());
     for (const auto& o : overlays)
       if (const char* why = ckpt.add_overlay(o.c_str()))
@@ -379,13 +379,13 @@ int main(int argc, char** argv) {
     // D1a：并发 serve 用更小的 prefill 分段，缩短 D1b 层间让出的最长停顿。
     // 必须在 devarena_init 之前（arena sizing 与 GpuModel 共用 eff_maxbatch）。
     if (eff_parallel() > 1) {
-      if (const char* e = getenv("GDEC_CONC_PREFILL_CHUNK")) {
+      if (const char* e = getenv("QWENOX_CONC_PREFILL_CHUNK")) {
         int v = atoi(e);
         if (v > 0) {
           // 只缩不放：大于单路分段时沿用单路值（不放大工作区，也不拉长让出间隔）。
           const int single = eff_maxbatch(maxctx);
           g_maxbatch_override = std::min(v, single);
-          fprintf(stderr, "gdec: parallel %d -> prefill chunk %d (GDEC_CONC_PREFILL_CHUNK=%d%s)\n",
+          fprintf(stderr, "qwenox: parallel %d -> prefill chunk %d (QWENOX_CONC_PREFILL_CHUNK=%d%s)\n",
                   eff_parallel(), eff_maxbatch(maxctx), v,
                   v > single ? ", capped by single-stream chunk" : "");
         }
@@ -400,7 +400,7 @@ int main(int argc, char** argv) {
     m.ple_on = ple_on;
     m.build_graphs();
     if (!vision_tower.empty()) m.load_vision(vision_tower.c_str());
-    if (!getenv("GDEC_NOWARMUP")) {
+    if (!getenv("QWENOX_NOWARMUP")) {
       // one dummy chunk moves first-call costs (Tensile library load,
       // hipBLASLt algo selection, kernel module loads) out of the first
       // served prefill; reset_state is the KV-split self-test path, proven
@@ -414,7 +414,7 @@ int main(int argc, char** argv) {
     // prompts) that produced the cached KV
     kvsnap::g_model_files = overlays;
     kvsnap::g_model_files.insert(kvsnap::g_model_files.begin(), base);
-    if (g_gguf)  // GDEC_GGUF experts: every shard is part of the identity
+    if (g_gguf)  // QWENOX_GGUF experts: every shard is part of the identity
       for (const auto& mp : g_gguf->mappings()) kvsnap::g_model_files.push_back(mp.path);
     if (g_gguf_dense) {  // same files as the G2 hybrid, different weights
       kvsnap::g_model_files.push_back("@gguf-dense");
@@ -487,7 +487,7 @@ int main(int argc, char** argv) {
   std::vector<int> all = tokens;
   std::vector<float> logits;
 
-  if (!getenv("GDEC_NOWARMUP") && mtp_test == 0 && spec_gen == 0) {
+  if (!getenv("QWENOX_NOWARMUP") && mtp_test == 0 && spec_gen == 0) {
     // warmup: one dummy chunk prefill, then reset (see serve path above).
     // Skipped for mtp/spec modes: tap capture would ingest warmup rows.
     std::vector<int> warm((size_t)m.maxbatch, 0);
@@ -514,7 +514,7 @@ int main(int argc, char** argv) {
       total_scored++;
       printf("ppl_token\t%zu\t%d\t%.9g\n", pos, tokens[pos + 1], nll);
     };
-    if (getenv("GDEC_NOPREFILLBATCH") && ppl_window == 0) {
+    if (getenv("QWENOX_NOPREFILLBATCH") && ppl_window == 0) {
       for (size_t pos = 0; pos < tokens.size(); pos++) {
         m.forward(tokens[pos]);
         if (pos + 1 == tokens.size()) break;
@@ -526,8 +526,8 @@ int main(int argc, char** argv) {
         report(pos, maximum + std::log(sum) - row[tokens[pos + 1]]);
       }
     } else {
-      if (ppl_window && getenv("GDEC_NOPREFILLBATCH")) {
-        fprintf(stderr, "--ppl-window does not support GDEC_NOPREFILLBATCH\n");
+      if (ppl_window && getenv("QWENOX_NOPREFILLBATCH")) {
+        fprintf(stderr, "--ppl-window does not support QWENOX_NOPREFILLBATCH\n");
         return 2;
       }
       size_t previous_end = 0;
@@ -595,7 +595,7 @@ int main(int argc, char** argv) {
   };
 
   int next_id = -1;
-  if (getenv("GDEC_NOPREFILLBATCH")) {
+  if (getenv("QWENOX_NOPREFILLBATCH")) {
     for (size_t i = 0; i < tokens.size(); i++) {
       next_id = m.forward(tokens[i]);
       if (dump) {
@@ -614,13 +614,13 @@ int main(int argc, char** argv) {
     }
   }
 
-  // GDEC_VBENCH=P1,P2,...（D0-M2）：prompt prefill 之后，用 prompt 开头的
+  // QWENOX_VBENCH=P1,P2,...（D0-M2）：prompt prefill 之后，用 prompt 开头的
   // 连续真实 token 片段跑 prefill_batch(P, base=N) 各 20 次取中位数，
   // 量 P 行成本曲线与 P>8 / P>16 悬崖（verify 路径同款参数 final/quiet，
   // 不捕 tap、不做快照）。跑完直接退出。
   // 项写成 PxS（如 8x4）：P 行由 S 段各 P/S 个连续 token 拼成，S 段取自 prompt 里
   // 均匀分开的位置，专家分布近似 S 个不同序列（D2 合批估算用，tools/d2_gate_check.sh）。
-  if (const char* vb = getenv("GDEC_VBENCH")) {
+  if (const char* vb = getenv("QWENOX_VBENCH")) {
     m.mtp_tap_capture = false;
     std::vector<std::pair<int, int>> Ps;
     for (const char* p = vb;;) {
@@ -669,40 +669,40 @@ int main(int argc, char** argv) {
   if (spec_gen > 0) {
     m.mtp_tap_capture = false;  // verify/re-prefill must NOT capture taps
     // (MTP prompt ingest already happened per-chunk inside prefill_batch.)
-    if (getenv("GDEC_NOPREFILLBATCH")) {
-      fprintf(stderr, "spec-gen: GDEC_NOPREFILLBATCH unsupported (no tap "
+    if (getenv("QWENOX_NOPREFILLBATCH")) {
+      fprintf(stderr, "spec-gen: QWENOX_NOPREFILLBATCH unsupported (no tap "
               "capture without prefill_batch)\n");
       return 1;
     }
     // Offline test hooks for the API decode paths:
-    //   GDEC_SPEC_CHAIN=1   chain drafter (ngram first, MTP fallback), the
+    //   QWENOX_SPEC_CHAIN=1   chain drafter (ngram first, MTP fallback), the
     //                       API default
-    //   GDEC_SPEC_SAMPLE=temp,top_k,top_p,seed[,presence,frequency]
+    //   QWENOX_SPEC_SAMPLE=temp,top_k,top_p,seed[,presence,frequency]
     //                       rejection-sampled spec
     // The first token (next_id) stays the prefill argmax.
-    //   GDEC_SPEC_FORCE=<file>  greedy MTP only: verify against these ids
+    //   QWENOX_SPEC_FORCE=<file>  greedy MTP only: verify against these ids
     //                       (whitespace-separated; the tokens AFTER the
     //                       prefill argmax, e.g. a plain --gen run's ids
     //                       minus prompt and first token). All γ policies
     //                       then commit the same ids (tools/gamma_force_check.sh).
-    const bool chain = getenv("GDEC_SPEC_CHAIN") && atoi(getenv("GDEC_SPEC_CHAIN"));
-    if (const char* ff = getenv("GDEC_SPEC_FORCE")) {
-      if (chain || getenv("GDEC_SPEC_SAMPLE")) {
-        fprintf(stderr, "GDEC_SPEC_FORCE: greedy MTP spec only (no CHAIN / SAMPLE)\n");
+    const bool chain = getenv("QWENOX_SPEC_CHAIN") && atoi(getenv("QWENOX_SPEC_CHAIN"));
+    if (const char* ff = getenv("QWENOX_SPEC_FORCE")) {
+      if (chain || getenv("QWENOX_SPEC_SAMPLE")) {
+        fprintf(stderr, "QWENOX_SPEC_FORCE: greedy MTP spec only (no CHAIN / SAMPLE)\n");
         return 2;
       }
       FILE* f = fopen(ff, "r");
-      if (!f) { fprintf(stderr, "GDEC_SPEC_FORCE: cannot open %s\n", ff); return 2; }
+      if (!f) { fprintf(stderr, "QWENOX_SPEC_FORCE: cannot open %s\n", ff); return 2; }
       for (int t; fscanf(f, "%d", &t) == 1;) m.spec_force.push_back(t);
       fclose(f);
       if ((int)m.spec_force.size() < spec_gen) {
-        fprintf(stderr, "GDEC_SPEC_FORCE: %zu ids < --spec-gen %d\n", m.spec_force.size(), spec_gen);
+        fprintf(stderr, "QWENOX_SPEC_FORCE: %zu ids < --spec-gen %d\n", m.spec_force.size(), spec_gen);
         return 2;
       }
       fprintf(stderr, "spec-gen force: %zu ids from %s\n", m.spec_force.size(), ff);
     }
     std::vector<int> spec_out;
-    if (const char* ss = getenv("GDEC_SPEC_SAMPLE")) {
+    if (const char* ss = getenv("QWENOX_SPEC_SAMPLE")) {
       serve::HostSampler smp;
       smp.temp = 1.0f;
       smp.top_k = 20;
@@ -712,7 +712,7 @@ int main(int argc, char** argv) {
       unsigned long long seed = 1;
       if (sscanf(ss, "%f,%d,%f,%llu,%f,%f", &smp.temp, &smp.top_k, &smp.top_p, &seed,
                  &smp.presence, &smp.frequency) < 1) {
-        fprintf(stderr, "GDEC_SPEC_SAMPLE expects temp,top_k,top_p,seed[,presence,frequency]\n");
+        fprintf(stderr, "QWENOX_SPEC_SAMPLE expects temp,top_k,top_p,seed[,presence,frequency]\n");
         return 2;
       }
       smp.rng = seed;
@@ -811,4 +811,4 @@ int main(int argc, char** argv) {
   return 0;
 }
 
-#endif  // !defined(GDEC_NO_MAIN)
+#endif  // !defined(QWENOX_NO_MAIN)

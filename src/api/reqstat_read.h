@@ -36,7 +36,7 @@ struct ScanInfo {
   uint64_t bad_crc = 0;        // records skipped on CRC mismatch
 };
 
-// Directory the recorder writes to: $GDEC_REQSTAT_DIR or "data".
+// Directory the recorder writes to: $QWENOX_REQSTAT_DIR or "data".
 std::string stat_dir();
 
 // Visit records with t0 <= ts_ms <= t1 in chain order (rotated files by seq,

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # d2_gate_check.sh — 独立复核 D2（多序列合批 verify）闸门，当前 HEAD 二进制 + 生产 HQ 权重，前台约 20 分钟。
 #   bash tools/d2_gate_check.sh
-#   BIN=build/gdec CTXS="8192 65536" SPEC=256 GATE=1.25 bash tools/d2_gate_check.sh
+#   BIN=build/qwenox-engine CTXS="8192 65536" SPEC=256 GATE=1.25 bash tools/d2_gate_check.sh
 #   SMP=0.7,20,0.8,1 bash tools/d2_gate_check.sh      # 改测采样（temp,top_k,top_p,seed）
 # 每个上下文长度（取 data/qsa-oracle/131072.tokens 的前 N 个 token，真实文本、无重复）：
-#   1) GDEC_VBENCH：P 行 verify 成本。T(P) = 同一序列连续 P 行；T(R×B) = R 行拆成 B 段、取自 prompt 里
+#   1) QWENOX_VBENCH：P 行 verify 成本。T(P) = 同一序列连续 P 行；T(R×B) = R 行拆成 B 段、取自 prompt 里
 #      相距很远的 B 处（专家分布近似 B 个不同序列）
 #   2) 单路投机 γ=1,2,3,4,7 与自适应 γ：tok/s、每轮 ms Tr(γ)、每轮提交 E(γ)
 # 另跑一次 1K 上下文的 VBENCH：C(p) = T_N(p) − T_1K(p) 近似"每个序列按上下文长度付的 attention/indexer 成本"。
@@ -21,7 +21,7 @@
 # 日志：logs/d2g_*.log，汇总 logs/d2_gate_check.out
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
-BIN="${BIN:-build/gdec}"
+BIN="${BIN:-build/qwenox-engine}"
 SRC="${SRC:-data/qsa-oracle/131072.tokens}"
 CTXS="${CTXS:-8192 65536}"
 NS="${SPEC:-256}"
@@ -54,7 +54,7 @@ svm_check() {
   fi
 }
 extra=()
-[[ -n "$SMP" ]] && extra=("GDEC_SPEC_SAMPLE=$SMP")
+[[ -n "$SMP" ]] && extra=("QWENOX_SPEC_SAMPLE=$SMP")
 fail=0
 run() {  # run LABEL TOKFILE [ENV=...]   额外环境变量为空时不传
   local L=$1 T=$2; shift 2
@@ -68,13 +68,13 @@ run() {  # run LABEL TOKFILE [ENV=...]   额外环境变量为空时不传
 
 head -n 1024 "$SRC" > logs/d2g/tok1024.txt
 echo "-- ctx 1024：VBENCH（扣除上下文相关成本用）"
-run d2g_1024_vb logs/d2g/tok1024.txt "GDEC_VBENCH=1,2,3,4,5,6,7,8" && grep -a '^vbench P=' logs/d2g_1024_vb.log | sed 's/^/     /'
+run d2g_1024_vb logs/d2g/tok1024.txt "QWENOX_VBENCH=1,2,3,4,5,6,7,8" && grep -a '^vbench P=' logs/d2g_1024_vb.log | sed 's/^/     /'
 for N in $CTXS; do
   T=logs/d2g/tok$N.txt
   head -n "$N" "$SRC" > "$T"
   (( $(wc -w <"$T") == N )) || { echo "token 文件不足 $N"; echo "D2 GATE CHECK: FAIL"; exit 1; }
   echo "-- ctx $N：VBENCH"
-  run "d2g_${N}_vb" "$T" "GDEC_VBENCH=$PS" || continue
+  run "d2g_${N}_vb" "$T" "QWENOX_VBENCH=$PS" || continue
   grep -a '^vbench P=' "logs/d2g_${N}_vb.log" | sed 's/^/     /'
   echo "-- ctx $N：单路投机 γ ∈ {$GAMMAS}（0 = 自适应）"
   for G in $GAMMAS; do

@@ -126,8 +126,8 @@ int main(int argc, char** argv) {
   if (argc == 3 && !strcmp(argv[1], "--fixtures")) {
     std::error_code ec;
     fs::create_directories(argv[2], ec);
-    set_env("GDEC_REQSTAT_DIR", argv[2]);
-    set_env("GDEC_REQSTAT_MAX_MB", "0.01");
+    set_env("QWENOX_REQSTAT_DIR", argv[2]);
+    set_env("QWENOX_REQSTAT_MAX_MB", "0.01");
     write_fixtures();
     append_junk(argv[2]);
     printf("fixtures written to %s\n", argv[2]);
@@ -139,8 +139,8 @@ int main(int argc, char** argv) {
   std::error_code ec;
   fs::remove_all(dir, ec);
   fs::create_directories(dir, ec);
-  set_env("GDEC_REQSTAT_DIR", dir);
-  set_env("GDEC_REQSTAT_MAX_MB", "0.01");  // 10 KiB -> rotates mid-run
+  set_env("QWENOX_REQSTAT_DIR", dir);
+  set_env("QWENOX_REQSTAT_MAX_MB", "0.01");  // 10 KiB -> rotates mid-run
 
   // Empty directory: valid scan, zero records.
   {
@@ -216,14 +216,14 @@ int main(int argc, char** argv) {
 
   // Missing directory: not an error, zero records.
   {
-    set_env("GDEC_REQSTAT_DIR", dir + "/no-such");
+    set_env("QWENOX_REQSTAT_DIR", dir + "/no-such");
     reqstat::ScanInfo info;
     Agg a = aggregate(0, ~(uint64_t)0, &info);
     std::vector<reqstat::QEntry> out;
     std::string err;
     const bool ok = reqstat::tail(10, &out, &info, &err);
     check(a.n == 0 && ok && out.empty(), "missing dir scans clean");
-    set_env("GDEC_REQSTAT_DIR", dir);
+    set_env("QWENOX_REQSTAT_DIR", dir);
   }
 
   fs::remove_all(dir, ec);

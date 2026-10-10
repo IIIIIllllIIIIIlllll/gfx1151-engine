@@ -11,9 +11,9 @@
 
 namespace {
 
-using gdec_uni::CCCEntry;
-using gdec_uni::CompEntry;
-using gdec_uni::DecompEntry;
+using qwenox_uni::CCCEntry;
+using qwenox_uni::CompEntry;
+using qwenox_uni::DecompEntry;
 
 // ---------- Unicode table lookups ----------
 
@@ -28,16 +28,16 @@ bool in_intervals(const uint32_t tab[][2], size_t n, uint32_t cp) {
     return false;
 }
 
-bool uni_is_L(uint32_t cp) { return in_intervals(gdec_uni::kCatL, gdec_uni::kCatLCount, cp); }
-bool uni_is_M(uint32_t cp) { return in_intervals(gdec_uni::kCatM, gdec_uni::kCatMCount, cp); }
-bool uni_is_N(uint32_t cp) { return in_intervals(gdec_uni::kCatN, gdec_uni::kCatNCount, cp); }
-bool uni_is_ws(uint32_t cp) { return in_intervals(gdec_uni::kWhiteSpace, gdec_uni::kWhiteSpaceCount, cp); }
+bool uni_is_L(uint32_t cp) { return in_intervals(qwenox_uni::kCatL, qwenox_uni::kCatLCount, cp); }
+bool uni_is_M(uint32_t cp) { return in_intervals(qwenox_uni::kCatM, qwenox_uni::kCatMCount, cp); }
+bool uni_is_N(uint32_t cp) { return in_intervals(qwenox_uni::kCatN, qwenox_uni::kCatNCount, cp); }
+bool uni_is_ws(uint32_t cp) { return in_intervals(qwenox_uni::kWhiteSpace, qwenox_uni::kWhiteSpaceCount, cp); }
 
 uint8_t uni_ccc(uint32_t cp) {
-    size_t lo = 0, hi = gdec_uni::kCCCCount;
+    size_t lo = 0, hi = qwenox_uni::kCCCCount;
     while (lo < hi) {
         size_t mid = (lo + hi) / 2;
-        const CCCEntry& e = gdec_uni::kCCC[mid];
+        const CCCEntry& e = qwenox_uni::kCCC[mid];
         if (cp < e.lo) hi = mid;
         else if (cp > e.hi) lo = mid + 1;
         else return e.ccc;
@@ -52,12 +52,12 @@ constexpr uint32_t kLCount = 19, kVCount = 21, kTCount = 28;
 constexpr uint32_t kNCount = kVCount * kTCount, kSCount = kLCount * kNCount;
 
 const DecompEntry* find_decomp(uint32_t cp) {
-    size_t lo = 0, hi = gdec_uni::kDecompCount;
+    size_t lo = 0, hi = qwenox_uni::kDecompCount;
     while (lo < hi) {
         size_t mid = (lo + hi) / 2;
-        if (cp < gdec_uni::kDecomp[mid].cp) hi = mid;
-        else if (cp > gdec_uni::kDecomp[mid].cp) lo = mid + 1;
-        else return &gdec_uni::kDecomp[mid];
+        if (cp < qwenox_uni::kDecomp[mid].cp) hi = mid;
+        else if (cp > qwenox_uni::kDecomp[mid].cp) lo = mid + 1;
+        else return &qwenox_uni::kDecomp[mid];
     }
     return nullptr;
 }
@@ -83,7 +83,7 @@ void decompose_canonical(uint32_t cp, size_t s0, size_t s1, std::vector<SCP>* ou
         return;
     }
     for (uint16_t i = 0; i < e->len; ++i)
-        decompose_canonical(gdec_uni::kDecompData[e->off + i], s0, s1, out);
+        decompose_canonical(qwenox_uni::kDecompData[e->off + i], s0, s1, out);
 }
 
 uint32_t compose_pair(uint32_t a, uint32_t b) {
@@ -92,10 +92,10 @@ uint32_t compose_pair(uint32_t a, uint32_t b) {
     if (a >= kSBase && a < kSBase + kSCount && (a - kSBase) % kTCount == 0 &&
         b > kTBase && b < kTBase + kTCount)
         return a + (b - kTBase);
-    size_t lo = 0, hi = gdec_uni::kCompCount;
+    size_t lo = 0, hi = qwenox_uni::kCompCount;
     while (lo < hi) {
         size_t mid = (lo + hi) / 2;
-        const CompEntry& e = gdec_uni::kComp[mid];
+        const CompEntry& e = qwenox_uni::kComp[mid];
         if (a < e.a || (a == e.a && b < e.b)) hi = mid;
         else if (a == e.a && b == e.b) return e.c;
         else lo = mid + 1;
@@ -378,7 +378,7 @@ size_t match_pretoken(const std::vector<CP>& s, size_t i) {
 
 }  // namespace
 
-namespace gdec {
+namespace qwenox {
 
 bool Tokenizer::load(const std::string& dir, std::string* err) {
     init_alphabet();
@@ -653,4 +653,4 @@ bool Tokenizer::is_special_token(int id) const {
     return it != added_special_.end() && it->second;
 }
 
-}  // namespace gdec
+}  // namespace qwenox

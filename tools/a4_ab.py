@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """A4: per-page content-addressed SSD KV cache (kvsnap) — restores across restarts.
 
-Usage (repo root, one engine on 127.0.0.1:8732 per step, GDEC_KVSNAP_DIR=DIR,
-GDEC_KVSNAP_MIN=1024 — tools/a4_verify.sh drives all of this):
+Usage (repo root, one engine on 127.0.0.1:8732 per step, QWENOX_KVSNAP_DIR=DIR,
+QWENOX_KVSNAP_MIN=1024 — tools/a4_verify.sh drives all of this):
   python3 tools/a4_ab.py save   --dir DIR        # E1 (empty dir, rckpt on): gold runs
   python3 tools/a4_ab.py run    --tag T [--only a2,b2,c2]   # fresh engine: restores
   python3 tools/a4_ab.py compare --tag T [--only ...] [--ref gold|TAG] [--miss|--hit]
@@ -225,7 +225,7 @@ def cmd_predict(a):
     print(f'  disk: {len(cks)} ckpts, {len(files)} files, {total / 2**30:.2f} GiB; keep newest '
           f'{a.keep} ({kept}) '
           f'= {size / 2**30:.3f} GiB, +1 = {nxt / 2**30:.3f} GiB', flush=True)
-    print(f'{cap / 2**30:.4f}')  # last line: GDEC_KVSNAP_MAX_GB
+    print(f'{cap / 2**30:.4f}')  # last line: QWENOX_KVSNAP_MAX_GB
 
 
 def cmd_check_lru(a):

@@ -38,18 +38,18 @@ export PYTHONPATH="${PWD}/.ppldeps${PYTHONPATH:+:$PYTHONPATH}"
 python3 tools/prepare_wikitext2.py --zip /path/to/wikitext-2.zip \
   --tokenizer-json "$MODEL_DIR/tokenizer/tokenizer.json" --output wiki-test.tokens
 bash build.sh engine
-export GDEC_PREFILL_TAIL_SLACK=0
+export QWENOX_PREFILL_TAIL_SLACK=0
 BASE="$MODEL_DIR/qwen38-flash-next-w4b.hgn"
 OVL="$MODEL_DIR/qwen38-flash-next-w4b.overlay.hgn"
 head -n 1024 wiki-test.tokens > wiki-smoke.tokens
-GDEC_PREFILL_CHUNK=512 build/gdec "$BASE" "$OVL" \
+QWENOX_PREFILL_CHUNK=512 build/qwenox-engine "$BASE" "$OVL" \
   --tokens-file wiki-smoke.tokens --maxctx 512 --ppl \
   --ppl-window 512 --ppl-stride 128 > wiki-smoke.tsv
 tail -1 wiki-smoke.tsv  # count 应为 1023；这只是烟测，不是正式 PPL
-GDEC_PREFILL_CHUNK=2048 build/gdec "$BASE" "$OVL" \
+QWENOX_PREFILL_CHUNK=2048 build/qwenox-engine "$BASE" "$OVL" \
   --tokens-file wiki-test.tokens --maxctx 2048 --ppl \
   --ppl-window 2048 --ppl-stride 512 > wiki-2048.tsv
-GDEC_PREFILL_CHUNK=512 build/gdec "$BASE" "$OVL" \
+QWENOX_PREFILL_CHUNK=512 build/qwenox-engine "$BASE" "$OVL" \
   --tokens-file wiki-test.tokens --maxctx 2048 --ppl \
   --ppl-window 2048 --ppl-stride 512 > wiki-512.tsv
 python3 tools/ppl_compare.py wiki-2048.tsv wiki-512.tsv --chunk 512
@@ -65,9 +65,9 @@ tail -1 wiki-2048.tsv
 
 Windows 也可用同一脚本，把 `--zip` 设为
 `C:\Users\Mark\Workspace\CProject\my\wikitext-2.zip`，执行
-`bash build_win.sh`，引擎路径改为 `build/gdec-win.exe`；其余参数相同。
+`bash build_win.sh`，引擎路径改为 `build/qwenox-engine-win.exe`；其余参数相同。
 为避免串行全量测试过慢，先从 `wiki-test.tokens` 截取 256 个 ID，分别用
-`GDEC_NOPREFILLBATCH=1`（串行）和 `GDEC_PREFILL_CHUNK=64`
+`QWENOX_NOPREFILLBATCH=1`（串行）和 `QWENOX_PREFILL_CHUNK=64`
 （批量）运行 `--ppl --maxctx 256`，再运行
 `python3 tools/ppl_compare.py serial.tsv batch.tsv --chunk 64`。
 不设置 `--ppl-window/--ppl-stride` 时仍是旧的单段数值对拍模式，

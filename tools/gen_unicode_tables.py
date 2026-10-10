@@ -98,7 +98,7 @@ def main():
     w("#include <cstddef>")
     w("#include <cstdint>")
     w("")
-    w("namespace gdec_uni {")
+    w("namespace qwenox_uni {")
     w("")
 
     def emit_intervals(name, tab):
@@ -149,7 +149,7 @@ def main():
     w("};")
     w(f"static const size_t kCompCount = {len(comp)};")
     w("")
-    w("}  // namespace gdec_uni")
+    w("}  // namespace qwenox_uni")
 
     out_path = sys.argv[1] if len(sys.argv) > 1 else "src/api/unicode_tables.inc"
     with open(out_path, "w") as f:

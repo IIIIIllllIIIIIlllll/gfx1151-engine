@@ -2,10 +2,11 @@
 # Windows (TheRock) 编译入口：与 Linux build.sh 并列，产物输出到 build/。
 #
 # 用法:
-#   bash build_win.sh            # 全部产物：引擎、benchmark、API、启动器
-#   bash build_win.sh bench      # 性能测试工具 → build/gdec-bench.exe
-#   bash build_win.sh api        # OpenAI HTTP 前端 → build/gdec-api-win.exe
-#   bash build_win.sh launcher   # 免脚本启动器 → ./start_win.exe（双击即用，托盘程序）
+#   bash build_win.sh            # 全部产物：引擎、benchmark、API、根目录入口
+#   bash build_win.sh bench      # 性能测试工具 → build/qwenox-bench.exe
+#   bash build_win.sh api        # OpenAI HTTP 前端 → build/qwenox-win.exe
+#                                #   （GUI 托盘程序：API 服务 + 控制台网页 + 引擎启停）
+#   bash build_win.sh launcher   # 根目录最小入口 → ./start_win.exe（双击拉起 API）
 #   bash build_win.sh test       # 编 build/ktest-win.exe 并运行 kernel 单测
 #
 # 前置：TheRock 多架构包（默认 C:\therock-dist-windows-multiarch-10.0.0\...，
@@ -77,17 +78,17 @@ FLAGS=(-O3 -std=c++17 --offload-arch="$GPU_ARCH" -D_CRT_SECURE_NO_WARNINGS
        -I"$TR/include" -Lbuild/winlibs -lrocblas -lhipblaslt)
 
 build_engine() {
-    echo "[编译] build/gdec-win.exe"
+    echo "[编译] build/qwenox-engine-win.exe"
     # 先编到临时文件再原子替换，编译失败保留上次成功的二进制（对齐 Linux build.sh）
-    "$HIPCC" "${FLAGS[@]}" src/gpu/gdec.cpp -o build/gdec-win.exe.tmp \
-      && mv -f build/gdec-win.exe.tmp build/gdec-win.exe
+    "$HIPCC" "${FLAGS[@]}" src/gpu/qwenox.cpp -o build/qwenox-engine-win.exe.tmp \
+      && mv -f build/qwenox-engine-win.exe.tmp build/qwenox-engine-win.exe
 }
 
 build_bench() {
-    echo "[编译] build/gdec-bench.exe"
+    echo "[编译] build/qwenox-bench.exe"
     "$HIPCC" "${FLAGS[@]}" -std=c++17 -Ithird_party src/gpu/bench_main.cpp \
-      -o build/gdec-bench.exe.tmp \
-      && mv -f build/gdec-bench.exe.tmp build/gdec-bench.exe
+      -o build/qwenox-bench.exe.tmp \
+      && mv -f build/qwenox-bench.exe.tmp build/qwenox-bench.exe
 }
 
 # 静态页嵌入：编译生成器并重新生成 src/api/static_gen.inc（复用调用方设好的 CXX）。
@@ -102,53 +103,67 @@ gen_static_inc() {
     ./build/gen_static_inc.exe src/api/static src/api/static_gen.inc || exit 1
 }
 
+# GUI 子系统链接选项（托盘/入口程序，双击不出控制台）；入口仍是 main()。
+# 链接器选项用 - 前缀：Git Bash 会把 / 开头的参数当路径改写。
+GUI_LDFLAGS=()
+gui_ldflags() {
+    [[ ${#GUI_LDFLAGS[@]} -gt 0 ]] && return
+    if "$CXX" -dumpmachine | grep -q msvc; then
+      GUI_LDFLAGS=(-Xlinker -subsystem:windows -Xlinker -entry:mainCRTStartup)
+    else
+      GUI_LDFLAGS=(-mwindows)
+    fi
+}
+
 build_api() {
     # OpenAI HTTP 前端：纯主机 C++，用 TheRock 自带 clang++（不拖 HIP 依赖）。
     # vision.cpp 的图片解码在 Windows 上走 stb_image（vendor 单头文件，
     # 编译进 exe，零新增 DLL），支持 PNG/JPEG；WebP 明确报错。
+    # Windows 上是 GUI 子系统托盘程序（默认无控制台，--console 恢复），
+    # 取代旧 start_win.exe 启动器的生态位：托盘菜单/网页 #/engine 启停引擎。
     CXX="$TR/lib/llvm/bin/clang++.exe"
     [[ -x "$CXX" ]] || { echo "找不到 TheRock clang++: $CXX" >&2; exit 1; }
     gen_static_inc
-    echo "[编译] build/gdec-api-win.exe"
+    gui_ldflags
+    echo "[编译] build/qwenox-win.exe"
     "$CXX" -O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS -Isrc/api -Ithird_party -I"$TR/include" \
       src/api/http.cpp src/api/engine_client.cpp src/api/tokenizer.cpp \
       src/api/chat_template.cpp src/api/json_py.cpp src/api/toolparse.cpp \
       src/api/vision.cpp src/api/reqstat.cpp src/api/reqstat_read.cpp \
-      src/api/power.cpp src/api/main.cpp -lws2_32 -o build/gdec-api-win.exe
+      src/api/power.cpp src/api/engine_sup.cpp src/api/tray_win.cpp src/api/main.cpp \
+      -lws2_32 -lshell32 -luser32 -lgdi32 -ladvapi32 "${GUI_LDFLAGS[@]}" -o build/qwenox-win.exe
 }
 
 build_launcher() {
-    # 免脚本启动器：原生 Win32，双击即用（不需要 Git Bash / PowerShell）。
+    # 根目录最小入口 start_win.exe：只负责以项目根为工作目录拉起
+    # build\qwenox-win.exe（托盘程序）。旧启动器（配置面板/双进程看守）
+    # 已归档到 attic/launcher/，不再编译。
     CXX="$TR/lib/llvm/bin/clang++.exe"
     [[ -x "$CXX" ]] || { echo "找不到 TheRock clang++: $CXX" >&2; exit 1; }
-    # GUI 子系统（托盘程序，双击不出控制台）；入口仍是 main()。
-    # 链接器/llvm-rc 选项用 - 前缀：Git Bash 会把 / 开头的参数当路径改写。
+    gui_ldflags
     RES=()
     if "$CXX" -dumpmachine | grep -q msvc; then
-      GUI_LDFLAGS=(-Xlinker -subsystem:windows -Xlinker -entry:mainCRTStartup)
       # exe 文件图标（可选）：优先 TheRock 的 llvm-rc，没有则退回 Windows SDK
-      # 的 rc.exe（取最新版本目录）；都没有也不影响托盘图标。
+      # 的 rc.exe（取最新版本目录）；都没有也不影响 API 的托盘图标。
       RC="$TR/lib/llvm/bin/llvm-rc.exe"
       RCFLAGS=(-no-preprocess)
       if [[ ! -x "$RC" ]]; then
         RC="$(ls "/c/Program Files (x86)/Windows Kits/10/bin"/*/x64/rc.exe 2>/dev/null | sort -V | tail -1)"
         RCFLAGS=()
       fi
-      if [[ -n "$RC" && -x "$RC" ]] && "$RC" "${RCFLAGS[@]}" -fo build/launch_win.res src/launch_win.rc; then
-        RES=(build/launch_win.res)
+      if [[ -n "$RC" && -x "$RC" ]] && "$RC" "${RCFLAGS[@]}" -fo build/start_stub.res src/start_stub.rc; then
+        RES=(build/start_stub.res)
       else
         echo "提示：llvm-rc 不可用，start_win.exe 文件不带图标（托盘图标不受影响）" >&2
       fi
-    else
-      GUI_LDFLAGS=(-mwindows)
     fi
     echo "[编译] start_win.exe"
-    LAUNCH_SRC=(-O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS src/launch_win.cpp
-                -lws2_32 -lshell32 -luser32 -lcomdlg32 -lgdi32 -lgdiplus -luxtheme -ldwmapi "${GUI_LDFLAGS[@]}" -o start_win.exe)
-    if ! "$CXX" "${LAUNCH_SRC[@]}" ${RES[@]+"${RES[@]}"}; then
+    STUB_SRC=(-O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS src/start_stub_win.cpp
+              -luser32 -lshell32 "${GUI_LDFLAGS[@]}" -o start_win.exe)
+    if ! "$CXX" "${STUB_SRC[@]}" ${RES[@]+"${RES[@]}"}; then
       [[ ${#RES[@]} -gt 0 ]] || exit 1
       echo "提示：带图标资源链接失败，改为不带文件图标重试" >&2
-      "$CXX" "${LAUNCH_SRC[@]}"
+      "$CXX" "${STUB_SRC[@]}"
     fi
 }
 

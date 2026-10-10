@@ -1,5 +1,5 @@
 // gemm_sol_scan.cu — rocBLAS solution-index autotune for prefill dense GEMM shapes.
-// Mirrors Model::gemm() (src/gpu/gdec.cpp:8899): C[N,P]f32 = A[N,K]bf16^T * B[K,P]bf16.
+// Mirrors Model::gemm() (src/gpu/qwenox.cpp:8899): C[N,P]f32 = A[N,K]bf16^T * B[K,P]bf16.
 // Usage: gemm_sol_scan [N K P ...]  (triples; defaults to the slow prefill shapes)
 // Env F32=1: A/B in fp32 instead of bf16 (the fp32 indexer projection,
 // rocblas_sgemm 640 x P x 2560 in Model::qsa_b).

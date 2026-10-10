@@ -12,7 +12,7 @@ prompts = [
 ]
 tag = sys.argv[1] if len(sys.argv) > 1 else "run"
 for i, p in enumerate(prompts):
-    body = {"model": "gdec", "messages": [{"role": "user", "content": p}],
+    body = {"model": "qwenox", "messages": [{"role": "user", "content": p}],
             "temperature": 0, "max_tokens": 220}
     req = urllib.request.Request(base + "/v1/chat/completions",
                                  data=json.dumps(body).encode(),

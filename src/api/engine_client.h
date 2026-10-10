@@ -1,10 +1,10 @@
-// engine_client.h — client for the gdec engine's line protocol (port 8730).
+// engine_client.h — client for the qwenox engine's line protocol (port 8730).
 //
 // Wire format is defined by the engine implementation in
-// src/gpu/gdec.cpp:11220-11860 (its parse_gen + the GEN handler).
+// src/gpu/qwenox.cpp:11220-11860 (its parse_gen + the GEN handler).
 //
 // One TCP connection carries one in-flight request: the engine takes one GEN
-// per connection and runs up to INFO kv_slots of them at once (GDEC_PARALLEL),
+// per connection and runs up to INFO kv_slots of them at once (QWENOX_PARALLEL),
 // so the front-end keeps a pool of kv_slots clients plus a control client.
 // Cancelling is out-of-band -- `X <req>` is written while a request is
 // decoding; the engine's per-connection reader picks it up at once.
@@ -21,7 +21,7 @@
 
 #include "sockt.h"
 
-namespace gdec {
+namespace qwenox {
 
 struct GenParams {
     long long req = 0;
@@ -83,7 +83,11 @@ class EngineClient {
     EngineClient& operator=(const EngineClient&) = delete;
 
     // host_port is "host:port" (IPv4 or hostname). Returns false with *err set.
-    bool connect(const std::string& host_port, std::string* err);
+    // timeout_s > 0 bounds the connect (non-blocking + poll): some machines
+    // delay a refused loopback connect by seconds (filter drivers), which
+    // would otherwise stall the startup probe or a request to a dead engine.
+    // timeout_s == 0 keeps the plain blocking connect.
+    bool connect(const std::string& host_port, std::string* err, double timeout_s = 0);
     void close();
     bool connected() const { return fd_.load(std::memory_order_acquire) >= 0; }
 
@@ -130,4 +134,4 @@ class EngineClient {
     double next_timeout_ = 300.0;
 };
 
-}  // namespace gdec
+}  // namespace qwenox

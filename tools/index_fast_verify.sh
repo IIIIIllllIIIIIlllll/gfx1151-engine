@@ -2,17 +2,17 @@
 # index_fast_verify.sh — 一键验证 indexer 快速打分 + 两遍精确选块（09_kernels_index.inc）
 #   1. 单元测试 build/index_fast_test：新旧 kernel 逐 bit 对比（打分全矩阵 memcmp，
 #      选块 vs stream/rs，含平分极多的合成行和 fallback 路径）+ 128K/256K 速度
-#   2. 128K 端到端 --ppl：同一个二进制，旧路径 (GDEC_INDEX_SCORE64=0 GDEC_INDEX_SEL2P=0)
+#   2. 128K 端到端 --ppl：同一个二进制，旧路径 (QWENOX_INDEX_SCORE64=0 QWENOX_INDEX_SEL2P=0)
 #      vs 新路径（默认），131071 个 ppl_token 行 + ppl_summary 必须逐字节一致
 #   3. 128K prefill 速度（pp.sh 同款 env，KVSNAP 关）：新旧各跑一次，比最后一个 chunk
 #      和整体平均 tok/s
 # 用法: bash tools/index_fast_verify.sh        （约 12 分钟，结尾输出 PASS / FAIL）
-#   BIN=build/gdec-idx（默认）  SKIP_PPL=1 只测速度
+#   BIN=build/qwenox-idx（默认）  SKIP_PPL=1 只测速度
 # 日志: logs/idxv_*.log（stderr）/ *.stdout（ppl 行单独存，避免与 stderr 交错），汇总 logs/index_fast_verify.out
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-BIN="${BIN:-build/gdec-idx}"
+BIN="${BIN:-build/qwenox-idx}"
 LEN=131072
 TOK="data/qsa-oracle/${LEN}.tokens"
 MAXCTX=$((LEN + 8192))
@@ -24,7 +24,7 @@ exec > >(tee "$OUT") 2>&1
 fail=0
 bad() { echo "  FAIL: $*"; fail=1; }
 ok() { echo "  OK: $*"; }
-OLD_ENV="GDEC_INDEX_SCORE64=0 GDEC_INDEX_SEL2P=0"
+OLD_ENV="QWENOX_INDEX_SCORE64=0 QWENOX_INDEX_SEL2P=0"
 
 for f in "$BIN" "$TOK" models/qwen38-flash-next-w4b.hgn models/qwen38-flash-next-w4b.overlay.hgn; do
   [[ -e "$f" ]] || { echo "缺文件: $f"; echo FAIL; exit 1; }
@@ -35,12 +35,12 @@ run() {  # label mode(ppl|pp) extra-env...
   local label=$1 mode=$2; shift 2
   local args=(--gen 1)
   [[ $mode == ppl ]] && args=(--ppl)
-  env GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1 \
-      GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1 \
-      GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 \
-      GDEC_PREFILL_CHUNK=$CHUNK GDEC_GEMM_WMMA=1 GDEC_GDN_FUSED=1 \
-      GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1 \
-      GDEC_KVSNAP=0 GDEC_PROF=1 GDEC_PHASE=1 "$@" \
+  env QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1 \
+      QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1 \
+      QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 \
+      QWENOX_PREFILL_CHUNK=$CHUNK QWENOX_GEMM_WMMA=1 QWENOX_GDN_FUSED=1 \
+      QWENOX_INDEX_FUSED2=1 QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1 \
+      QWENOX_KVSNAP=0 QWENOX_PROF=1 QWENOX_PHASE=1 "$@" \
       "$BIN" models/qwen38-flash-next-w4b.hgn models/qwen38-flash-next-w4b.overlay.hgn \
       --tokens-file "$TOK" "${args[@]}" --maxctx "$MAXCTX" \
       >"logs/idxv_$label.stdout" 2>"logs/idxv_$label.log"

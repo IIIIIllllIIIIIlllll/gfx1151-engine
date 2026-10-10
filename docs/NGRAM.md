@@ -35,7 +35,7 @@ ng_cs 同一"workload 属性"哲学）：
 - 默认阈值放宽为 **match=8/min=8/max=64**：门兜底后宽松阈值在周期内容
   上全额收益（3× 基线），在半重复/普通内容上自动关腿（编号段落 0.87x
   场景即此修复）；
-- env `GDEC_NGRAM_GATE=0` 恢复旧的常开行为。
+- env `QWENOX_NGRAM_GATE=0` 恢复旧的常开行为。
 
 **输出语义**：门只跳过起草，提交永远是目标模型 argmax，门开/关不改变
 贪婪输出的"合法解集"；但 ngram 轮一旦开火，其多行批量 verify 在近平局
@@ -56,7 +56,7 @@ token 上可能与纯 MTP 路径分叉（同 2026-09-18 节结论，两侧均连
   续链下一块；不等视为边界拒绝，状态干净、无需重放，直接结束本轮。
 - ng_cs 初始 16，全接受轮翻倍（上限 64），拒绝轮减半（下限 8），作为
   Model 成员跨请求持久。
-- env `GDEC_NGRAM_CHUNK`：不设 = 自适应（默认）；`0` = 旧单趟路径
+- env `QWENOX_NGRAM_CHUNK`：不设 = 自适应（默认）；`0` = 旧单趟路径
   （原代码保留作对照/回滚）；`N` = 固定块大小。
 - 贪心和采样两条 chain 均实现。`CHUNK=64` 固定单块可复现 legacy 的
   全部数字，证明 round 重写本身不改变语义。
@@ -137,7 +137,7 @@ ktest ALL PASS。
 
 默认长草稿下，高重复文本 decode 约 6.5 倍、重复代码约 3.4 倍。这包含更长批量对权重读取和执行开销的摊销，不能归因于单独的 GDN 优化，也不代表实际代码任务普遍能达到这个速度。默认配置共完成 39 个请求，除编号用例两次对拍失败外，其余检查通过；测试总体退出状态仍为失败。
 
-最终源码同为 min=48/max=64 的旧路径对照（`GDEC_NGRAM_LEGACY_GDN=1 GDEC_NGRAM_LEGACY_FINAL=1`）：
+最终源码同为 min=48/max=64 的旧路径对照（`QWENOX_NGRAM_LEGACY_GDN=1 QWENOX_NGRAM_LEGACY_FINAL=1`）：
 
 | 用例 | 旧 GDN + 旧末行 head（两次） | 新路径（两次） | decode 平均耗时下降 |
 |---|---:|---:|---:|
@@ -182,9 +182,9 @@ ktest ALL PASS。
 
 请求省略 `drafter` 时由引擎侧环境变量决定,API 不再代填:
 
-- `GDEC_DRAFTER=ngram`(或 `ngram-mod`/`3`):贪心请求默认走 ngram;
+- `QWENOX_DRAFTER=ngram`(或 `ngram-mod`/`3`):贪心请求默认走 ngram;
   采样请求自动回退既有默认(ngram 只起草贪心)。
-- `GDEC_DRAFTER=serial`(或 `0`):默认串行。
+- `QWENOX_DRAFTER=serial`(或 `0`):默认串行。
 - 不设或 `mtp`:既有行为不变(MTP 权重在则 MTP,否则串行)。
 - 客户端显式传 `drafter` 始终优先,不受该变量影响。
 - 引擎 INFO 第 5 字段上报当前默认;API `/health` 的 `drafter_default`
@@ -199,8 +199,8 @@ ktest ALL PASS。
 ```bash
 bash build.sh test
 bash build.sh engine
-PROBE_TAG=my-ngram-test PROBE_CONTEXT=40960 GDEC_PREFILL_CHUNK=8192 \
-  GDEC_NGRAM_MIN=4 GDEC_NGRAM_MAX=16 bash tools/run_ngram_probe.sh
+PROBE_TAG=my-ngram-test PROBE_CONTEXT=40960 QWENOX_PREFILL_CHUNK=8192 \
+  QWENOX_NGRAM_MIN=4 QWENOX_NGRAM_MAX=16 bash tools/run_ngram_probe.sh
 # 引擎日志出现 serve: listening 后，保持 API 停止，再运行：
 python3 tools/ngram_regress.py --keep-going --output logs/my-ngram-test.json
 python3 tools/snapshot_regress.py

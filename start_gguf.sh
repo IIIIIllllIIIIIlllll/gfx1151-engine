@@ -28,9 +28,9 @@ fi
 [[ -z "$GGUF_VISION_FILE" ]] || need '视觉塔 mmproj' "$GGUF_VISION_FILE" '纯文本可设 GGUF_VISION_FILE=""'
 MISSING_HINT='GGUF 权重下载 Unsloth 的 Qwen3.8-Flash-Next UD-Q4_K_XL（全部分片 + mtp-*.gguf + mmproj），放进 models/（见 GGUF.md）；手上是 .hgn 请用 bash start_hgn.sh。'
 
-# 引擎看到 *.gguf 基座即为纯 GGUF 启动（自动 GDEC_GGUF + GDEC_GGUF_DENSE=1）；
+# 引擎看到 *.gguf 基座即为纯 GGUF 启动（自动 QWENOX_GGUF + QWENOX_GGUF_DENSE=1）；
 # MTP sidecar 总是显式传入（空串 = 不用），不让引擎去分片目录里猜。
-export GDEC_GGUF_MTP="$GGUF_MTP_FILE"
+export QWENOX_GGUF_MTP="$GGUF_MTP_FILE"
 FORMAT=GGUF
 MAIN_MODEL=$GGUF_FILE
 MODEL_ARGS=("$GGUF_FILE")

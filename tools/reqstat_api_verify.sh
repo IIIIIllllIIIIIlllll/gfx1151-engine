@@ -2,7 +2,7 @@
 # reqstat_api_verify.sh — reqstat 记录 + C++ 查询端点的端到端验证。
 #
 # 1) 编译并运行 tools/reqstat_read_test（记录器/读取器全链路断言套件）。
-# 2) 若本机有 API 二进制（build/gdec-api 或 build/gdec-api-win.exe）和
+# 2) 若本机有 API 二进制（build/qwenox-api 或 build/qwenox-win.exe）和
 #    tokenizer（TOKENIZER_DIR，默认 ./models/tokenizer），用测试固件起真实
 #    API 进程，curl 校验 GET /reqstat/summary 与 /reqstat/tail；缺任一项
 #    则跳过 HTTP 段（SKIP），不影响第 1 段结论。
@@ -38,8 +38,8 @@ fi
 [[ -n "$CXX_BIN" ]] || { echo "找不到 C++ 编译器（设 CXX=...）" >&2; exit 1; }
 
 API=''
-[[ -x build/gdec-api ]] && API=build/gdec-api
-[[ -x build/gdec-api-win.exe ]] && API=build/gdec-api-win.exe
+[[ -x build/qwenox-api ]] && API=build/qwenox-api
+[[ -x build/qwenox-win.exe ]] && API=build/qwenox-win.exe
 
 # ---- 1) C++ 断言套件 ------------------------------------------------------
 say "编译 reqstat_read_test（$CXX_BIN）"
@@ -66,7 +66,7 @@ else
   say "固件 + 真实 API（$API）"
   "$TESTBIN" --fixtures "$TMP/fix" >/dev/null || fail "写固件失败"
   PORT=18731
-  GDEC_REQSTAT_DIR="$TMP/fix" "$API" --tokenizer "$TOK" --engine 127.0.0.1:9 \
+  QWENOX_REQSTAT_DIR="$TMP/fix" "$API" --tokenizer "$TOK" --engine 127.0.0.1:9 \
     --host 127.0.0.1 --port "$PORT" >"$TMP/api.log" 2>&1 &
   API_PID=$!
   ok=0

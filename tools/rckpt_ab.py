@@ -1,7 +1,7 @@
-"""A3: RAM checkpoints that survive conversation switches (GDEC_KV_PAGED pins KV pages).
+"""A3: RAM checkpoints that survive conversation switches (QWENOX_KV_PAGED pins KV pages).
 
-Usage (repo root, one fresh engine on 127.0.0.1:8732 per run; GDEC_KVSNAP=0,
-GDEC_RCKPT_MIN=1024 — tools/a3_verify.sh drives all of this):
+Usage (repo root, one fresh engine on 127.0.0.1:8732 per run; QWENOX_KVSNAP=0,
+QWENOX_RCKPT_MIN=1024 — tools/a3_verify.sh drives all of this):
   python3 tools/rckpt_ab.py switch --tag off|p1|p2|p1big
   python3 tools/rckpt_ab.py evict  --tag off|p2         # engine with --maxctx 16384
   python3 tools/rckpt_ab.py compare

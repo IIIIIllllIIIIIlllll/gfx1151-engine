@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # epi_verify.sh — 一键验证 prefill 小 kernel 的 epilogue 融合（逐 bit 等价）
-#   GDEC_MOE_SG_FUSE   共享专家加法 k_axpy_sg 折进路由 reduce（k_moe_reduce_pw_sg）
-#   GDEC_QSA_GATE_BF16 QSA 输出门控 + o_proj 输入 bf16 转换合一（k_sigmoid_gate_bf16_v4，
+#   QWENOX_MOE_SG_FUSE   共享专家加法 k_axpy_sg 折进路由 reduce（k_moe_reduce_pw_sg）
+#   QWENOX_QSA_GATE_BF16 QSA 输出门控 + o_proj 输入 bf16 转换合一（k_sigmoid_gate_bf16_v4，
 #                      门控直接读 d_qgb，qsplit 不再拷 gs）
 #   1. 2051 --ppl：全关 vs 每个开关单开 vs 全开，ppl_token + summary 必须逐字节一致
 #   2. 32K --ppl：全关 vs 全开逐字节一致
 #   3. 32K prefill 速度（pp.sh 同款 env，KVSNAP 关）：新旧交替各 2 次取最快，需快 ≥0.3%
 # 用法: bash tools/epi_verify.sh        （约 6 分钟，结尾输出 PASS / FAIL）
-#   BIN=build/gdec-epi（默认）  SKIP_PPL=1 只测速度
+#   BIN=build/qwenox-epi（默认）  SKIP_PPL=1 只测速度
 # 日志: logs/epv_*.log（stderr）/ *.stdout（ppl 行单独存），汇总 logs/epi_verify.out
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-BIN="${BIN:-build/gdec-epi}"
+BIN="${BIN:-build/qwenox-epi}"
 CHUNK=8192
 OUT=logs/epi_verify.out
 mkdir -p logs
@@ -20,7 +20,7 @@ exec > >(tee "$OUT") 2>&1
 fail=0
 bad() { echo "  FAIL: $*"; fail=1; }
 ok() { echo "  OK: $*"; }
-FLAGS=(GDEC_MOE_SG_FUSE GDEC_QSA_GATE_BF16)
+FLAGS=(QWENOX_MOE_SG_FUSE QWENOX_QSA_GATE_BF16)
 OLD_ENV=()
 for f in "${FLAGS[@]}"; do OLD_ENV+=("$f=0"); done
 
@@ -34,12 +34,12 @@ run() {  # label len mode(ppl|pp) extra-env...
   local label=$1 len=$2 mode=$3; shift 3
   local args=(--gen 1)
   [[ $mode == ppl ]] && args=(--ppl)
-  env GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1 \
-      GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1 \
-      GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 \
-      GDEC_PREFILL_CHUNK=$CHUNK GDEC_GEMM_WMMA=1 GDEC_GDN_FUSED=1 \
-      GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1 \
-      GDEC_KVSNAP=0 GDEC_PROF=1 GDEC_PHASE=1 "$@" \
+  env QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1 \
+      QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1 \
+      QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 \
+      QWENOX_PREFILL_CHUNK=$CHUNK QWENOX_GEMM_WMMA=1 QWENOX_GDN_FUSED=1 \
+      QWENOX_INDEX_FUSED2=1 QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1 \
+      QWENOX_KVSNAP=0 QWENOX_PROF=1 QWENOX_PHASE=1 "$@" \
       "$BIN" models/qwen38-flash-next-w4b.hgn models/qwen38-flash-next-w4b.overlay.hgn \
       --tokens-file "data/qsa-oracle/$len.tokens" "${args[@]}" --maxctx $((len + 8192)) \
       >"logs/epv_$label.stdout" 2>"logs/epv_$label.log"

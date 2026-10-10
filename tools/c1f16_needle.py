@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """C1 f16 one-off needle check: 64K prompt, 3 codewords at 10/50/90% depth.
 Reuses tools/yarn_ladder.py's prompt builder + chat(); run against a live
-gdec-api (start_win.sh). Usage: python3 tools/c1f16_needle.py [base_url]"""
+qwenox-api (start_win.sh). Usage: python3 tools/c1f16_needle.py [base_url]"""
 import sys
 from pathlib import Path
 

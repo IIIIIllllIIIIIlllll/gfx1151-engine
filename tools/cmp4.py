@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# cmp4.py — gdec vs server gold snapshot (server_greedy24.json, same dir), no docker needed.
+# cmp4.py — qwenox vs server gold snapshot (server_greedy24.json, same dir), no docker needed.
 import argparse
 import json
 import os
@@ -10,7 +10,7 @@ import sys
 from qwentok import Tokenizer
 
 ROOT = Path(__file__).resolve().parent.parent
-GDEC = str(ROOT / "build/gdec")
+QWENOX = str(ROOT / "build/qwenox-engine")
 MODEL_DIR = os.environ.get("MODEL_DIR", "models")
 BASE = f"{MODEL_DIR}/qwen38-flash-next-w4b.hgn"
 OVL = f"{MODEL_DIR}/qwen38-flash-next-w4b.overlay.hgn"
@@ -19,8 +19,8 @@ GEN = 24
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Compare gdec with server snapshots.")
-    parser.add_argument("env_extra", nargs="?", help="e.g. GDEC_NOPREFILLBATCH=1")
+    parser = argparse.ArgumentParser(description="Compare qwenox with server snapshots.")
+    parser.add_argument("env_extra", nargs="?", help="e.g. QWENOX_NOPREFILLBATCH=1")
     args = parser.parse_args(argv)
     env = dict(os.environ)
     if args.env_extra is not None:
@@ -47,12 +47,12 @@ def main(argv=None):
         try:
             ids = tk.encode(prompt)
             p = subprocess.run(
-                [GDEC, BASE, OVL, "--tokens", ",".join(map(str, ids)),
+                [QWENOX, BASE, OVL, "--tokens", ",".join(map(str, ids)),
                  "--gen", str(GEN)], capture_output=True, text=True,
                 encoding="utf-8", timeout=1800, env=env)
             stderr = p.stderr
             if p.returncode != 0:
-                raise ValueError(f"gdec exited with status {p.returncode}")
+                raise ValueError(f"qwenox exited with status {p.returncode}")
             lines = [line[4:] for line in p.stdout.splitlines() if line.startswith("ids:")]
             if len(lines) != 1:
                 raise ValueError(f"expected one ids: line, got {len(lines)}")
@@ -65,7 +65,7 @@ def main(argv=None):
                 raise ValueError("output contains unknown token ids")
             text = tk.decode(ours[len(ids):])
         except (OSError, subprocess.TimeoutExpired, ValueError, KeyError) as exc:
-            print(f"[{prompt!r}] GDEC FAILED: {exc}", flush=True)
+            print(f"[{prompt!r}] QWENOX FAILED: {exc}", flush=True)
             if stderr:
                 print(stderr[-2000:], file=sys.stderr, flush=True)
             continue

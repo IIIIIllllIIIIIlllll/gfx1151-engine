@@ -101,7 +101,7 @@ need = target for reset; max(target, mapped_pages) for live continuation
 available = pool_pages - sum(max(target, mapped_pages) for other active slots)
 ```
 
-`GDEC_KV_RESERVE_DECODE` caps decode reservation at 4096 tokens by default;
+`QWENOX_KV_RESERVE_DECODE` caps decode reservation at 4096 tokens by default;
 it does not cap generation. It accepts integers from 0 through INT_MAX;
 invalid values fail engine serve startup. Decode beyond the cap counts its
 actual mapped pages at subsequent admissions, and still uses the existing
@@ -136,21 +136,21 @@ requests generated exactly their remaining context budgets. See
 
 - Main attention, decode, prefill, MTP, and M-RoPE share the YaRN inverse-frequency table.
 - The default YaRN attention factor is `1 + 0.1 * ln(factor)`; it is applied to main-attention Q/K, not the indexer's partial RoPE.
-- `GDEC_ROPE_*` environment variables and `--rope-*` engine options are supported. Launchers pass the same settings to the engine and API.
+- `QWENOX_ROPE_*` environment variables and `--rope-*` engine options are supported. Launchers pass the same settings to the engine and API.
 - The KV snapshot fingerprint includes all RoPE parameters, so switching YaRN cannot reuse SSD KV pages created with a different position encoding.
-- `GDEC_QSA_UNION` is disabled automatically above 256K because its block IDs are `uint16_t`.
+- `QWENOX_QSA_UNION` is disabled automatically above 256K because its block IDs are `uint16_t`.
 
 ## Memory expectations
 
-For 512K, use `GDEC_QSA_KV_BF16=1`. With 12 trunk QSA layers plus the MTP layer,
+For 512K, use `QWENOX_QSA_KV_BF16=1`. With 12 trunk QSA layers plus the MTP layer,
 the row-major BF16 K/V arrays use about 13 GiB, comparable to 256K FP32 K/V.
 The tested BTV configuration additionally stores about 6 GiB of transposed V;
 indexer keys, guard pages, weights and workspaces are extra. At 1M, row-major
 BF16 K/V alone doubles to about 26 GiB (BTV adds about 12 GiB), so the 13/26 GiB
 figures must not be used as total device-memory budgets. BF16 pagination has
 WMMA constraints; production configuration should keep
-`GDEC_QSA_WMMA=1` and `GDEC_QSA_WMMA_BTV=1`, and should not enable
-`GDEC_QSA_UNION`.
+`QWENOX_QSA_WMMA=1` and `QWENOX_QSA_WMMA_BTV=1`, and should not enable
+`QWENOX_QSA_UNION`.
 
 The 256K offline prefill benchmark measured 1374.4 tok/s with native RoPE and
 1370.3 tok/s with YaRN factor 2, about 0.3% difference at noise level; both

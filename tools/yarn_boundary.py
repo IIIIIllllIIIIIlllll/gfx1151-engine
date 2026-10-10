@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exact-context-boundary tests against a running gdec-api (completions path).
+"""Exact-context-boundary tests against a running qwenox-api (completions path).
 
 Token-exact prompt construction: filler paragraphs + " x" padding, verified
 with build/tok_cli (same tokenizer as the server). Run on the engine host.
@@ -50,7 +50,7 @@ def build_exact(n):
 
 
 def completions(prompt, max_tokens):
-    body = {"model": "gdec", "prompt": prompt, "temperature": 0,
+    body = {"model": "qwenox", "prompt": prompt, "temperature": 0,
             "max_tokens": max_tokens, "stream": False}
     req = urllib.request.Request(BASE + "/v1/completions",
                                  data=json.dumps(body).encode(),

@@ -1,5 +1,5 @@
-#define GDEC_NO_MAIN
-#include "gdec.cpp"
+#define QWENOX_NO_MAIN
+#include "qwenox.cpp"
 
 #include "../api/tokenizer.h"
 #include "../api/tokenizer.cpp"
@@ -262,13 +262,13 @@ static std::vector<std::filesystem::path> token_files(const BenchConfig& config)
 }
 
 static std::string choose_format(const BenchConfig& config) {
-  std::string format = env_value("GDEC_BENCH_FORMAT");
+  std::string format = env_value("QWENOX_BENCH_FORMAT");
   if (format.empty()) format = config_value(config, "BENCH_FORMAT");
   if (!format.empty()) {
     for (char& character : format)
       character = (char)std::tolower((unsigned char)character);
     if (format == "hgn" || format == "gguf") return format;
-    throw std::runtime_error("GDEC_BENCH_FORMAT must be hgn or gguf");
+    throw std::runtime_error("QWENOX_BENCH_FORMAT must be hgn or gguf");
   }
   const auto hgn = rooted_path(config, config_value(config, "MODEL_FILE"));
   const auto gguf = rooted_path(config, config_value(config, "GGUF_FILE"));
@@ -283,52 +283,52 @@ static void configure_runtime(const BenchConfig& config) {
     const std::string value = config_value(config, config_key);
     if (!value.empty()) set_env_value(env_key, value);
   };
-  set_env_value("GDEC_QSA_KV_BF16", "1");
-  set_env_value("GDEC_QSA_WMMA", "1");
-  set_env_value("GDEC_QSA_WMMA_BTV", "1");
-  set_env_value("GDEC_GEMM_WMMA", "1");
-  set_env_value("GDEC_GDN_FUSED", "1");
-  set_env_value("GDEC_MOE_LT", "1");
-  set_env_value("GDEC_MOE_LT_BF16", "1");
-  set_env_value("GDEC_GR_BF16", "1");
-  set_env_value("GDEC_GDN_STREAM", "1");
-  set_env_value("GDEC_GDN_WAVE", "1");
-  set_env_value("GDEC_INDEX_FUSED2", "1");
-  set_env_value("GDEC_PP_MOE_OUT", "1");
-  set_env_value("GDEC_INDEX_STREAM_SELECT", "1");
+  set_env_value("QWENOX_QSA_KV_BF16", "1");
+  set_env_value("QWENOX_QSA_WMMA", "1");
+  set_env_value("QWENOX_QSA_WMMA_BTV", "1");
+  set_env_value("QWENOX_GEMM_WMMA", "1");
+  set_env_value("QWENOX_GDN_FUSED", "1");
+  set_env_value("QWENOX_MOE_LT", "1");
+  set_env_value("QWENOX_MOE_LT_BF16", "1");
+  set_env_value("QWENOX_GR_BF16", "1");
+  set_env_value("QWENOX_GDN_STREAM", "1");
+  set_env_value("QWENOX_GDN_WAVE", "1");
+  set_env_value("QWENOX_INDEX_FUSED2", "1");
+  set_env_value("QWENOX_PP_MOE_OUT", "1");
+  set_env_value("QWENOX_INDEX_STREAM_SELECT", "1");
   const int prefill_chunk = config_int(config, "PREFILL_CHUNK", 0);
   if (prefill_chunk > 0) {
-    set_env_value("GDEC_PREFILL_CHUNK", std::to_string(prefill_chunk));
+    set_env_value("QWENOX_PREFILL_CHUNK", std::to_string(prefill_chunk));
   } else {
 #ifdef _WIN32
-    unset_env_value("GDEC_PREFILL_CHUNK");
+    unset_env_value("QWENOX_PREFILL_CHUNK");
 #else
-    set_env_value("GDEC_PREFILL_CHUNK", "16384");
+    set_env_value("QWENOX_PREFILL_CHUNK", "16384");
 #endif
   }
-  set_env_value("GDEC_KVSNAP", "0");
-  set_env_value("GDEC_NOWARMUP", "1");
-  unset_env_value("GDEC_CONC_PREFILL_CHUNK");
-  set_env_value("GDEC_PARALLEL", "1");
+  set_env_value("QWENOX_KVSNAP", "0");
+  set_env_value("QWENOX_NOWARMUP", "1");
+  unset_env_value("QWENOX_CONC_PREFILL_CHUNK");
+  set_env_value("QWENOX_PARALLEL", "1");
   if (config_int(config, "KV_PAGED", 1)) {
-    set_env_value("GDEC_KV_PAGED", "1");
+    set_env_value("QWENOX_KV_PAGED", "1");
     const int pool_tokens = config_int(config, "KV_POOL_TOKENS", 0);
-    if (pool_tokens > 0) set_env_value("GDEC_KV_POOL_TOKENS", std::to_string(pool_tokens));
-    else unset_env_value("GDEC_KV_POOL_TOKENS");
+    if (pool_tokens > 0) set_env_value("QWENOX_KV_POOL_TOKENS", std::to_string(pool_tokens));
+    else unset_env_value("QWENOX_KV_POOL_TOKENS");
   } else {
-    unset_env_value("GDEC_KV_PAGED");
-    unset_env_value("GDEC_KV_POOL_TOKENS");
+    unset_env_value("QWENOX_KV_PAGED");
+    unset_env_value("QWENOX_KV_POOL_TOKENS");
   }
-  if (config_int(config, "PLE_URING", 1)) set_env_value("GDEC_PLE_URING", "1");
-  else unset_env_value("GDEC_PLE_URING");
-  set_if_configured("GDEC_ROPE_FACTOR", "ROPE_FACTOR");
-  set_if_configured("GDEC_ROPE_ORIGINAL_CTX", "ROPE_ORIGINAL_CTX");
-  set_if_configured("GDEC_ROPE_BETA_FAST", "ROPE_BETA_FAST");
-  set_if_configured("GDEC_ROPE_BETA_SLOW", "ROPE_BETA_SLOW");
-  set_if_configured("GDEC_ROPE_ATTN_SCALE", "ROPE_ATTN_SCALE");
+  if (config_int(config, "PLE_URING", 1)) set_env_value("QWENOX_PLE_URING", "1");
+  else unset_env_value("QWENOX_PLE_URING");
+  set_if_configured("QWENOX_ROPE_FACTOR", "ROPE_FACTOR");
+  set_if_configured("QWENOX_ROPE_ORIGINAL_CTX", "ROPE_ORIGINAL_CTX");
+  set_if_configured("QWENOX_ROPE_BETA_FAST", "ROPE_BETA_FAST");
+  set_if_configured("QWENOX_ROPE_BETA_SLOW", "ROPE_BETA_SLOW");
+  set_if_configured("QWENOX_ROPE_ATTN_SCALE", "ROPE_ATTN_SCALE");
   const std::string gamma = config_value(config, "MTP_GAMMA");
-  if (!gamma.empty() && gamma != "0") set_env_value("GDEC_SPEC_GAMMA", gamma);
-  else unset_env_value("GDEC_SPEC_GAMMA");
+  if (!gamma.empty() && gamma != "0") set_env_value("QWENOX_SPEC_GAMMA", gamma);
+  else unset_env_value("QWENOX_SPEC_GAMMA");
 }
 
 struct ModelPaths {
@@ -377,7 +377,7 @@ static ModelPaths configured_model(const BenchConfig& config) {
 static void configure_gguf_mtp(const ModelPaths& model) {
   if (model.format == "gguf") {
     gguf_base_setup(model.base.string());
-    set_env_value("GDEC_GGUF_MTP", model.mtp.string());
+    set_env_value("QWENOX_GGUF_MTP", model.mtp.string());
   }
 }
 
@@ -513,7 +513,7 @@ struct DecodeCase {
   const char* prompt;
 };
 
-static std::vector<int> encode_case(const gdec::Tokenizer& tokenizer, const char* prompt) {
+static std::vector<int> encode_case(const qwenox::Tokenizer& tokenizer, const char* prompt) {
   const std::string formatted = std::string("<|im_start|>user\n") + prompt +
                                 "<|im_end|>\n<|im_start|>assistant\n";
   return tokenizer.encode(formatted);
@@ -527,7 +527,7 @@ static int run_decode(GpuModel& model, const BenchConfig& config, int maxctx,
   }
   const std::filesystem::path tokenizer_dir =
       rooted_path(config, config_value(config, "TOKENIZER_DIR"));
-  gdec::Tokenizer tokenizer;
+  qwenox::Tokenizer tokenizer;
   std::string tokenizer_error;
   if (tokenizer_dir.empty() || !tokenizer.load(tokenizer_dir.string(), &tokenizer_error)) {
     fprintf(stderr, "MTP decode benchmark skipped: cannot load tokenizer from %s: %s\n",

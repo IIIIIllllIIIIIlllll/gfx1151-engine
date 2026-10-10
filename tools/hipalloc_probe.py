@@ -12,7 +12,7 @@
 # 判读：
 #   - resolved 行必须指向发布包 build/ 目录；指到 System32 就是部署缺 DLL。
 #   - VRAM total 明显小于 ~95 GiB → BIOS carve-out 不够，调 96 GiB。
-#   - free 明显小于 total（无引擎在跑时）→ 有别的进程占着 VRAM（含僵尸 gdec-win.exe）。
+#   - free 明显小于 total（无引擎在跑时）→ 有别的进程占着 VRAM（含僵尸 qwenox-engine-win.exe）。
 #   - max single block 卡在 ~41 GiB → 加载到的是旧 HIP SDK 的 DLL。
 
 import ctypes

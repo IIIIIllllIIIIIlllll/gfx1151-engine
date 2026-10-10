@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# vbase_verify.sh — 验证 P3-A 第一段（batch 路径 base 位置设备化，d_vbase；GDEC_VBASE=0 回退）
+# vbase_verify.sh — 验证 P3-A 第一段（batch 路径 base 位置设备化，d_vbase；QWENOX_VBASE=0 回退）
 # 和 iproj GEMV 长上下文，全部用生产权重（start_hgn.sh --check 取自 service.conf）。
 #   set_vbase 的暂存是 4 格 pinned 环 + event：多 chunk prefill 连续改 base 时，
 #   前一个 chunk 的异步拷贝不会读到后一个 chunk 的值（不依赖别处碰巧的同步）。
 # 检查（ids 必须逐 token 一致的判 FAIL；iproj 为非逐 bit 改动，DIFF 只报 WARN）：
 #   0. 权重必须是 HQ（日志含 "dense: 8-bit"），否则直接 FAIL——防止 service.conf 被覆盖后白测
-#   1. 8K  greedy MTP γ=4：默认 vs GDEC_VBASE=0
-#   2. 8K  greedy chain γ=4：默认 vs GDEC_VBASE=0
-#   3. 32K greedy MTP γ=4（prefill 2 个 chunk）：默认 vs GDEC_VBASE=0
-#   4. 8K  普通 decode GEN=32，GDEC_PREFILL_CHUNK=2048（≥3 个 chunk）：默认 vs GDEC_VBASE=0
-#   5. 64K greedy MTP γ=4：默认 vs GDEC_IPROJ_GEMV=0（SAME/DIFF，DIFF 记 WARN）
+#   1. 8K  greedy MTP γ=4：默认 vs QWENOX_VBASE=0
+#   2. 8K  greedy chain γ=4：默认 vs QWENOX_VBASE=0
+#   3. 32K greedy MTP γ=4（prefill 2 个 chunk）：默认 vs QWENOX_VBASE=0
+#   4. 8K  普通 decode GEN=32，QWENOX_PREFILL_CHUNK=2048（≥3 个 chunk）：默认 vs QWENOX_VBASE=0
+#   5. 64K greedy MTP γ=4：默认 vs QWENOX_IPROJ_GEMV=0（SAME/DIFF，DIFF 记 WARN）
 # 用法: bash tools/vbase_verify.sh   （约 12 分钟，结尾 PASS / FAIL）
-#   BIN=build/gdec（默认）  SKIP_64K=1 跳过第 5 步
+#   BIN=build/qwenox-engine（默认）  SKIP_64K=1 跳过第 5 步
 # 日志: logs/vbv_*.log，汇总 logs/vbase_verify.out
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
-BIN="${BIN:-build/gdec}"
+BIN="${BIN:-build/qwenox-engine}"
 OUT=logs/vbase_verify.out
 mkdir -p logs
 exec > >(tee "$OUT") 2>&1
@@ -61,15 +61,15 @@ pair() {
   fi
 }
 
-SPEC=256 GAMMA=4 pair "1. 8K MTP γ=4：VBASE on/off"   vbv_8k   8k  "" "GDEC_VBASE=0"
-SPEC=256 GAMMA=4 pair "2. 8K chain γ=4：VBASE on/off" vbv_8kc  8k  "GDEC_SPEC_CHAIN=1" "GDEC_VBASE=0"
-SPEC=256 GAMMA=4 pair "3. 32K MTP γ=4：VBASE on/off"  vbv_32k  32k "" "GDEC_VBASE=0"
-GEN=32 pair "4. 8K 多 chunk（GDEC_PREFILL_CHUNK=2048）：VBASE on/off" vbv_8kch 8k "GDEC_PREFILL_CHUNK=2048" "GDEC_VBASE=0"
+SPEC=256 GAMMA=4 pair "1. 8K MTP γ=4：VBASE on/off"   vbv_8k   8k  "" "QWENOX_VBASE=0"
+SPEC=256 GAMMA=4 pair "2. 8K chain γ=4：VBASE on/off" vbv_8kc  8k  "QWENOX_SPEC_CHAIN=1" "QWENOX_VBASE=0"
+SPEC=256 GAMMA=4 pair "3. 32K MTP γ=4：VBASE on/off"  vbv_32k  32k "" "QWENOX_VBASE=0"
+GEN=32 pair "4. 8K 多 chunk（QWENOX_PREFILL_CHUNK=2048）：VBASE on/off" vbv_8kch 8k "QWENOX_PREFILL_CHUNK=2048" "QWENOX_VBASE=0"
 if [[ -f logs/vbv_8kch_a.log ]] && (( $(nchunk vbv_8kch_a) < 3 )); then
   bad "第 4 步 prefill 只有 $(nchunk vbv_8kch_a) 个 chunk，没测到多 chunk"
 fi
 if [[ -z "${SKIP_64K:-}" ]]; then
-  SPEC=256 GAMMA=4 pair "5. 64K MTP γ=4：IPROJ_GEMV on/off" vbv_64k 64k "" "GDEC_IPROJ_GEMV=0" 0
+  SPEC=256 GAMMA=4 pair "5. 64K MTP γ=4：IPROJ_GEMV on/off" vbv_64k 64k "" "QWENOX_IPROJ_GEMV=0" 0
 fi
 
 echo "== 汇总 $(date '+%T')"

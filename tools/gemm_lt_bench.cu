@@ -1,7 +1,7 @@
 // gemm_lt_bench.cu — per-shape speed trial for extending k_gemm_wmma coverage.
 // Benches, for each (N,K,P) triple: the production hipBLASLt path (heuristic,
 // index 4 with validation + fallback scan, 64MB workspace — mirrors
-// src/gpu/gdec.cpp:10090-10160) vs k_gemm_wmma configs (#included verbatim
+// src/gpu/qwenox.cpp:10090-10160) vs k_gemm_wmma configs (#included verbatim
 // from tools/gemm_wmma_kernel.inc, the sed-extracted production kernel).
 // Correctness ref: rocBLAS algo_standard (driver tolerance maxrel < 1e-2).
 // Usage: gemm_lt_bench [N K P ...]  (triples; default = the five 32K narrow

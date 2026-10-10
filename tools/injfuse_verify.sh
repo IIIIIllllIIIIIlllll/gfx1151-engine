@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# injfuse_verify.sh — 一键验证 HC inject 融合（GDEC_HC_INJ_FUSE，非逐 bit 等价，KLD 把关）
+# injfuse_verify.sh — 一键验证 HC inject 融合（QWENOX_HC_INJ_FUSE，非逐 bit 等价，KLD 把关）
 #   把 N=4 的 inject GEMM（Rhat · Winj）折进上一步的 scatter_norm：kernel 写 Rhat 的同时
 #   累加 4 个 branch 的部分和，下一层 inject 只需 k_inj_psum 把 4 份部分和加起来。
 #   R / Rhat 逐 bit 不变，只有 w4 的求和顺序变了（fp32，误差 ~1e-8 × sum|terms|）。
@@ -8,12 +8,12 @@
 #      关 vs 开，开 - 关 ≤ 0.0003（噪声 ±0.0001），same_top（百分数）降幅 ≤ 0.3 个百分点
 #   3. 32K prefill 速度（pp.sh 同款 env，KVSNAP 关）：新旧交替各 2 次取最快，需快 ≥0.5%
 # 用法: bash tools/injfuse_verify.sh     （约 12 分钟，结尾输出 PASS / FAIL）
-#   BIN=build/gdec-inj（默认）  SKIP_KLD=1 只测速度  SKIP_PP=1 只测 KLD
+#   BIN=build/qwenox-inj（默认）  SKIP_KLD=1 只测速度  SKIP_PP=1 只测 KLD
 # 日志: logs/ijv_*.log、logs/kld_ijv_*.log，汇总 logs/injfuse_verify.out
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-BIN="${BIN:-build/gdec-inj}"
+BIN="${BIN:-build/qwenox-inj}"
 CHUNK=8192
 OUT=logs/injfuse_verify.out
 mkdir -p logs build
@@ -42,11 +42,11 @@ if [[ -z "${SKIP_KLD:-}" ]]; then
   echo "== 2. KLD：关 vs 开（每次约 2 分钟）"
   kv() { sed -n 's/.*mean_kld=\([0-9.]*\).*/\1/p' "logs/kld_ijv_$1.log" | tail -1; }
   st() { sed -n 's/.*same_top=\([0-9.]*\).*/\1/p' "logs/kld_ijv_$1.log" | tail -1; }
-  CHUNKS=8 MAXCTX=8192 BIN="$BIN" bash tools/kld_engine.sh "$KREF" ijv_off GDEC_HC_INJ_FUSE=0 | grep -E 'kld_summary|rc=' | sed 's/^/  /'
+  CHUNKS=8 MAXCTX=8192 BIN="$BIN" bash tools/kld_engine.sh "$KREF" ijv_off QWENOX_HC_INJ_FUSE=0 | grep -E 'kld_summary|rc=' | sed 's/^/  /'
   CHUNKS=8 MAXCTX=8192 BIN="$BIN" bash tools/kld_engine.sh "$KREF" ijv_on | grep -E 'kld_summary|rc=' | sed 's/^/  /'
   k0=$(kv off); k1=$(kv on); s0=$(st off); s1=$(st on)
   if grep -q 'hc-inj-fuse\] on' logs/kld_ijv_off.log; then bad "关的那次也走了融合路径"; fi
-  if ! grep -q 'hc-inj-fuse\] on' logs/kld_ijv_on.log; then bad "开的那次没走融合路径（生产 env 缺 GDEC_GR_BF16 / 条件不满足？）"; fi
+  if ! grep -q 'hc-inj-fuse\] on' logs/kld_ijv_on.log; then bad "开的那次没走融合路径（生产 env 缺 QWENOX_GR_BF16 / 条件不满足？）"; fi
   if [[ -z "$k0" || -z "$k1" ]]; then
     bad "KLD 运行失败（见 logs/kld_ijv_off.log / kld_ijv_on.log）"
   else
@@ -59,12 +59,12 @@ fi
 if [[ -z "${SKIP_PP:-}" ]]; then
   run() {  # label len extra-env...
     local label=$1 len=$2; shift 2
-    env GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1 \
-        GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1 \
-        GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 \
-        GDEC_PREFILL_CHUNK=$CHUNK GDEC_GEMM_WMMA=1 GDEC_GDN_FUSED=1 \
-        GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1 \
-        GDEC_KVSNAP=0 GDEC_PROF=1 GDEC_PHASE=1 "$@" \
+    env QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1 \
+        QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1 \
+        QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 \
+        QWENOX_PREFILL_CHUNK=$CHUNK QWENOX_GEMM_WMMA=1 QWENOX_GDN_FUSED=1 \
+        QWENOX_INDEX_FUSED2=1 QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1 \
+        QWENOX_KVSNAP=0 QWENOX_PROF=1 QWENOX_PHASE=1 "$@" \
         "$BIN" models/qwen38-flash-next-w4b.hgn models/qwen38-flash-next-w4b.overlay.hgn \
         --tokens-file "data/qsa-oracle/$len.tokens" --gen 1 --maxctx $((len + 8192)) \
         >"logs/ijv_$label.stdout" 2>"logs/ijv_$label.log"
@@ -77,7 +77,7 @@ if [[ -z "${SKIP_PP:-}" ]]; then
   secs() { grep -E 'prefill: ' "logs/ijv_$1.log" | tail -n "$NCHUNK" | sed 's/.* in \([0-9.]*\) s = .*/\1/' | awk '{s+=$1} END{printf "%.3f",s}'; }
   okrun=1
   for r in 1 2; do
-    rc_o=$(run pp_old$r $LEN GDEC_HC_INJ_FUSE=0)
+    rc_o=$(run pp_old$r $LEN QWENOX_HC_INJ_FUSE=0)
     rc_n=$(run pp_new$r $LEN)
     for l in pp_old$r pp_new$r; do
       [[ $(rates $l | wc -l) == "$NCHUNK" ]] || okrun=0

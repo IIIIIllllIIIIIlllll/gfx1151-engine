@@ -1,5 +1,5 @@
-#define main gdec_real_main
-#include "gdec.cpp"
+#define main qwenox_real_main
+#include "qwenox.cpp"
 #undef main
 #include <random>
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Deterministic line-protocol engine used by api_regression_test.py.
 
-Run this on port 18730, start gdec-api with --engine 127.0.0.1:18730 and
+Run this on port 18730, start qwenox-api with --engine 127.0.0.1:18730 and
 --port 18731, then run api_regression_test.py against that API port.
 """
 import argparse

@@ -333,7 +333,7 @@ __global__ void k_bf16_rows_to_bt(const uint16_t* __restrict__ vc,
   }
 }
 
-// Debug (GDEC_VCT_CHECK): count logical rows [0, r1) whose transposed-V slot
+// Debug (QWENOX_VCT_CHECK): count logical rows [0, r1) whose transposed-V slot
 // differs from the row-major BF16 V. out = {count, first row, last row}.
 __global__ void k_vct_check(const uint16_t* __restrict__ vc,
                             const uint16_t* __restrict__ vct,
@@ -362,7 +362,7 @@ __global__ void k_vct_zero_slots(uint16_t* __restrict__ vct,
   }
   vct[((size_t)(row >> 2) * 512 + i) * 4 + (t & 3)] = val;
 }
-// Debug (GDEC_ATTN_HASH): order-independent hashes. Logical rows [r0, r1) of a
+// Debug (QWENOX_ATTN_HASH): order-independent hashes. Logical rows [r0, r1) of a
 // row-major bf16 cache (512 per row) / of the transposed V (per slot), and a
 // raw float buffer.
 __device__ __forceinline__ unsigned long long dbg_mix(unsigned long long x) {
@@ -390,7 +390,7 @@ __global__ void k_dbg_hash_i32(const int* __restrict__ x, uint64_t n,
   if (gid >= n) return;
   atomicAdd(out, dbg_mix(gid * 0x100000001ull + (unsigned)x[gid] + 1));
 }
-// Debug (GDEC_VCT_CHECK): non-finite bf16 values in n raw uint16 of vct.
+// Debug (QWENOX_VCT_CHECK): non-finite bf16 values in n raw uint16 of vct.
 // out = {count, first physical row, last physical row}.
 __global__ void k_vct_nonfinite(const uint16_t* __restrict__ vct, uint64_t n,
                                 unsigned* __restrict__ out) {
@@ -532,7 +532,7 @@ __global__ void k_gr_scatter_norm_b_hc_bf16(
   }
 }
 
-// HC inject fusion (GDEC_HC_INJ_FUSE). w4[t][k] = sum_c Winj[k][c] *
+// HC inject fusion (QWENOX_HC_INJ_FUSE). w4[t][k] = sum_c Winj[k][c] *
 // Rhat[t][c] over K = 4 * d is the next site's inject projection (an N=4
 // GEMM that re-reads the whole P x 10240 Rhat). Summed in a fixed order:
 // per-branch partials p[t][b][k], then b = 0..3 by inj_psum.
@@ -560,7 +560,7 @@ __global__ void k_inj_psum(const float* __restrict__ pin, float* __restrict__ w4
 // the same inject scalar; only w4 changes (summation order vs the GEMM).
 // The scalar comes from the GEMM's w4 (pfull [P][4]) or from the previous
 // call's partials (pin [P][4][4]); pin != pout (other blocks still read pin).
-// Write == false (B2-1, GDEC_HC_FUSE_WRITE, default off): the write was
+// Write == false (B2-1, QWENOX_HC_FUSE_WRITE, default off): the write was
 // already applied to R by the moe reduce (k_*_hc, same expression), so only
 // the norm / Rhat / pout work remains; y/pfull/pin are unused, pass null.
 template <int T, bool Write = true>
@@ -662,7 +662,7 @@ __global__ void __launch_bounds__(256) k_gr_scatter_norm_inj_bf16(
 // accesses (warp = 128/256 B contiguous), and the per-token reductions are
 // wave shuffles + one 8-entry LDS exchange (2 barriers per token instead of
 // ~10). Summation order differs -> Rhat / partials not bit-identical (R is:
-// the write is element-wise). GDEC_GR_SCAT_V2=0 restores the old kernel.
+// the write is element-wise). QWENOX_GR_SCAT_V2=0 restores the old kernel.
 template <int T, bool Write = true>
 __global__ void __launch_bounds__(256) k_gr_scatter_norm_inj_bf16_v2(
     const float* __restrict__ pfull, const float* __restrict__ pin,
@@ -1036,7 +1036,7 @@ __global__ void k_qsa_flash(const float* __restrict__ q, const KVT* __restrict__
   // Sparse: q/out rows are batch-local (token - kb); token stays absolute
   // for ntok/source bookkeeping. Dense: rows local, keys/mask absolute (kb).
   const int qrow = token - kb;
-  // selected == nullptr (GDEC_QSA_DENSE decode): every visible position.
+  // selected == nullptr (QWENOX_QSA_DENSE decode): every visible position.
   const int ntok = Sparse ? ((token < 2051 || !selected) ? token + 1
                                                          : 2048 + (token + 1) % 4)
                           : min(kb + P, kb + ts + QSA_TR);
@@ -1285,7 +1285,7 @@ __device__ __forceinline__ uint32_t pack_bf2(float a, float b) {
 }
 
 // stage 16 K/V elements from global into a bf16 LDS row slice. FP32 global
-// is converted with f2bf RNE; BF16 global (the GDEC_QSA_KV_BF16 production
+// is converted with f2bf RNE; BF16 global (the QWENOX_QSA_KV_BF16 production
 // layout) is a straight copy with no conversion work.
 template <typename KVT>
 __device__ __forceinline__ void stage16_bf16(uint16_t* dst, const KVT* src) {
@@ -1424,7 +1424,7 @@ __global__ void k_qsa_flash_bf16(const float* __restrict__ q,
 }
 
 // --- k_qsa_wmma: WMMA bf16 sparse flash attention (256 thr = 8 warps) ---------
-// Opt-in (GDEC_QSA_WMMA=1, BF16 KV mode only): replaces k_qsa_flash_bf16 for
+// Opt-in (QWENOX_QSA_WMMA=1, BF16 KV mode only): replaces k_qsa_flash_bf16 for
 // the sparse tail. One block per (token, kvh); keys stream in 128-key block
 // iterations and warp w scores its own 16-key stripe (S = Q·Kᵀ WMMA, dual
 // accumulators for ILP). Softmax uses a BLOCK-wide online maximum (two-stage
@@ -1786,7 +1786,7 @@ __global__ void __launch_bounds__(256)
 }
 
 // --- k_qsa_wmma6: dim-split WMMA sparse flash attention (128 thr = 4 warps) --
-// Opt-in (GDEC_QSA_WMMA6=1, on top of the transposed-V BF16 path). Same data
+// Opt-in (QWENOX_QSA_WMMA6=1, on top of the transposed-V BF16 path). Same data
 // layout and masking as k_qsa_wmma, but warp w owns dims [w*64, +64) for BOTH
 // QK and PV (no key/dim role switch): Q lives in registers as four resident
 // bf16 A fragments (fp32 global -> RNE on load, rows >= 12 zero). Per 16-key
@@ -1971,7 +1971,7 @@ __global__ void __launch_bounds__(128)
     }
 }
 
-// --- GDEC_QSA_UNION: 4-query 块并集 WMMA 稀疏 prefill attention ---------------
+// --- QWENOX_QSA_UNION: 4-query 块并集 WMMA 稀疏 prefill attention ---------------
 // 移植自 llama.cpp-strix-halo qsa.cu 的 qsa3 rows/merge/attn（同模型、同 GPU
 // 验证过），适配引擎数据布局。4 个连续（4 对齐）稀疏 token 的 top-512 块列表
 // 由 k_qsa_union_merge 合成并集（实测重叠 ~2/3，K/V gather 量约 ÷3），
@@ -2753,7 +2753,7 @@ __global__ void __launch_bounds__(NT)
 }
 // [gemm-wmma-end]
 
-// aggr 10-05 HC mix-down split (GDEC_HC_MIXSPLIT, with GDEC_HC_NORHAT):
+// aggr 10-05 HC mix-down split (QWENOX_HC_MIXSPLIT, with QWENOX_HC_NORHAT):
 // W'[n][k] = bf16(W[n][k] * (1 + hw[k])) in place (the hc_norm weight folded
 // into the dequanted mix-down weight), so the mix-down reads the raw R' and the
 // per-(token, branch) rms scale is applied once per branch partial in

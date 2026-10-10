@@ -11,12 +11,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-env GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1 GDEC_MOE_LT=1 \
-    GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1 GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 \
-    GDEC_PREFILL_CHUNK=16384 GDEC_GEMM_WMMA=1 GDEC_GDN_FUSED=1 \
-    GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1 \
-    GDEC_KVSNAP=0 GDEC_RCKPT_MIN=200 \
-    build/gdec-win models/qwen38-flash-next-w4b.hgn \
+env QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1 QWENOX_MOE_LT=1 \
+    QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1 QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 \
+    QWENOX_PREFILL_CHUNK=16384 QWENOX_GEMM_WMMA=1 QWENOX_GDN_FUSED=1 \
+    QWENOX_INDEX_FUSED2=1 QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1 \
+    QWENOX_KVSNAP=0 QWENOX_RCKPT_MIN=200 \
+    build/qwenox-engine-win models/qwen38-flash-next-w4b.hgn \
     models/qwen38-flash-next-w4b.overlay.hgn \
     --serve --host 127.0.0.1 --port 8732 --maxctx 32768 \
     > logs/agent_engine.log 2>&1 &
@@ -29,10 +29,10 @@ for i in $(seq 1 150); do
 done
 [ "$ok" = 1 ] || { echo "引擎启动超时"; exit 1; }
 
-build/gdec-api-win.exe --tokenizer models/tokenizer --engine 127.0.0.1:8732 \
+build/qwenox-win.exe --tokenizer models/tokenizer --engine 127.0.0.1:8732 \
   --host 127.0.0.1 --port 8733 --context 32768 > logs/agent_api_on.log 2>&1 &
 A1=$!
-GDEC_API_TOKCACHE=0 build/gdec-api-win.exe --tokenizer models/tokenizer \
+QWENOX_API_TOKCACHE=0 build/qwenox-win.exe --tokenizer models/tokenizer \
   --engine 127.0.0.1:8732 --host 127.0.0.1 --port 8734 --context 32768 \
   > logs/agent_api_off.log 2>&1 &
 A2=$!

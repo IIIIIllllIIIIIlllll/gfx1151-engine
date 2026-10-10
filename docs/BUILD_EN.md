@@ -25,7 +25,7 @@ architecture flags directly to other graphics cards.
 ```bash
 bash build.sh                 # all: build engine + benchmark + API in parallel (default)
 bash build.sh --bundle        # distribution build with all runtime dependencies
-bash build.sh engine [name]   # engine only → build/<name> (default gdec)
+bash build.sh engine [name]   # engine only → build/<name> (default qwenox)
 bash build.sh bench           # standalone performance benchmark only
 bash build.sh api             # API server + CLI tools only
 bash build.sh test            # build ktest and run kernel unit tests
@@ -35,9 +35,9 @@ Artifacts:
 
 | File | Contents |
 |---|---|
-| `build/gdec` | GPU engine (`src/gpu/gdec.cpp`) |
-| `build/gdec-bench` | Standalone performance benchmark (`src/gpu/bench_main.cpp`) |
-| `build/gdec-api` | OpenAI-compatible API server (`src/api/*.cpp`) |
+| `build/qwenox-engine` | GPU engine (`src/gpu/qwenox.cpp`) |
+| `build/qwenox-bench` | Standalone performance benchmark (`src/gpu/bench_main.cpp`) |
+| `build/qwenox-api` | OpenAI-compatible API server (`src/api/*.cpp`) |
 | `build/tok_cli` `tpl_cli` `eng_cli` | tokenizer / template / engine protocol CLIs |
 | `build/http_selftest` `toolparse_test` `vision_test` `engine_host_test` | API / engine listen-address component self-tests |
 | `build/ktest` | engine kernel unit tests |
@@ -80,7 +80,7 @@ Engine:
 ```bash
 hipcc -O3 -Werror --offload-arch=gfx1151 \
   -Wl,-rpath,'$ORIGIN/lib' -Wl,--disable-new-dtags \
-  -o build/gdec src/gpu/gdec.cpp -lrocblas -lhipblaslt
+  -o build/qwenox-engine src/gpu/qwenox.cpp -lrocblas -lhipblaslt
 ```
 
 The RPATH flags above are added only to `--bundle` distribution builds.
@@ -112,11 +112,11 @@ manual approach for hgn.
 Production options (some optimizations are enabled via environment variables):
 
 ```bash
-export GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1
-export GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1
-export GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 GDEC_NOWARMUP=1
-export GDEC_PREFILL_CHUNK=16384
-export GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1
+export QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1
+export QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1
+export QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 QWENOX_NOWARMUP=1
+export QWENOX_PREFILL_CHUNK=16384
+export QWENOX_INDEX_FUSED2=1 QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1
 MODEL_BASE=./models/qwen38-flash-next-w4b
 ```
 
@@ -124,7 +124,7 @@ Short token-ID inference example (`--tokens` accepts token IDs; for text go
 through the tokenizer/API):
 
 ```bash
-bash tools/run_capped.sh 86 -- build/gdec \
+bash tools/run_capped.sh 86 -- build/qwenox-engine \
   "$MODEL_BASE.hgn" "$MODEL_BASE.overlay.hgn" \
   --tokens 1,2,3 --gen 8 --maxctx 4096
 ```
@@ -132,7 +132,7 @@ bash tools/run_capped.sh 86 -- build/gdec \
 Launch a 256K service:
 
 ```bash
-bash tools/run_capped.sh 86 -- build/gdec \
+bash tools/run_capped.sh 86 -- build/qwenox-engine \
   "$MODEL_BASE.hgn" "$MODEL_BASE.overlay.hgn" \
   --serve --port 8730 --maxctx 262144 --gamma 3 \
   --vision-tower ./models/qwen38-flash-next-vision.hgn
@@ -142,11 +142,11 @@ Wait until the engine prints `serve: listening`, then start the API in
 another terminal:
 
 ```bash
-build/gdec-api --tokenizer ./models/tokenizer \
+build/qwenox-api --tokenizer ./models/tokenizer \
   --engine 127.0.0.1:8730 --host 127.0.0.1 --port 8731 --context 262144
 ```
 
-A text-only service can omit the engine's `--vision-tower`. `GDEC_NOWARMUP=1`
+A text-only service can omit the engine's `--vision-tower`. `QWENOX_NOWARMUP=1`
 makes the first request bear the warmup cost, so first-request latency cannot
 be taken directly as steady-state prefill performance.
 
@@ -154,11 +154,11 @@ The API disconnect regression needs no GPU or model weights: it creates a
 synthetic tokenizer in a temporary directory and starts a local fake engine
 and API. It covers streaming/non-streaming disconnects on all three generation
 endpoints, prefill, queuing, protocol draining, and the next request. Build the
-API first; on Windows, use `--api build/gdec-api-win.exe` instead:
+API first; on Windows, use `--api build/qwenox-win.exe` instead:
 
 ```bash
-python tools/api_disconnect_test.py --api build/gdec-api
-python tools/api_disconnect_test.py --api build/gdec-api --slots 2
+python tools/api_disconnect_test.py --api build/qwenox-api
+python tools/api_disconnect_test.py --api build/qwenox-api --slots 2
 ```
 
 Engine listen-address and launcher configuration regressions (no model needed):
@@ -168,7 +168,9 @@ build/engine_host_test
 python tools/engine_host_config_test.py --bash bash
 ```
 
-On Windows, also pass `--launcher ./start_win.exe` to test the native launcher.
+On Windows, `--launcher` used to also test the old native launcher; it is now
+archived in `attic/launcher/` (no longer built) — compile it manually and pass
+the path if needed.
 
 ## Windows (TheRock)
 
@@ -178,34 +180,56 @@ start_hgn.sh, covering the engine and the API frontend
 PORTING-WINDOWS_EN.md):
 
 ```bash
-bash build_win.sh           # all artifacts: engine, benchmark, API, launcher
+bash build_win.sh           # all artifacts: engine, benchmark, API, root stub
 bash build_win.sh bench     # standalone performance benchmark only
-bash build_win.sh api       # OpenAI API frontend → build/gdec-api-win.exe
-bash build_win.sh launcher  # script-free launcher → ./start_win.exe
+bash build_win.sh api       # OpenAI API frontend → build/qwenox-win.exe (GUI tray app)
+bash build_win.sh launcher  # minimal root stub → ./start_win.exe
 bash build_win.sh test      # build ktest-win and run kernel unit tests
-bash start_win.sh           # under Git Bash: start engine (line protocol 8730) + API (8731) as two processes
+bash start_win.sh           # under Git Bash: start engine (line protocol 8730) + API (8731, --console) as two processes
 ```
 
-**Use `start_win.exe` for daily launches**: a native Win32 launcher,
-double-click and go, no Git Bash / PowerShell / any script host needed. It
-brings up the engine + API as two processes. By default it is a tray app with
-no console window; child process output is written to `logs\` (the launcher's
-own output goes to `logs\launcher-win-*.log`). Right-click the tray icon to
-open the dashboard / copy the API URL / view the engine or API log / open the
-log folder / quit (stops both); double-click opens the dashboard once ready.
-Errors and child exits pop up a message box. Both children live in a Job, so
-they also end if the launcher is killed from Task Manager.
-`start_win.exe --console` is the old console mode (live output, Ctrl+C or
-closing the window stops it), for troubleshooting.
+**Double-click `start_win.exe` for daily launches**: a minimal root stub whose
+only job is launching `build\qwenox-win.exe` with the repo root as working
+directory. **On Windows the API component itself is the tray app** (GUI
+subsystem, no console window on double-click), taking over the niche of the
+old `start_win.exe` launcher: right-click the tray icon to open the web
+console / start·stop the engine / copy the API URL / view the engine or API
+log / open the log folder / quit (the engine lives in a KILL_ON_JOB_CLOSE
+job, so it dies with the API — no orphans); double-click opens the web
+console. Engine state is polled every 2 s, with balloons on ready or
+unexpected exit; while running, the tooltip's second line shows live pp/tg
+rates (SNAP polling). The API's own output goes to `logs\api-win-*.log`,
+engine output to `logs\engine-api-*.log`. **The engine does not start
+automatically**: edit settings on the console's "Engine" page (`#/engine`)
+and start it there, or use the tray right-click menu. The old launcher with
+the native setup panel is archived in `attic/launcher/` and no longer built
+or maintained.
 **Configuration lives in the root `service.conf`** (the same file as the Linux
 launchers; Windows currently supports hgn only and reads the "hgn" section, the
-GGUF section has no effect): edit it to change the model filename, adjust the context window,
-or change ports; precedence is environment variables > service.conf >
-built-in defaults (`set MAX_CONTEXT=131072 && start_win.exe` overrides
-temporarily; `start_win.exe --check` only checks the configuration without
-starting). Clients connect to `http://127.0.0.1:8731/v1` (standard OpenAI
+GGUF section has no effect): edit it directly, or on the console's `#/engine`
+page (backed up to `service.conf.bak` before writing, applied on the next
+engine start); precedence is environment variables > service.conf >
+built-in defaults. Clients connect to `http://127.0.0.1:8731/v1` (standard OpenAI
 interface, including streaming); 8730 is the engine's internal line protocol,
 automatically bridged by the API — no need to connect to it directly.
+
+**Standalone API details**: running `build\qwenox-win.exe` with no arguments
+(double-clicking works too) enters tray mode; `--console` restores console
+mode (when output is redirected by a script, the console is not claimed). It
+reads the root `service.conf` itself for the tokenizer, ports and context
+(explicit command-line flags still win; precedence is argv > environment >
+service.conf > built-in defaults; `--service-conf FILE` or `QWENOX_SERVICE_CONF`
+selects another config file). Without an engine it still serves the console
+web UI, `/health` and friends; only inference requests return 502. A missing
+tokenizer falls back to the repo-bundled `data/tokenizer` (see its README;
+an explicit `--tokenizer` failure does not fall back); if that is also
+missing it is only a warning (inference returns 503) — console, config and
+engine management keep working. On a fatal startup error (port in use, bad
+arguments), tray mode shows a MessageBox and writes the log, while console
+mode pauses the window so you can read the message. Engine start/stop is done
+by the API process itself spawning `build\qwenox-engine-win.exe` (same QWENOX_*
+environment and arguments; stopping terminates the process). On
+Linux the start/stop endpoints return 501 and the page only edits config.
 
 Build entry points run in Git Bash (double-clicking `build_win.bat` also
 works — it locates Git Bash automatically; it only accepts Git for Windows'

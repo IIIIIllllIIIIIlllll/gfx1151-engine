@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# brow_r_verify.sh — 一键验证 k_q8g32_gemv_brow_r 行平铺（默认开，GDEC_BROW_R=0 回退）：
+# brow_r_verify.sh — 一键验证 k_q8g32_gemv_brow_r 行平铺（默认开，QWENOX_BROW_R=0 回退）：
 #   q8g32 brow 分支（xbf16 && cols>=4096 && rows<=4096：HC down 320x10240、out_proj
 #   2560x6144 的 verify 档）从每块 1 行改成每块 RPB=4 行，x 每组只取一次全块复用。
 #   每 (row,p) 的 group 顺序/表达式/归约树逐字复刻 brow → 构造性逐 bit。
@@ -8,12 +8,12 @@
 #   1. ktest 单测：brow_r_bitexact 必须 mismatches=0（含 319 尾行）
 #   2. greedy ids：8K MTP / 8K chain / 32K MTP，BIN vs BASE 完全一致；opt-out 一致
 # 用法: bash tools/brow_r_verify.sh   （约 7 分钟，结尾输出 PASS / FAIL）
-#   BIN=build/gdec（默认）  BASE=build/gdec.base（默认）  SKIP_KTEST=1 跳过单测
+#   BIN=build/qwenox-engine（默认）  BASE=build/qwenox.base（默认）  SKIP_KTEST=1 跳过单测
 # 日志: logs/brv_*.log，汇总 logs/brow_r_verify.out
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
-BIN="${BIN:-build/gdec}"
-BASE="${BASE:-build/gdec.base}"
+BIN="${BIN:-build/qwenox-engine}"
+BASE="${BASE:-build/qwenox.base}"
 OUT=logs/brow_r_verify.out
 mkdir -p logs
 exec > >(tee "$OUT") 2>&1
@@ -52,7 +52,7 @@ if run brv_8_base "$BASE" 8k && run brv_8_new "$BIN" 8k; then
 else
   bad "8k 运行失败"
 fi
-if run brv_c_base "$BASE" 8k GDEC_SPEC_CHAIN=1 && run brv_c_new "$BIN" 8k GDEC_SPEC_CHAIN=1; then
+if run brv_c_base "$BASE" 8k QWENOX_SPEC_CHAIN=1 && run brv_c_new "$BIN" 8k QWENOX_SPEC_CHAIN=1; then
   [[ "$(ids brv_c_base)" == "$(ids brv_c_new)" ]] \
     && ok "8k chain ids 一致" || bad "8k chain ids 不一致"
 else
@@ -66,9 +66,9 @@ else
 fi
 
 echo "-- 3. opt-out 与 BASE 一致"
-if run brv_off "$BIN" 8k GDEC_BROW_R=0; then
+if run brv_off "$BIN" 8k QWENOX_BROW_R=0; then
   [[ "$(ids brv_off)" == "$(ids brv_8_base)" ]] \
-    && ok "GDEC_BROW_R=0 ids 一致" || bad "opt-out ids 不一致"
+    && ok "QWENOX_BROW_R=0 ids 一致" || bad "opt-out ids 不一致"
 else
   bad "opt-out 运行失败"
 fi

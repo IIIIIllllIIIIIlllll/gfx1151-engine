@@ -1,14 +1,14 @@
 // moe_wmma_proto.cu — Stage 1: grouped expert up-GEMM, Q4C-P codes fused
 // dequant to LDS + WMMA compute (gfx1151 prototype; engine untouched).
 //
-// Contract (mirrors k_moe_w4_up, src/gpu/gdec.cpp:4192):
+// Contract (mirrors k_moe_w4_up, src/gpu/qwenox.cpp:4192):
 //   expert e owns pairs tokidx[eoff[e] .. eoff[e+1]); weight W_e = [rows, cols]
 //   Q4C-P (4-bit codes row-major, rows*cols/2 bytes; fp16 scale per 32 cols,
 //   scale_stride bytes per row; 16-entry fp32 codebook cb).
 //   Output (Stage 1 raw, no silu): gu[pair][rows] fp32,
 //     gu[n0+p][n] = sum_k X[tokidx[n0+p]][k] * deq(W_e[n][k]),
 //     deq: byte b -> k=2b (low nibble), 2b+1 (high); w = bf16(cb[code]*s)
-//     — formula identical to k_dequant_q4cp_bf16 (gdec.cpp:2631).
+//     — formula identical to k_dequant_q4cp_bf16 (qwenox.cpp:2631).
 // Kernel: k_gemm_wmma d9 skeleton (128x256 tile, 8 warps 2x4, warp 4x4 frags,
 // K-step 32 = exactly one scale group, LDS double buffer, gwmma_sync,
 // unconditional staging). Only difference vs dense: B staging is

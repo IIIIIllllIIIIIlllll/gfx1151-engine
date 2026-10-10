@@ -184,7 +184,7 @@ def main():
     leg, gg = imatrices(tmp, dims, rng)
     eb = os.path.join(tmp, "bin")
     os.makedirs(eb)
-    for b in ("gdec", "gdec-api"):
+    for b in ("qwenox", "qwenox-api"):
         open(os.path.join(eb, b), "w").close()
     conv = os.path.join(HERE, "flashnext2hgn.py")
     com = [md, "--name", "m", "--skip-mtp-sidecar", "--engine-bin", eb]

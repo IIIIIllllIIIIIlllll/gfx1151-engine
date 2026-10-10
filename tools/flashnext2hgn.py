@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """flashnext2hgn.py — convert a Qwen3.8-Flash-Next (qwen4_exp) HF safetensors
-model into the .hgn checkpoint format consumed by gdec (gfx1151).
+model into the .hgn checkpoint format consumed by qwenox (gfx1151).
 
 Self-contained: stdlib + numpy only (no torch, no safetensors); uses the
 sibling modules q4cp_imat.py and (for GGUF imatrix files) gguf_mini.py.
@@ -19,7 +19,7 @@ Outputs (into OUTDIR):
   <name>-mtp.hgn      MTP sidecar (q8g64 linears; optional at engine launch)
   <name>-vision.hgn   vision tower (all bf16; optional --vision-tower arg)
   tokenizer/          tokenizer files copied from MODEL_DIR
-  start.sh            engine + API launcher: gdec base overlay mtp ...
+  start.sh            engine + API launcher: qwenox base overlay mtp ...
 
 Only this exact architecture shape is supported (the engine hardcodes it):
 48 layers (GDN + every-4th QSA), hidden 2560, 512 experts, 24 heads,
@@ -759,8 +759,8 @@ def write_start_script(outdir, name, has_mtp, has_vision, engine_dir,
         raise SystemExit(f"engine binary not found in {engine_dir} "
                          f"(tried {', '.join(cands)}); pass --engine-bin")
 
-    engine_bin = pick("gdec", "gdec")
-    api_bin = pick("gdec-api")
+    engine_bin = pick("qwenox", "qwenox")
+    api_bin = pick("qwenox-api")
     run_capped = os.path.realpath(os.path.join(engine_dir, os.pardir,
                                                "tools", "run_capped.sh"))
     if not os.path.exists(run_capped):
@@ -786,18 +786,18 @@ LOG_API="$LOG_DIR/api.log"
 for port in "$ENGINE_PORT" "$API_PORT"; do
   [[ -z "$(ss -H -ltn "sport = :$port")" ]] || {{ echo "端口 $port 已被占用" >&2; exit 1; }}
 done
-if procs="$(pgrep -af '(^|/)(gdec[^/[:space:]]*|serve_api\\.py)([[:space:]]|$)')"; then
+if procs="$(pgrep -af '(^|/)(qwenox[^/[:space:]]*|serve_api\\.py)([[:space:]]|$)')"; then
   echo "已有引擎/API 进程在跑：$procs" >&2; exit 1
 fi
 
-export GDEC_QSA_KV_BF16=1 GDEC_QSA_WMMA=1 GDEC_QSA_WMMA_BTV=1
-export GDEC_MOE_LT=1 GDEC_MOE_LT_BF16=1 GDEC_GR_BF16=1
-export GDEC_GDN_STREAM=1 GDEC_GDN_WAVE=1 GDEC_NOWARMUP=1
-export GDEC_PREFILL_CHUNK=16384
-export GDEC_INDEX_FUSED2=1 GDEC_PP_MOE_OUT=1 GDEC_INDEX_STREAM_SELECT=1
-export GDEC_KVSNAP=1 GDEC_KVSNAP_MAX_GB=20
-export GDEC_KVSNAP_DIR="${{GDEC_KVSNAP_DIR:-$HERE/kvsnap}}"
-export GDEC_SPEC_GAMMA="$GAMMA"
+export QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1
+export QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1
+export QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 QWENOX_NOWARMUP=1
+export QWENOX_PREFILL_CHUNK=16384
+export QWENOX_INDEX_FUSED2=1 QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1
+export QWENOX_KVSNAP=1 QWENOX_KVSNAP_MAX_GB=20
+export QWENOX_KVSNAP_DIR="${{QWENOX_KVSNAP_DIR:-$HERE/kvsnap}}"
+export QWENOX_SPEC_GAMMA="$GAMMA"
 
 engine_cmd=("$ENGINE" "$HERE/{name}.hgn")
 """
@@ -1312,7 +1312,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="validate mapping and print the plan; write nothing")
     ap.add_argument("--engine-bin",
-                    help="dir containing the gdec/gdec-api binaries "
+                    help="dir containing the qwenox/qwenox-api binaries "
                          "(default: ../build relative to this script)")
     ap.add_argument("--start-script-only", action="store_true",
                     help="only (re)write OUTDIR/start.sh for an existing "

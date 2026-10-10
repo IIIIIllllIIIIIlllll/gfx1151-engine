@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 一键验证 gdec-api 服务端参数覆盖（/admin/overrides）与控制台页面。
+# 一键验证 qwenox-api 服务端参数覆盖（/admin/overrides）与控制台页面。
 #   bash tools/api_override_verify.sh           # 先 bash build.sh api，再测
 #   SKIP_BUILD=1 bash tools/api_override_verify.sh
 # 用生产环境变量（start_hgn.sh --check）起测试引擎 :8732 + 测试 API :8733，覆盖表写到临时文件，
@@ -33,7 +33,7 @@ api_stop() {
 }
 api_start() {  # $1 = 日志 tag；其余为额外环境变量 K=V
   local tag=$1; shift
-  env "$@" build/gdec-api --tokenizer "$TOKENIZER_DIR" --engine 127.0.0.1:8732 \
+  env "$@" build/qwenox-api --tokenizer "$TOKENIZER_DIR" --engine 127.0.0.1:8732 \
     --host 127.0.0.1 --port "$API_PORT" --overrides "$OVR_FILE" >"logs/$tag.log" 2>&1 </dev/null &
   API_PID=$!
   local t0=$SECONDS
@@ -46,10 +46,10 @@ api_start() {  # $1 = 日志 tag；其余为额外环境变量 K=V
 trap 'api_stop; probe_stop; rm -rf "$TMPD"' EXIT
 trap 'exit 130' INT TERM
 
-for e in $(compgen -e | grep '^GDEC_'); do unset "$e"; done
+for e in $(compgen -e | grep '^QWENOX_'); do unset "$e"; done
 for e in "${PENV[@]}"; do export "$e"; done
-export GDEC_KVSNAP_DIR="$TMPD/kvsnap"
-mkdir -p "$GDEC_KVSNAP_DIR" logs
+export QWENOX_KVSNAP_DIR="$TMPD/kvsnap"
+mkdir -p "$QWENOX_KVSNAP_DIR" logs
 probe_start apiovr-engine "${ENGINE[@]}" || { echo "API OVERRIDE VERIFY: FAIL（引擎启动失败）"; exit 1; }
 
 declare -A RES
@@ -61,7 +61,7 @@ RES[persist]=$?
 grep -q "overrides from $OVR_FILE" logs/apiovr-api2.log || { echo "FAIL API 启动日志没有加载覆盖表"; RES[persist]=1; }
 api_stop
 KEY="k$RANDOM$RANDOM"
-api_start apiovr-api3 GDEC_API_ADMIN_KEY="$KEY" && python3 tools/api_override_verify.py auth --port "$API_PORT" --key "$KEY"
+api_start apiovr-api3 QWENOX_API_ADMIN_KEY="$KEY" && python3 tools/api_override_verify.py auth --port "$API_PORT" --key "$KEY"
 RES[auth]=$?
 api_stop
 grep -E 'hipError|Segmentation|Aborted|FATAL|GUARD PAGE' "$PROBE_LOG" | head -3

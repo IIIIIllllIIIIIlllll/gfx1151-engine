@@ -437,7 +437,7 @@ __device__ __forceinline__ fw_shortx16 fw_ld16(const uint16_t* p) {
 
 // WMMA fp16 flash 注意力(非因果,单段):grid (ceil(P/128), 16 头),block 256
 // = 8 warps,warp w 拥有 q 行 [w*16,+16)。gfx1151 fragment 布局(引擎
-// gdec.cpp k_qsa_wmma 实证注释):
+// qwenox.cpp k_qsa_wmma 实证注释):
 //   A(r,k): r<8 -> lane 2r elem k; r>=8 -> lane 17+2(r-8) elem k (rest ignored)
 //   B(k,c): lane c elem k AND lane 16+c elem k (duplicate)
 //   C(r,c): lane c + 16*(r>=8), elem r%8

@@ -4,12 +4,12 @@
 #   打印 tok/s、commit/round、ms/round（看 verify 成本是否随上下文上涨）、各深度接受率、自适应 γ 分布
 #   PASS：全部跑通、HQ、无 SVM 死锁；自适应 ≥ 0.95× 旧默认（greedy γ=4 / 采样 γ=3，单样本所以放宽到 5%）
 # 用法: bash tools/gamma_128k_verify.sh （约 16 分钟，结尾 PASS / FAIL）
-#   BIN=build/gdec  TOK=data/qsa-oracle/131072.tokens  SEEDS="1"  SPEC=512
+#   BIN=build/qwenox-engine  TOK=data/qsa-oracle/131072.tokens  SEEDS="1"  SPEC=512
 # 注：tok65536.txt 是 32K 重复两遍，不能代表真实长上下文；131072.tokens 无重复 64-gram。
 # 日志: logs/g128_*.log，汇总 logs/gamma_128k_verify.out
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
-BIN="${BIN:-build/gdec}"
+BIN="${BIN:-build/qwenox-engine}"
 TOK="${TOK:-data/qsa-oracle/131072.tokens}"
 SEEDS="${SEEDS:-1}"
 NS="${SPEC:-512}"
@@ -77,7 +77,7 @@ for G in 4 7 0; do run g128_greedy_g$G $G; done
 chk greedy g128_greedy_g0 g128_greedy_g4
 for s in $SEEDS; do
   echo "-- 采样 seed $s（$SMP）"
-  for G in 3 4 7 0; do run g128_smp${s}_g$G $G "GDEC_SPEC_SAMPLE=$SMP,$s"; done
+  for G in 3 4 7 0; do run g128_smp${s}_g$G $G "QWENOX_SPEC_SAMPLE=$SMP,$s"; done
   chk "采样 s$s" g128_smp${s}_g0 g128_smp${s}_g3
 done
 

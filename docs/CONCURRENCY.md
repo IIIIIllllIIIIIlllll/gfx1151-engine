@@ -14,7 +14,7 @@
 | `KV_PAGED` | 1 | 必须为 1（`PARALLEL>1` 时启动器会拒绝 0） |
 | `KV_POOL_TOKENS` | 0 | 共享 KV 页池大小，取 `max(KV_POOL_TOKENS, MAX_CONTEXT)`；默认即一条 256K |
 
-引擎读 `GDEC_PARALLEL`，API 启动时从引擎 `INFO` 的 `kv_slots` 字段得知路数并开同样
+引擎读 `QWENOX_PARALLEL`，API 启动时从引擎 `INFO` 的 `kv_slots` 字段得知路数并开同样
 多的引擎连接。每多一路约多占 0.12 GiB 显存（GDN 状态 113 MB 加少量 MTP 流状态）。
 MTP 层的 KV/indexer keys 是共享页池里的一层（B0），和主干 KV 一样按页取用，不再每路按
 MAX_CONTEXT 预分配（旧版每路多 0.5 GiB（BF16）/ 1 GiB（FP32）；PARALLEL=4 实测省 1.63 GiB）。
@@ -28,7 +28,7 @@ rckpt 检查点连同 MTP 层的页一起钉住，恢复后继续 MTP 投机（`
   FIFO 票据锁拥有 GPU，持有者在让出点（spec 轮开头、prefill 分块边界、串行 decode
   每个 token）发现有人排队就交出。每条序列算出的结果与它单独运行逐位一致。
 - **并发时的 prefill 分段**：PARALLEL>1 时 prompt 按 min(`CONC_PREFILL_CHUNK`, 单路分段) 分段
-  （默认 8192，引擎变量 `GDEC_CONC_PREFILL_CHUNK`；单路分段 = `PREFILL_CHUNK`，Linux 默认 16384），
+  （默认 8192，引擎变量 `QWENOX_CONC_PREFILL_CHUNK`；单路分段 = `PREFILL_CHUNK`，Linux 默认 16384），
   只缩不放。`PREFILL_CHUNK` 管工作区显存和单条 prompt 的 PP，`CONC_PREFILL_CHUNK` 管并发响应：
   分段越小，长 prompt prefill 期间别的会话卡得越短（32K prompt 实测最长卡顿 16384 时 830 ms、
   8192 时 624 ms），代价是这条 prompt 的首 token 约晚 8%。它在启动时一次定死，只有一个请求时也按它分段。
@@ -57,7 +57,7 @@ rckpt 检查点连同 MTP 层的页一起钉住，恢复后继续 MTP 投机（`
 现在单 token 路径与小批量 verify 一样走 `k_q4cp_gemv_gd_topk_h16<10>`（专家部分和留在
 寄存器里按专家顺序求和，无原子操作）。速度不变；输出与旧二进制在长生成中会有差异
 （累加顺序不同），但同一二进制下 unpaged / 分页 / 乱序分页 / 调试同步 / 并发全部逐位一致。
-`GDEC_MOE_DOWN_ATOMIC=1` 可切回旧路径做对比。
+`QWENOX_MOE_DOWN_ATOMIC=1` 可切回旧路径做对比。
 
 ## 验证
 
@@ -78,5 +78,5 @@ bash tools/conc_verify.sh
    先跑，B 后来：B 在 decode 中被中断，A 与单独运行逐位一致；A2（12K）运行时 B2 连 prefill
    都放不下，B2 直接失败；之后 B2 单独重试成功。
 
-可选：`OLD_BIN=build/gdec.old` 额外对拍旧二进制的单路结果（注意上面的确定性修复会让
+可选：`OLD_BIN=build/qwenox.old` 额外对拍旧二进制的单路结果（注意上面的确定性修复会让
 旧/新在长输出上合法地不同）；`STAGES="ovf"` 只跑某几段；`CONC_ENV="..."` 附加引擎环境。

@@ -32,37 +32,37 @@ models/
 | `GGUF_VISION_FILE` | `$MODEL_DIR/mmproj-BF16.gguf` | 设 `""` 纯文本 |
 
 缺任何一个文件时启动器列出全部缺失项并退出 1，不会启动引擎；`bash start_gguf.sh --check` 只检查。
-`start_gguf.sh` 只接受 `.gguf`，`start_hgn.sh` 只接受 `.hgn`；两者都会清掉外部残留的 `GDEC_GGUF*`，
+`start_gguf.sh` 只接受 `.gguf`，`start_hgn.sh` 只接受 `.hgn`；两者都会清掉外部残留的 `QWENOX_GGUF*`，
 权重格式只由所用的启动器决定。
 
-- 启动器执行 `gdec <第 1 个分片>.gguf ...`，引擎看到 `.gguf` 基座即为纯 GGUF 启动，等价于
-  `GDEC_GGUF=<该分片> GDEC_GGUF_DENSE=1`，基座 Checkpoint 为空，全部张量来自 GGUF。MTP sidecar 由启动器
-  以 `GDEC_GGUF_MTP` 显式传入（空串 = 不用）；直接运行引擎且没设 `GDEC_GGUF_MTP` 时，引擎自动使用分片
+- 启动器执行 `qwenox <第 1 个分片>.gguf ...`，引擎看到 `.gguf` 基座即为纯 GGUF 启动，等价于
+  `QWENOX_GGUF=<该分片> QWENOX_GGUF_DENSE=1`，基座 Checkpoint 为空，全部张量来自 GGUF。MTP sidecar 由启动器
+  以 `QWENOX_GGUF_MTP` 显式传入（空串 = 不用）；直接运行引擎且没设 `QWENOX_GGUF_MTP` 时，引擎自动使用分片
   目录里唯一的 `mtp-*.gguf`。
 - PLE n-gram 表直接用 GGUF 里的 IQ4_NL（90 B/行，约 27 GiB；hgn fp8 为 160 B/行 47.7 GiB），
   prefill 在 GPU 上解量化（`k_ple_iq4nl_dequant`），decode 在 CPU 上解量化；`PLE_URING=1` 的 io_uring 批量读
   改为指向表所在的分片。
-- 目前只支持 Linux（`GDEC_GGUF_DENSE` 还没移植到 Windows；Windows 启动器只读 service.conf 的 hgn 一段）。
+- 目前只支持 Linux（`QWENOX_GGUF_DENSE` 还没移植到 Windows；Windows 启动器只读 service.conf 的 hgn 一段）。
 
 ## 用法：混合模式（过渡，仍需 hgn；只用于验证脚本直接运行引擎，启动器会清掉这些变量）
 
 ```bash
 D=~/App/llama.cpp/models/Qwen3.8-Flash-Next-UD-Q4_K_XL
-export GDEC_GGUF=$D/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf   # G2：路由专家来自 GGUF
-export GDEC_GGUF_DENSE=1                                                 # G3.1：其余非专家张量也来自 GGUF
-export GDEC_GGUF_MTP=$D/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf          # G3.1/G3.2：MTP 头（含路由专家）
+export QWENOX_GGUF=$D/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf   # G2：路由专家来自 GGUF
+export QWENOX_GGUF_DENSE=1                                                 # G3.1：其余非专家张量也来自 GGUF
+export QWENOX_GGUF_MTP=$D/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf          # G3.1/G3.2：MTP 头（含路由专家）
 # G3.2：视觉塔在命令行给 --vision-tower $D/mmproj-BF16.gguf
 ```
 
 | 变量 | 作用 |
 |---|---|
-| `GDEC_GGUF=<第 1 个分片>` | trunk 48 层路由专家直接读 GGUF（hipHostRegister 原地映射，不复制），跑 `26_kernels_moe_gguf.inc` 的 WMMA kernel（移植自 gufo，MIT） |
-| `GDEC_GGUF_DENSE=1` | 加载期把 dense / norm / router / HC / embed / lm_head / PLE 投影从 GGUF 转成引擎格式（`src/gguf_map.h`），按 hgn 名覆盖 hgn 记录 |
-| `GDEC_GGUF_MTP=<sidecar>` | MTP 头从 Q8_0 sidecar 读：非专家张量需 `GDEC_GGUF_DENSE=1`；路由专家（Q8_0 gate/up/down）只要同时设了 `GDEC_GGUF` 就原地映射，走同一套 MoE kernel |
-| `GDEC_GGUF_MTP_EXPERTS=0` | 调试用：MTP 路由专家仍取 hgn |
+| `QWENOX_GGUF=<第 1 个分片>` | trunk 48 层路由专家直接读 GGUF（hipHostRegister 原地映射，不复制），跑 `26_kernels_moe_gguf.inc` 的 WMMA kernel（移植自 gufo，MIT） |
+| `QWENOX_GGUF_DENSE=1` | 加载期把 dense / norm / router / HC / embed / lm_head / PLE 投影从 GGUF 转成引擎格式（`src/gguf_map.h`），按 hgn 名覆盖 hgn 记录 |
+| `QWENOX_GGUF_MTP=<sidecar>` | MTP 头从 Q8_0 sidecar 读：非专家张量需 `QWENOX_GGUF_DENSE=1`；路由专家（Q8_0 gate/up/down）只要同时设了 `QWENOX_GGUF` 就原地映射，走同一套 MoE kernel |
+| `QWENOX_GGUF_MTP_EXPERTS=0` | 调试用：MTP 路由专家仍取 hgn |
 | `--vision-tower <mmproj.gguf>` | 路径以 `.gguf` 结尾时按 llama.cpp mmproj（clip / qwen3vl_merger）加载，转成与 hgn 视觉文件相同的 bf16 张量（`gguf_map::build_vision`） |
-| `GDEC_GGUF_PLE=1` | 混合模式下 PLE n-gram 表也用 GGUF 的 IQ4_NL（默认保留 hgn 的 fp8 表，KLD 更好，见下） |
-| `GDEC_GGUF_DENSE_FILTER=a,b,...` | 调试用：只有名字包含其中某个子串的张量来自 GGUF（`!` 前缀表示取反），用于二分定位 |
+| `QWENOX_GGUF_PLE=1` | 混合模式下 PLE n-gram 表也用 GGUF 的 IQ4_NL（默认保留 hgn 的 fp8 表，KLD 更好，见下） |
+| `QWENOX_GGUF_DENSE_FILTER=a,b,...` | 调试用：只有名字包含其中某个子串的张量来自 GGUF（`!` 前缀表示取反），用于二分定位 |
 
 ## 转换规则（gguf_map.h）
 
@@ -94,9 +94,9 @@ export GDEC_GGUF_MTP=$D/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf          # G3.1/
 - 不设 GGUF 变量时与改动前提交的 hgn 结果逐位相同（REF 要用同一提交编出的二进制，见 g3_verify.sh 注释）。
 - **decode / 投机提速（2026-09-25 下午）。** 原先两个短板：P=1 时 WMMA 专家 kernel 16 行只用 1 行；
   Q8_0 dense 每 token 读取字节约为 q4cp 的 2 倍。已做：
-  1. 小 P（≤8，`GDEC_GG_GEMV`）的路由专家走原始块 FP32 GEMV `moe_gg_gemv`（26_kernels_moe_gguf.inc），
+  1. 小 P（≤8，`QWENOX_GG_GEMV`）的路由专家走原始块 FP32 GEMV `moe_gg_gemv`（26_kernels_moe_gguf.inc），
      P=1 每层 158 µs（WMMA 约 225）。
-  2. 2≤P≤8 时做专家去重（`GDEC_GG_UQ=0` 关闭）：投机验证的几个 token 共享的专家只读一次，
+  2. 2≤P≤8 时做专家去重（`QWENOX_GG_UQ=0` 关闭）：投机验证的几个 token 共享的专家只读一次，
      与不去重的路径逐位相同（`tools/moe_gguf_gemv_test.cu --share 0.5`：MoE 1.07–1.14×；
      实测投机端到端只有约 +1%，在噪声内，没有共享时开销 <1%）。
   3. q8g32 dense GEMV：P=1 `k_q8g32_gemv_lpr`；P>1 `k_q8g32_gemv_mlpr`（每组权重解码一次，复用于 P 行），
@@ -139,7 +139,7 @@ export GDEC_GGUF_MTP=$D/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf          # G3.1/
   | decode @ 32K（tok/s） | 24.8 | 24.8 |
   | 投机 8K γ=3 tok/s（commit/round；hgn 51.3 / 3.78） | 46（3.82） | 45.9–46.1（3.82） |
 
-  纯 GGUF 与"hgn 基座 + GGUF 全覆盖 + `GDEC_GGUF_PLE=1`"的 PPL 逐位相同，说明没有任何张量还在读 hgn。
+  纯 GGUF 与"hgn 基座 + GGUF 全覆盖 + `QWENOX_GGUF_PLE=1`"的 PPL 逐位相同，说明没有任何张量还在读 hgn。
 
 ## 同机完整对比（`tools/bench_full.sh`）
 
@@ -170,13 +170,13 @@ pp_prod.sh 现在把启动器命令行里的全部权重参数传给引擎，hgn
 ## hgn 路由专家也走 WMMA：LUT 解码 kernel（2026-09-25，`tools/lut_verify.sh` PASS）
 
 以前 hgn 没吃到 G1 MoE kernel 的收益：它只认 GGUF 块格式，hgn（q4cp）prefill 仍是
-dequant + hipBLASLt（`GDEC_MOE_LT`）/ 标量 `k_moe_w4`。q4cp 与 IQ4_NL 结构几乎一样
+dequant + hipBLASLt（`QWENOX_MOE_LT`）/ 标量 `k_moe_w4`。q4cp 与 IQ4_NL 结构几乎一样
 （32 元素一组、4-bit 查表索引、fp16 scale），所以写了一个 LUT 解码族 kernel
 `src/gpu/parts/27_kernels_moe_lut.inc`：`k_moe_lut<kQ4CP | kIQ4NL | kIQ4XS, pair>`，
 流水线/tiling/epilogue 与 `k_moe_gg` 相同，解码 = LDS half2 对表（一个字节查出两个元素）× scale。
 
-- **默认开启**（hgn prefill，P > moe_naive_max）；`GDEC_MOE_Q4W=0` 恢复旧路径且与旧提交逐位相同。
-  开启时 `GDEC_MOE_LT` 不再生效，它的 dequant/gather 缓冲（`d_moexg` 等，chunk 16384 约 0.8 GiB、
+- **默认开启**（hgn prefill，P > moe_naive_max）；`QWENOX_MOE_Q4W=0` 恢复旧路径且与旧提交逐位相同。
+  开启时 `QWENOX_MOE_LT` 不再生效，它的 dequant/gather 缓冲（`d_moexg` 等，chunk 16384 约 0.8 GiB、
   Windows chunk 8192 约 0.4 GiB）也不分配，`devarena_estimate` 同步。
 - decode（P ≤ 16 的 grouped GEMV）完全不变：逐 token decode mean_nll 与旧二进制逐位相同。
 - IQ4_NL / IQ4_XS 模板已在 `tools/moe_lut_test.cu --synth iq4nl|iq4xs` 对 CPU 参考通过；

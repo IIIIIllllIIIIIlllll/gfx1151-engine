@@ -6,7 +6,7 @@
 #     NEW=~/Models/hq/qwen38-flash-next-w4b.overlay-q8.hgn   新 overlay
 #     NEWBASE=~/Models/hq/qwen38-flash-next-w4b-imat.hgn     新基座（默认不换）
 #     KMAX=0.075           KLD 上限（设了 NEWBASE 时默认 0.060）
-#     BIN=build/gdec-hq2   新二进制      REF=build/gdec-q4w  改动前提交（fdf805a）编出的二进制
+#     BIN=build/qwenox-hq2   新二进制      REF=build/qwenox-q4w  改动前提交（fdf805a）编出的二进制
 #     QUICK=1              KLD 只跑 16 chunk，跳过速度
 # 检查项：
 #   1. 旧 overlay：BIN 与 REF 逐位相同（1024 token prefill / 逐 token decode mean_nll）
@@ -20,8 +20,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 NEW=${NEW:-$HOME/Models/hq/qwen38-flash-next-w4b.overlay-q8.hgn}
 NEWBASE=${NEWBASE:-}
 KMAX=${KMAX:-$([[ -n $NEWBASE ]] && echo 0.060 || echo 0.075)}
-BIN=${BIN:-build/gdec-hq2}
-REF=${REF:-build/gdec-q4w}
+BIN=${BIN:-build/qwenox-hq2}
+REF=${REF:-build/qwenox-q4w}
 export PROBE_CAP_GB=${PROBE_CAP_GB:-100}
 KREF=data/kld/bf16_c512.kld
 TOKSRC=$HOME/ppbench/tok8192.txt
@@ -32,7 +32,7 @@ bad() { echo "FAIL: $*" >&2; fail=1; }
 for f in "$NEW" ${NEWBASE:+"$NEWBASE"} "$BIN" "$REF" "$KREF" "$TOKSRC" "$HOME/ppbench/tok32768.txt"; do
   [[ -e "$f" ]] || { echo "缺少 $f"; echo FAIL; exit 1; }
 done
-if pgrep -af '(^|/)(gdec[^/[:space:]]*|flash_serve|serve_api\.py|llama-server|llama-perplexity|llama-cli)([[:space:]]|$)' >/dev/null; then
+if pgrep -af '(^|/)(qwenox[^/[:space:]]*|flash_serve|serve_api\.py|llama-server|llama-perplexity|llama-cli)([[:space:]]|$)' >/dev/null; then
   echo "GPU 上已有引擎/llama.cpp 在跑，请先停掉"; echo FAIL; exit 1
 fi
 mkdir -p logs
@@ -64,8 +64,8 @@ echo "新权重: ${WNEW[*]}"
 run_ppl() {  # label bin old|new extra-env...  -> "ppl mean_nll"
   local label=$1 bin=$2 which=$3; shift 3
   local -a W=("${WOLD[@]}"); [[ $which == new ]] && W=("${WNEW[@]}")
-  ( for e in $(compgen -e | grep '^GDEC_'); do unset "$e"; done
-    for e in "${PENV[@]}" GDEC_KVSNAP=0 "$@"; do export "$e"; done
+  ( for e in $(compgen -e | grep '^QWENOX_'); do unset "$e"; done
+    for e in "${PENV[@]}" QWENOX_KVSNAP=0 "$@"; do export "$e"; done
     bash tools/run_capped.sh "$PROBE_CAP_GB" -- "$bin" "${W[@]}" --tokens-file "$TOK" \
       --ppl --maxctx 4096 >"logs/$label.log" 2>&1 )
   grep -qE 'hipError|Segmentation|Aborted|FATAL|what\(\)' "logs/$label.log" && bad "$label 崩溃（logs/$label.log）"
@@ -77,8 +77,8 @@ arena() { sed -n 's/^weight arena: \([0-9.]*\) GiB.*/\1/p' "$1" | head -1; }
 note "1. 旧 overlay：$BIN 与 $REF 逐位相同"
 read -r _ rnb < <(run_ppl hq_ref_prefill "$REF" old); svm_check
 read -r _ onb < <(run_ppl hq_old_prefill "$BIN" old); svm_check
-read -r _ rnd < <(run_ppl hq_ref_decode "$REF" old GDEC_NOPREFILLBATCH=1); svm_check
-read -r _ ond < <(run_ppl hq_old_decode "$BIN" old GDEC_NOPREFILLBATCH=1); svm_check
+read -r _ rnd < <(run_ppl hq_ref_decode "$REF" old QWENOX_NOPREFILLBATCH=1); svm_check
+read -r _ ond < <(run_ppl hq_old_decode "$BIN" old QWENOX_NOPREFILLBATCH=1); svm_check
 echo "prefill mean_nll ref=${rnb:-?} bin=${onb:-?}   decode ref=${rnd:-?} bin=${ond:-?}"
 if [[ -n "${rnb:-}" && "${rnb:-}" == "${onb:-}" && -n "${rnd:-}" && "${rnd:-}" == "${ond:-}" ]]; then
   echo "逐位相同  OK"
@@ -88,7 +88,7 @@ grep -q 'few-row bf16 gemv on' logs/hq_old_prefill.log && bad "旧 overlay 不�
 # ---- 2. 新 overlay prefill vs decode -----------------------------------------
 note "2. 新 overlay：1024 token prefill vs decode PPL"
 read -r np nnb < <(run_ppl hq_new_prefill "$BIN" new); svm_check
-read -r nd nnd < <(run_ppl hq_new_decode "$BIN" new GDEC_NOPREFILLBATCH=1); svm_check
+read -r nd nnd < <(run_ppl hq_new_decode "$BIN" new QWENOX_NOPREFILLBATCH=1); svm_check
 read -r op _ < <(sed -n 's/^ppl_summary.*mean_nll=\([0-9.]*\).*ppl=\([0-9.]*\).*/\2 \1/p' logs/hq_old_prefill.log)
 echo "PPL 新 prefill=${np:-?} decode=${nd:-?}   旧 prefill=${op:-?}"
 if [[ -z "${np:-}" || -z "${nd:-}" ]]; then bad "PPL 没有输出"
@@ -143,12 +143,12 @@ speed() {  # label old|new tok gen extra... -> "prefill_tok/s decode_tok/s"
 }
 if [[ -z ${QUICK:-} ]]; then
   note "5a. pp 8K @ chunk 2048"
-  read -r a _ < <(speed hq_pp8k_old old 8k 1 GDEC_PREFILL_CHUNK=2048); svm_check
-  read -r b _ < <(speed hq_pp8k_new new 8k 1 GDEC_PREFILL_CHUNK=2048); svm_check
+  read -r a _ < <(speed hq_pp8k_old old 8k 1 QWENOX_PREFILL_CHUNK=2048); svm_check
+  read -r b _ < <(speed hq_pp8k_new new 8k 1 QWENOX_PREFILL_CHUNK=2048); svm_check
   echo "旧=$a  新=$b tok/s"
   note "5b. pp 32K @ chunk 16384 + decode 128"
-  read -r a ad < <(speed hq_pp32k_old old 32k 128 GDEC_PREFILL_CHUNK=16384); svm_check
-  read -r b bd < <(speed hq_pp32k_new new 32k 128 GDEC_PREFILL_CHUNK=16384); svm_check
+  read -r a ad < <(speed hq_pp32k_old old 32k 128 QWENOX_PREFILL_CHUNK=16384); svm_check
+  read -r b bd < <(speed hq_pp32k_new new 32k 128 QWENOX_PREFILL_CHUNK=16384); svm_check
   echo "pp     旧=$a  新=$b tok/s"
   echo "decode 旧=$ad 新=$bd tok/s   [GGUF 纯 ~25]"
   if [[ "$ad" == "-" || "$bd" == "-" ]]; then bad "decode 没有输出"

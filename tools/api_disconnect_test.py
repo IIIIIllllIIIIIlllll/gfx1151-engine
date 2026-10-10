@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """CPU-only disconnect regression using a fake engine and synthetic tokenizer.
 
-Run: python tools/api_disconnect_test.py --api build/gdec-api-win.exe
-     python tools/api_disconnect_test.py --api build/gdec-api --slots 2
+Run: python tools/api_disconnect_test.py --api build/qwenox-win.exe
+     python tools/api_disconnect_test.py --api build/qwenox-api --slots 2
 """
 import argparse
 import json
@@ -162,7 +162,7 @@ def run_checks(base, api_port, engine_port, slots):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--api", required=True, help="path to the compiled gdec-api binary")
+    parser.add_argument("--api", required=True, help="path to the compiled qwenox-api binary")
     parser.add_argument("--slots", type=int, default=1)
     args = parser.parse_args()
     api_binary = str(Path(args.api).resolve())
@@ -172,11 +172,11 @@ def main():
         api_port = free_port()
     base = f"http://127.0.0.1:{api_port}"
     children = []
-    with tempfile.TemporaryDirectory(prefix="gdec-api-disconnect-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="qwenox-api-disconnect-") as temporary:
         root = Path(temporary)
         make_tokenizer(root / "tokenizer")
-        env = dict(os.environ, GDEC_API_TOKCACHE_FILE="", GDEC_API_ADMIN_KEY="",
-                   GDEC_API_TOKCACHE="0", GDEC_REQSTAT="0", ROPE_FACTOR="1")
+        env = dict(os.environ, QWENOX_API_TOKCACHE_FILE="", QWENOX_API_ADMIN_KEY="",
+                   QWENOX_API_TOKCACHE="0", QWENOX_REQSTAT="0", ROPE_FACTOR="1")
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         with (root / "test.log").open("w+") as log:
             try:

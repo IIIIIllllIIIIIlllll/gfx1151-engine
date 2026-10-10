@@ -164,11 +164,11 @@ RoPE 配置是**实例级**的:factor 2 下所有请求都使用 YaRN,不是超�
 | `KV_PAGED` | `1` | 分页共享池;`PARALLEL>1` 必须开启,并使用支持分页的 kernel 组合 |
 | `KV_POOL_TOKENS` | `0` | 全部槽位共享的物理页池容量,以 token 为单位;`0` 跟随 `MAX_CONTEXT`,小于它也按它算,向上取整到 256 token/页 |
 | `PARALLEL` | `4` | 并发槽位数,范围 1–8;不自动乘大池容量,也不把单条上限等分 |
-| `GDEC_KV_RESERVE_DECODE` | `4096` | 引擎环境变量,控制准入时最多预约多少 decode token;不是输出上限,有效值为 0–2147483647 |
+| `QWENOX_KV_RESERVE_DECODE` | `4096` | 引擎环境变量,控制准入时最多预约多少 decode token;不是输出上限,有效值为 0–2147483647 |
 
-脚本启动器把 `ROPE_*` 导出为同名的 `GDEC_ROPE_*`,让引擎和 API 使用相同设置。
+脚本启动器把 `ROPE_*` 导出为同名的 `QWENOX_ROPE_*`,让引擎和 API 使用相同设置。
 直接运行引擎时可用 `--rope-factor`、`--rope-original-ctx`、`--rope-beta-fast`、
-`--rope-beta-slow`、`--rope-attn-scale`;直接运行 API 则使用 `GDEC_ROPE_*`。
+`--rope-beta-slow`、`--rope-attn-scale`;直接运行 API 则使用 `QWENOX_ROPE_*`。
 手工启动要确保两侧配置一致;只改 API 的 `/health` 元数据不会改变引擎的 RoPE。
 
 ### 两种 512K 配置
@@ -220,7 +220,7 @@ ROPE_BETA_SLOW=1 ROPE_ATTN_SCALE=0 bash start_hgn.sh --check
 Linux GGUF 使用相同变量,换成 `start_gguf.sh`;已完成的 512K 实机验收使用 Linux
 hgn + BF16 分页 KV + WMMA + BTV,不代表所有权重/kernel/平台组合都已验证。
 Windows 的 `start_win.sh` 与原生 `start_win.exe` 都会读取 `service.conf` 的
-`ROPE_*`、做同样的校验并转为 `GDEC_ROPE_*` 传给引擎和 API,但 Windows 512K
+`ROPE_*`、做同样的校验并转为 `QWENOX_ROPE_*` 传给引擎和 API,但 Windows 512K
 尚未实测验收,且需另行确认 arena(95 GiB 上限)/显存能否放下 512K 页池。
 
 ### 两个典型场景(参考)
@@ -256,7 +256,7 @@ GPU 在安全调度点轮转,并发数翻倍不意味着吞吐翻倍,请求延�
 
 ```text
 目标页数 = ceil(min(MAX_CONTEXT,
-                   prompt_tokens + min(max_tokens, GDEC_KV_RESERVE_DECODE)) / 256)
+                   prompt_tokens + min(max_tokens, QWENOX_KV_RESERVE_DECODE)) / 256)
 其他活跃槽的预算 = max(目标页数, 当前实际映射页数)
 可用预算 = 池总页数 - 其他活跃槽预算之和
 新请求需页 = 目标页数; live continuation 则取 max(目标页数, 已映射页数)
@@ -269,7 +269,7 @@ GPU 在安全调度点轮转,并发数翻倍不意味着吞吐翻倍,请求延�
   页视为可逐出,不把所有缓存永久扣减;真正分配时仍保留压力处理。
 - 池耗尽时先逐出 RAM 检查点,再释放空闲槽 KV,仍不足则中断较晚准入的活跃请求;
   需要页的请求若自身是后来者,它可能失败。被中断请求通过 API 返回错误。
-- `GDEC_KV_RESERVE_DECODE=4096` 不会把输出裁到 4096;输出仍受请求预算和
+- `QWENOX_KV_RESERVE_DECODE=4096` 不会把输出裁到 4096;输出仍受请求预算和
   `MAX_CONTEXT` 限制。减小预约可能提高准入率,但增加中途池耗尽风险。
 - `PARALLEL=1` 绕过多槽准入门禁,仍受单条上限、实际池容量和缓存逐出机制约束。
 
@@ -281,7 +281,7 @@ GPU 在安全调度点轮转,并发数翻倍不意味着吞吐翻倍,请求延�
 ### 启动检查、缓存与验证范围
 
 - 512K 使用 BF16 KV + WMMA + BTV;Linux 启动器已设置此组合。超过原生 256K
-  时引擎自动禁用 `GDEC_QSA_UNION`,不要手工强制使用未验证组合。
+  时引擎自动禁用 `QWENOX_QSA_UNION`,不要手工强制使用未验证组合。
 - 检查 `--check` 的单条上下文、共享池和并发数;服务起来后检查 engine 日志的
   `RoPE: YaRN factor=2`、`[kvpage]` 页数及 KV 类型,以及 `/health` 的
   `context=524288` 和 `rope_scaling.factor=2`。默认原生返回 `rope_scaling=null`;
@@ -306,22 +306,22 @@ Windows 版与 Linux 版功能一致(引擎 + OpenAI API + 多模态),移植记�
 (或双击 `build_win.bat`,仅编译期需要 Git):
 
 ```bash
-bash build_win.sh           # 全部所需产物:引擎、benchmark、API、启动器
-bash build_win.sh api       # OpenAI API 前端
-bash build_win.sh launcher  # 免脚本启动器 start_win.exe
+bash build_win.sh           # 全部所需产物:引擎、benchmark、API、根目录入口
+bash build_win.sh api       # OpenAI API 前端(Windows 上是托盘程序)
+bash build_win.sh launcher  # 根目录最小入口 start_win.exe
 ```
 
-日常运行双击 `start_win.exe`(原生 Win32,不需要 Git/PowerShell):拉起引擎
-+ API 双进程,不开控制台,只在任务栏右下角放托盘图标(右键:打开面板 / 复制
-API 地址 / 查看日志 / 退出;双击:打开面板),输出写入 `logs\`;排查问题可用
-`start_win.exe --console` 回到控制台模式(Ctrl+C 或关窗停止)。首次双击会弹出
-启动配置面板(4 个分页):第 1 页权重(V1/V2/GGUF 版本选择,GGUF 仅保存供
-Linux `start_gguf.sh` 用)、第 2 页上下文/并发/YaRN 勾选(扩展倍数按单请求
-上限自动推导)、第 3 页监听地址与端口、
-第 4 页显存环境检查,每页有独立的检查报错区,确认后写回 `service.conf` 并启动;之后双击不再弹出,
-改配置用托盘右键"设置…"或 `start_win.exe --setup`。配置与 Linux
-**共用 `service.conf`**(换模型文件名、改上下文窗口都编辑它),环境变量可
-临时覆盖。客户端连 `http://<主机>:8731/v1`。
+日常运行双击 `start_win.exe`(原生 Win32,不需要 Git/PowerShell):它以项目根
+为工作目录拉起 `build\qwenox-win.exe` —— Windows 上 API 组件本身就是托盘
+程序,不开控制台,只在任务栏右下角放托盘图标(右键:打开控制台 / 启动·停止
+引擎 / 复制 API 地址 / 查看日志 / 退出;双击:打开控制台网页)。双击后引擎
+**不会自动拉起**:在控制台网页的 `#/engine` 页修改配置(写回 `service.conf`,
+与 Linux 共用同一文件)并手动启动/停止引擎,或用托盘右键菜单启停。API 自己的
+输出写入 `logs\api-win-*.log`,引擎输出写入 `logs\engine-api-*.log`;排查问题
+可用 `build\qwenox-win.exe --console` 回到控制台模式。词表按
+`TOKENIZER_DIR`(默认 `models/tokenizer`)加载,缺失时回退到仓库内置的
+`data/tokenizer`(见该目录 README)。旧版配置面板启动器已归档到
+`attic/launcher/`,不再维护。客户端连 `http://<主机>:8731/v1`。
 
 分发:`build/` + `start_win.exe` + `models/` 拷到任意 gfx1151 Windows
 机器即用,**无需安装 ROCm/TheRock**;仅需 AMD 显卡驱动,并在 BIOS 为 GPU
@@ -337,7 +337,7 @@ Linux `start_gguf.sh` 用)、第 2 页上下文/并发/YaRN 勾选(扩展倍数�
 - 图片解码经 stb_image 支持 PNG/JPEG(WebP 未接)
 - prefill chunk 默认 8192
 - 冷加载为整权重读盘(分钟级,进度见控制台/日志)
-- 启动器未开 `GDEC_GEMM_WMMA` 与 `GDEC_GDN_FUSED`(Linux 启动器已转正的
+- 启动器未开 `QWENOX_GEMM_WMMA` 与 `QWENOX_GDN_FUSED`(Linux 启动器已转正的
   自写 WMMA GEMM 与 GDN 融合 kernel,合计约 8-10% PP,TheRock 下未验证——
   故 Windows 端 prefill 走 hipBLASLt + 旧 GDN 路径)
 

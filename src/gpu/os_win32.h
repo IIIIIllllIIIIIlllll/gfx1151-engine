@@ -1,5 +1,5 @@
-// os_win32.h — Windows 兼容层：为 gdec.cpp / hgn.h 提供 POSIX 等价物。
-// 仅 _WIN32 下包含。设计原则：gdec.cpp 主体代码基本不动，差异全部收敛到这里。
+// os_win32.h — Windows 兼容层：为 qwenox.cpp / hgn.h 提供 POSIX 等价物。
+// 仅 _WIN32 下包含。设计原则：qwenox.cpp 主体代码基本不动，差异全部收敛到这里。
 #pragma once
 #ifndef _WIN32
 #error "os_win32.h 仅供 Windows 构建包含"

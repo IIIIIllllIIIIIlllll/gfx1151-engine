@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # 一键 A1 逐位一致矩阵（前台运行，全程有输出，结束时给出 PASS/FAIL）。
-# 依次以 off / GDEC_KV_PAGED=1 / GDEC_KV_PAGED=2 启动引擎 → 跑 snapshot_regress
+# 依次以 off / QWENOX_KV_PAGED=1 / QWENOX_KV_PAGED=2 启动引擎 → 跑 snapshot_regress
 # → 停引擎，最后逐用例比较各配置的生成文本（必须一字不差）。
 #   bash tools/a1_verify.sh                  # 三种配置，maxctx 40960，约 5-10 分钟
 #   bash tools/a1_verify.sh off p2           # 只跑指定配置
 #   A1_CTX=131072 bash tools/a1_verify.sh p2 # 大 maxctx（512 页）
 #   A1_NGRAM=1 bash tools/a1_verify.sh       # 额外跑 ngram_regress
-#   OLD_BINARY=/tmp/gdec-base/build/gdec bash tools/a1_verify.sh prod prodold
+#   OLD_BINARY=/tmp/qwenox-base/build/qwenox-engine bash tools/a1_verify.sh prod prodold
 #       # 生产 kernel 配置下，新二进制 vs 改动前二进制（A1b 回归，必须逐字一致）
 #   bash tools/a1_verify.sh prod prodp1 prodp2
 #       # A1c：生产配置（BF16+WMMA+BTV）下关闭分页 / 恒等页表 / 反转页表，必须逐字一致
@@ -31,7 +31,7 @@ probe_precheck || exit 1
 if (( $# )); then cfgs=("$@"); else cfgs=(off p1 p2); fi
 for c in "${cfgs[@]}"; do
   case "$c" in off|p1|p2|prod|prodp1|prodp2) ;; prodold)
-    [[ -x "${OLD_BINARY:-}" ]] || { echo "prodold 需要 OLD_BINARY=<改动前编译的 gdec>" >&2; exit 2; } ;;
+    [[ -x "${OLD_BINARY:-}" ]] || { echo "prodold 需要 OLD_BINARY=<改动前编译的 qwenox>" >&2; exit 2; } ;;
     *) echo "未知配置 $c（可选 off p1 p2 prod prodp1 prodp2 prodold）" >&2; exit 2 ;;
   esac
 done
@@ -40,23 +40,23 @@ MODEL_DIR="${MODEL_DIR:-models}"
 args=("$MODEL_DIR/qwen38-flash-next-w4b.hgn" "$MODEL_DIR/qwen38-flash-next-w4b.overlay.hgn"
       --serve --port 8732 --maxctx "$CTX")
 # 与 run_ngram_probe.sh 相同的环境（关 kvsnap）
-export GDEC_KVSNAP=0
-export GDEC_NGRAM_MIN="${GDEC_NGRAM_MIN:-4}" GDEC_NGRAM_MAX="${GDEC_NGRAM_MAX:-16}"
-PROD_VARS=(GDEC_QSA_KV_BF16 GDEC_QSA_WMMA GDEC_QSA_WMMA_BTV GDEC_GEMM_WMMA GDEC_GDN_FUSED
-           GDEC_MOE_LT GDEC_MOE_LT_BF16 GDEC_GR_BF16 GDEC_GDN_STREAM GDEC_GDN_WAVE
-           GDEC_NOWARMUP GDEC_INDEX_FUSED2 GDEC_PP_MOE_OUT GDEC_INDEX_STREAM_SELECT)
+export QWENOX_KVSNAP=0
+export QWENOX_NGRAM_MIN="${QWENOX_NGRAM_MIN:-4}" QWENOX_NGRAM_MAX="${QWENOX_NGRAM_MAX:-16}"
+PROD_VARS=(QWENOX_QSA_KV_BF16 QWENOX_QSA_WMMA QWENOX_QSA_WMMA_BTV QWENOX_GEMM_WMMA QWENOX_GDN_FUSED
+           QWENOX_MOE_LT QWENOX_MOE_LT_BF16 QWENOX_GR_BF16 QWENOX_GDN_STREAM QWENOX_GDN_WAVE
+           QWENOX_NOWARMUP QWENOX_INDEX_FUSED2 QWENOX_PP_MOE_OUT QWENOX_INDEX_STREAM_SELECT)
 # prod / prodold：tools/serve_common.sh 的生产 kernel 配置（BF16 KV + WMMA + BTV，16K chunk）
 set_env() {
-  unset GDEC_KV_PAGED GDEC_PREFILL_CHUNK "${PROD_VARS[@]}"
-  [[ -z "${A1_CHUNK:-}" ]] || export GDEC_PREFILL_CHUNK="$A1_CHUNK"
+  unset QWENOX_KV_PAGED QWENOX_PREFILL_CHUNK "${PROD_VARS[@]}"
+  [[ -z "${A1_CHUNK:-}" ]] || export QWENOX_PREFILL_CHUNK="$A1_CHUNK"
   case "$1" in
-    p1) export GDEC_KV_PAGED=1 ;;
-    p2) export GDEC_KV_PAGED=2 ;;
+    p1) export QWENOX_KV_PAGED=1 ;;
+    p2) export QWENOX_KV_PAGED=2 ;;
     prod|prodold|prodp1|prodp2)
       local v; for v in "${PROD_VARS[@]}"; do export "$v=1"; done
-      export GDEC_PREFILL_CHUNK="${A1_CHUNK:-16384}"
-      [[ "$1" == prodp1 ]] && export GDEC_KV_PAGED=1
-      [[ "$1" == prodp2 ]] && export GDEC_KV_PAGED=2
+      export QWENOX_PREFILL_CHUNK="${A1_CHUNK:-16384}"
+      [[ "$1" == prodp1 ]] && export QWENOX_KV_PAGED=1
+      [[ "$1" == prodp2 ]] && export QWENOX_KV_PAGED=2
       ;;
   esac
 }
@@ -68,9 +68,9 @@ ran=()
 for c in "${cfgs[@]}"; do
   set_env "$c"
   rm -f "logs/a1-$c.json" "logs/a1-$c.txt"   # 不让上一次的结果混进汇总
-  bin="${PROBE_BINARY:-build/gdec}"; [[ "$c" == prodold ]] && bin="$OLD_BINARY"
+  bin="${PROBE_BINARY:-build/qwenox-engine}"; [[ "$c" == prodold ]] && bin="$OLD_BINARY"
   echo
-  echo "================ 配置 $c（GDEC_KV_PAGED=${GDEC_KV_PAGED:-未设置}，BF16=${GDEC_QSA_KV_BF16:-0}，maxctx $CTX，$bin）================"
+  echo "================ 配置 $c（QWENOX_KV_PAGED=${QWENOX_KV_PAGED:-未设置}，BF16=${QWENOX_QSA_KV_BF16:-0}，maxctx $CTX，$bin）================"
   probe_start "a1-$c" "$bin" "${args[@]}" || { echo "[$c] 启动失败，跳过" >&2; continue; }
   kvp="$(grep -m1 '\[kvpage\]' "$PROBE_LOG" || true)"
   echo "[$c] 页表日志: ${kvp:-（无 [kvpage] 行）}"

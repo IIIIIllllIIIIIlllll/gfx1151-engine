@@ -16,7 +16,7 @@ change should pass this set of baselines before being considered for merge.
   one per line), convenient for manual inspection and reuse; the `65536` /
   `131072` files are extra-long prompt material for generating future
   long-context baselines.
-- `<N>.gdec.log` — per-step top-5 logit records captured engine-side when
+- `<N>.qwenox.log` — per-step top-5 logit records captured engine-side when
   collecting the baselines, used to locate the first divergence point when
   outputs differ.
 - `server-health.json` — reference sample of the API `/health` response shape.

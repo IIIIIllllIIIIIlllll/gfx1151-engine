@@ -3,7 +3,7 @@
 #   bash tools/bench_full.sh
 #     FORMATS="gguf hgn"   测哪几种、按什么顺序（只测一种写 FORMATS=gguf）
 #     SKIP="kld api"       跳过其中几项：pp spec kld api（decode 跟 32K prefill 一起跑）
-#     BIN=build/gdec
+#     BIN=build/qwenox-engine
 # 全部用启动器 --check 给出的生产环境变量与权重参数（service.conf 的 hgn / GGUF 两段）：
 #   pp      离线 prefill 8K / 32K / 64K（生产 chunk 16384）：整体 tok/s（总 token / 总时间）与最后一个 chunk 的 tok/s
 #   decode  32K prompt 之后逐 token 生成 128（不投机）
@@ -18,7 +18,7 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 FORMATS=${FORMATS:-gguf hgn}
 SKIP=" ${SKIP:-} "
-export BIN=${BIN:-build/gdec}
+export BIN=${BIN:-build/qwenox-engine}
 KREF=data/kld/bf16_c512.kld
 DOC=$HOME/ppbench/prompt32k.json   # {"text": 约 32K token 的项目文档}
 OUT=logs/bench_full.md
@@ -32,7 +32,7 @@ want() { [[ $SKIP != *" $1 "* ]]; }
 launcher() { if [[ $1 == hgn ]]; then echo start_hgn.sh; else echo start_gguf.sh; fi; }
 crashed() { tr '\r' '\n' <"$1" | grep -aqE 'hipError|Segmentation|Aborted|FATAL'; }
 
-GPU_RE='(^|/)(gdec[^/[:space:]]*|flash_serve|serve_api\.py|llama-server|llama-perplexity|llama-cli)([[:space:]]|$)'
+GPU_RE='(^|/)(qwenox[^/[:space:]]*|flash_serve|serve_api\.py|llama-server|llama-perplexity|llama-cli)([[:space:]]|$)'
 if pgrep -af "$GPU_RE" >/dev/null; then
   pgrep -af "$GPU_RE" | cut -c1-160; echo "GPU 上已有引擎或 llama.cpp 在跑，先停掉"; echo FAIL; exit 1
 fi

@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # D1a 一键验收（并发时 prefill 用更小的分段），前台运行约 7 分钟，最后一行 D1A VERIFY: PASS/FAIL。
 #   bash tools/d1a_verify.sh
-#   BIN=build/gdec.x CONC_CHUNK=8192 STALL_MAX=1.0 PP_MAX=10 bash tools/d1a_verify.sh
+#   BIN=build/qwenox.x CONC_CHUNK=8192 STALL_MAX=1.0 PP_MAX=10 bash tools/d1a_verify.sh
 # 用生产环境（start_hgn.sh --check）+ PARALLEL=2 起两次测试引擎（端口 8732，kvsnap/RAM 检查点关，
 # 开 warmup 以免首个大 chunk 的一次性开销算进 PP）：
-#   c16  GDEC_CONC_PREFILL_CHUNK=0     → 并发时仍用 16384（D1a 之前的行为）
-#   c8   GDEC_CONC_PREFILL_CHUNK=8192  → D1a
+#   c16  QWENOX_CONC_PREFILL_CHUNK=0     → 并发时仍用 16384（D1a 之前的行为）
+#   c8   QWENOX_CONC_PREFILL_CHUNK=8192  → D1a
 # 每个引擎：A 单独 decode 1536 token → B 单独 32K prefill → A decode 期间提交 B。
 # 判定：测量有效；A 并发 == A 单独（逐 token）；c8 的最大停顿 < STALL_MAX 秒；32K 单独 prefill 变慢 ≤ PP_MAX%。
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 source tools/probe_lib.sh
-BIN="${BIN:-build/gdec}"
+BIN="${BIN:-build/qwenox-engine}"
 CONC_CHUNK="${CONC_CHUNK:-8192}"
 export PROBE_BINARY="$BIN"
 probe_precheck || { echo "D1A VERIFY: FAIL（预检未通过）"; exit 1; }
@@ -25,12 +25,12 @@ trap 'exit 130' INT TERM
 mkdir -p logs/d1a
 fail=0
 
-run_one() {  # run_one <tag> <GDEC_CONC_PREFILL_CHUNK>
+run_one() {  # run_one <tag> <QWENOX_CONC_PREFILL_CHUNK>
   local tag=$1 cc=$2 e i
-  for e in $(compgen -e | grep '^GDEC_'); do unset "$e"; done
+  for e in $(compgen -e | grep '^QWENOX_'); do unset "$e"; done
   for e in "${PENV[@]}"; do export "$e"; done
-  export GDEC_KVSNAP=0 GDEC_RCKPT=0 GDEC_NGRAM_CHUNK=16 GDEC_PARALLEL=2 GDEC_CONC_PREFILL_CHUNK="$cc"
-  unset GDEC_NOWARMUP
+  export QWENOX_KVSNAP=0 QWENOX_RCKPT=0 QWENOX_NGRAM_CHUNK=16 QWENOX_PARALLEL=2 QWENOX_CONC_PREFILL_CHUNK="$cc"
+  unset QWENOX_NOWARMUP
   local cmd=("${BASE[@]}")
   cmd[0]="$BIN"
   for i in "${!cmd[@]}"; do [[ "${cmd[$i]}" == --port ]] && cmd[$((i + 1))]=8732; done
@@ -39,7 +39,7 @@ run_one() {  # run_one <tag> <GDEC_CONC_PREFILL_CHUNK>
   if (( cc > 0 )); then
     grep -q "prefill chunk $cc" "$PROBE_LOG" || { echo "[$tag] 日志里没有 'prefill chunk $cc'：$BIN 不含 D1a"; probe_stop; return 1; }
   else
-    grep -q 'GDEC_CONC_PREFILL_CHUNK' "$PROBE_LOG" && { echo "[$tag] CONC_PREFILL_CHUNK=0 却生效了"; probe_stop; return 1; }
+    grep -q 'QWENOX_CONC_PREFILL_CHUNK' "$PROBE_LOG" && { echo "[$tag] CONC_PREFILL_CHUNK=0 却生效了"; probe_stop; return 1; }
   fi
   python3 tools/d1a_verify.py run --tag "$tag"
   local rc=$?
