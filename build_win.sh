@@ -22,7 +22,7 @@
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
-TR="${THEROCK:-/c/therock-dist-windows-multiarch-10.0.0/therock-dist-windows-multiarch-10.0.0}"
+TR="${THEROCK:-/c/therock-dist-windows-gfx1151-10.1.0}"
 HIPCC="$TR/bin/hipcc.exe"
 [[ -x "$HIPCC" ]] || { echo "找不到 TheRock hipcc: $HIPCC（设 THEROCK=...）" >&2; exit 1; }
 # hipcc 会读 HIP_PATH 定位 clang（实测指向坏路径直接编译失败；指向 HIP SDK 7.2
