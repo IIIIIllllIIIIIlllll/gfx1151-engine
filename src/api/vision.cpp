@@ -484,27 +484,20 @@ bool image_url_from_item(const json& item, std::string* url, bool* image,
 
 // QWENOX_API_MAX_IMAGES (= service.conf MAX_IMAGES) sets the per-request image
 // cap (default 8). The launchers reject values outside 1–256; a hand-set value
-// above 256 clamps to it with a warning.
+// above 256 clamps to it with a warning. Read on every call (no caching): on
+// Windows the variable is set when the engine starts (engine_sup), which can
+// be later than the first request.
 int max_images() {
-    static const int limit = [] {
-        const char* e = std::getenv("QWENOX_API_MAX_IMAGES");
-        if (e != nullptr && *e != '\0') {
-            char* end = nullptr;
-            const long v = std::strtol(e, &end, 10);
-            if (end != e && *end == '\0' && v >= 1) {
-                if (v <= kMaxImagesCap) return static_cast<int>(v);
-                fprintf(stderr,
-                        "vision: QWENOX_API_MAX_IMAGES=%ld clamped to %d "
-                        "(engine GEN-protocol ceiling)\n",
-                        v, kMaxImagesCap);
-                return kMaxImagesCap;
-            }
-            fprintf(stderr, "vision: ignoring bad QWENOX_API_MAX_IMAGES=%s (want >= 1)\n",
-                    e);
+    const char* e = std::getenv("QWENOX_API_MAX_IMAGES");
+    if (e != nullptr && *e != '\0') {
+        char* end = nullptr;
+        const long v = std::strtol(e, &end, 10);
+        if (end != e && *end == '\0' && v >= 1) {
+            if (v <= kMaxImagesCap) return static_cast<int>(v);
+            return kMaxImagesCap;
         }
-        return kDefaultMaxImages;
-    }();
-    return limit;
+    }
+    return kDefaultMaxImages;
 }
 
 bool decode_image_url(const std::string& value, std::vector<uint8_t>* bytes,

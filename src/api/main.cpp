@@ -3408,6 +3408,24 @@ int main(int argc, char** argv) {
                 c > 0)
                 g_cfg.context = static_cast<int>(c);
         }
+        // vision::max_images 只读环境变量 QWENOX_API_MAX_IMAGES：Linux 启动器会
+        // export，Windows 托盘模式下由 engine_sup 在拉起引擎时写入——但引擎可能
+        // 外部启动、或晚于首个请求启动，上限就卡在默认 8。这里按 conf 补齐；
+        // 已设置则不覆盖（engine_sup 启动引擎时仍会按当时的 conf 重写）。
+        if (!std::getenv("QWENOX_API_MAX_IMAGES")) {
+            long mi = 0;
+            if (svcconf::parse_int(svcconf::cfg(g_svc_conf, "MAX_IMAGES", ""), &mi) &&
+                mi >= 1) {
+                const std::string v = std::to_string(mi);
+#ifdef _WIN32
+                // SetEnvironmentVariableA 只改 Win32 环境块，本进程 CRT 的
+                // getenv 看不到；_putenv 两者都更新。
+                _putenv((std::string("QWENOX_API_MAX_IMAGES=") + v).c_str());
+#else
+                setenv("QWENOX_API_MAX_IMAGES", v.c_str(), 0);
+#endif
+            }
+        }
     }
 #ifdef _WIN32
     // 托盘模式没有控制台：stdout/stderr 重定向到 logs\api-win-<时间戳>.log。
