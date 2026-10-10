@@ -179,15 +179,31 @@ inline bool parse_double(const std::string& s, double* out) {
     return true;
 }
 
+// 读 "# <prefix><value>" 注释标记行（如 "# start_win: weights=v2"）；没有返回空串。
+inline std::string conf_marker(const std::string& path, const char* prefix) {
+    std::string text;
+    if (!read_text_file(path, &text)) return "";
+    const size_t p = text.find(prefix);
+    if (p == std::string::npos) return "";
+    const size_t b = p + strlen(prefix);
+    const size_t e = text.find_first_of("\r\n", b);
+    return trim(text.substr(b, e == std::string::npos ? std::string::npos : e - b));
+}
+
 // 写回 service.conf：注释/空行/未知键原样保留；已知键整行替换为
 // KEY="${KEY:-值}"（可选文件键为 KEY="${KEY-值}"），保持 bash 启动器兼容。
 // 键缺失时追加到文件末尾。写前备份为 <path>.bak。
+// marker_prefix/marker_value：顺带 upsert 一行注释标记（如
+// "# start_win: weights=" + "v2"），与键值同一次写入（同一份 .bak 备份）。
 inline bool save_conf(const std::string& path,
                       const std::map<std::string, std::string>& vals,
-                      std::string* error) {
+                      std::string* error,
+                      const char* marker_prefix = nullptr,
+                      const std::string& marker_value = "") {
     std::string text;
     read_text_file(path, &text);  // 缺失视为空文件，后面全量追加
     std::map<std::string, bool> written;
+    bool marker_written = false;
     std::string out;
     size_t pos = 0;
     while (pos <= text.size()) {
@@ -196,10 +212,17 @@ inline bool save_conf(const std::string& path,
         std::string line = text.substr(pos, last ? std::string::npos : eol - pos);
         pos = last ? text.size() + 1 : eol + 1;
         if (!line.empty() && line.back() == '\r') line.pop_back();
+        bool replaced = false;
+        // 注释标记行：已有该前缀行则整行改写
+        if (marker_prefix && !marker_written &&
+            line.compare(0, strlen(marker_prefix), marker_prefix) == 0) {
+            out += std::string(marker_prefix) + marker_value;
+            marker_written = true;
+            replaced = true;
+        }
         // 匹配 ^\s*KEY\s*=（KEY 为待写键）
         size_t i = line.find_first_not_of(" \t");
-        bool replaced = false;
-        if (i != std::string::npos && line[i] != '#') {
+        if (!replaced && i != std::string::npos && line[i] != '#') {
             size_t eq = line.find('=', i);
             if (eq != std::string::npos) {
                 std::string key = line.substr(i, eq - i);
@@ -223,6 +246,10 @@ inline bool save_conf(const std::string& path,
             const char* sep = is_optional_file_key(kv.first) ? "-" : ":-";
             out += kv.first + "=\"${" + kv.first + sep + kv.second + "}\"\n";
         }
+    if (marker_prefix && !marker_written) {
+        if (!out.empty() && out.back() != '\n') out += '\n';
+        out += std::string(marker_prefix) + marker_value + "\n";
+    }
     if (!text.empty()) {
         FILE* bak = fopen((path + ".bak").c_str(), "wb");
         if (bak) {

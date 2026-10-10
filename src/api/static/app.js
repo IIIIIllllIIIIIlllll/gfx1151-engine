@@ -18,6 +18,7 @@ const I18N = {
     "nav.overview": "总览", "nav.usage": "用量", "nav.requests": "请求",
     "common.loading": "加载中…",
     "common.refresh": "刷新", "common.all": "全部", "common.read_failed": "读取失败",
+    "common.close": "关闭",
     "common.requests": "请求数",
     "stamp.updated": "更新", "stamp.failed": "请求失败",
     "ov.status": "服务状态", "ov.model": "模型配置",
@@ -98,12 +99,20 @@ const I18N = {
     "cfg.title": "服务配置（service.conf）",
     "cfg.hint": "保存写入 service.conf（原内容备份为 .bak），下次启动引擎时生效；运行中的引擎与 API 端口不受影响。环境变量覆盖的键已置灰。",
     "cfg.grp_weights": "权重文件", "cfg.grp_ctx": "上下文与并发", "cfg.grp_net": "端口与监听",
+    "cfg.weights_ver": "权重版本",
+    "cfg.ver_v1": "V1（单文件，n-gram 内嵌主权重）",
+    "cfg.ver_v2": "V2（主权重 + 独立 n-gram 文件）",
+    "cfg.ver_gguf": "GGUF（仅 Linux 脚本启动）",
     "cfg.save": "保存配置", "cfg.reload": "重新读取",
     "cfg.s_dirty": "有未保存的修改", "cfg.s_loaded": "已读取",
     "cfg.s_saved": "已保存，下次启动引擎时生效",
     "cfg.s_saved_env": "已保存，但这些键被环境变量覆盖，需清除环境变量才生效：{k}",
     "cfg.e_read": "读取失败：{m}", "cfg.e_save": "保存失败：{m}",
     "cfg.env_badge": "env 覆盖", "cfg.confirm_reload": "丢弃未保存的修改？",
+    "cfg.pick_ph": "手动输入，或点浏览选择（项目根目录）",
+    "cfg.browse": "浏览", "cfg.pick_empty": "此目录下没有可选条目",
+    "cfg.pick_here": "选择此目录", "cfg.up": "上一级",
+    "cfg.dir_tag": "目录", "cfg.e_files": "文件列表加载失败：{m}",
   },
   en: {
     "app.title": "Qwen-Flash-Server console",
@@ -111,6 +120,7 @@ const I18N = {
     "nav.overview": "Overview", "nav.usage": "Usage", "nav.requests": "Requests",
     "common.loading": "Loading…",
     "common.refresh": "Refresh", "common.all": "All", "common.read_failed": "read failed",
+    "common.close": "Close",
     "common.requests": "Requests",
     "stamp.updated": "Updated", "stamp.failed": "request failed",
     "ov.status": "Service status", "ov.model": "Model config",
@@ -198,12 +208,20 @@ const I18N = {
       "on the next engine start; the running engine and API port are unaffected. " +
       "Keys overridden by environment variables are disabled.",
     "cfg.grp_weights": "Weight files", "cfg.grp_ctx": "Context & concurrency", "cfg.grp_net": "Ports & listen",
+    "cfg.weights_ver": "Weights version",
+    "cfg.ver_v1": "V1 (single file, n-gram embedded)",
+    "cfg.ver_v2": "V2 (main weights + separate n-gram)",
+    "cfg.ver_gguf": "GGUF (started via Linux scripts only)",
     "cfg.save": "Save config", "cfg.reload": "Reload",
     "cfg.s_dirty": "unsaved changes", "cfg.s_loaded": "loaded",
     "cfg.s_saved": "saved; takes effect on the next engine start",
     "cfg.s_saved_env": "saved, but these keys are overridden by environment variables: {k}",
     "cfg.e_read": "read failed: {m}", "cfg.e_save": "save failed: {m}",
     "cfg.env_badge": "env override", "cfg.confirm_reload": "Discard unsaved changes?",
+    "cfg.pick_ph": "type manually, or browse (project root)",
+    "cfg.browse": "Browse", "cfg.pick_empty": "no selectable entries in this folder",
+    "cfg.pick_here": "Select this folder", "cfg.up": "up one level",
+    "cfg.dir_tag": "dir", "cfg.e_files": "file list load failed: {m}",
   },
 };
 
@@ -964,6 +982,7 @@ async function renderRequests(force) {
 
 // ---------------- 引擎 / 设置（service.conf + 启停） ----------------
 // 数据源：GET/POST /admin/config（20 个受管键，与托盘面板相同）、
+// GET /admin/files（工作空间内的受限目录浏览，权重路径键的"浏览"弹窗数据）、
 // GET /admin/engine/status、POST /admin/engine/start|stop（仅 Windows）。
 // Linux 上隐藏启停按钮、显示提示，只保留配置编辑（保存后下次启动生效）。
 
@@ -975,11 +994,25 @@ const CFG_GROUPS = [
       "PREFILL_CHUNK", "ROPE_FACTOR", "KVSNAP_MAX_GB"] },
   { title: "cfg.grp_net", keys: ["ENGINE_HOST", "ENGINE_PORT", "API_HOST", "API_PORT"] },
 ];
+// 权重组键带"浏览"弹窗（数据来自 /admin/files，仍可手输）：
+// TOKENIZER_DIR 选目录，其余选文件。
+const CFG_FILE_KEYS = new Set(CFG_GROUPS[0].keys);
+// 权重版本 → 该版本相关的权重键（与旧托盘面板语义一致；TOKENIZER_DIR 各版本通用）。
+// V1：n-gram 内嵌主权重（保存时 NGRAM_FILE 由服务端固定为 $MODEL_FILE）；
+// V2：独立 n-gram 文件（OVERLAY_FILE 由服务端置空）；GGUF：只有 GGUF_* 三键。
+const CFG_VER_KEYS = {
+  v1: ["MODEL_FILE", "OVERLAY_FILE", "MTP_FILE", "VISION_FILE"],
+  v2: ["MODEL_FILE", "NGRAM_FILE", "MTP_FILE", "VISION_FILE"],
+  gguf: ["GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE"],
+};
+const CFG_VER_IDS = ["v1", "v2", "gguf"];
 
 const engEl = (id) => document.getElementById(id);
 let cfgBuilt = false, cfgDirty = false, engTimer = null, engLastStatus = null;
+let cfgVer = "v1";     // 当前选中的权重版本（GET /admin/config 的 weights_ver）
 const cfgInputs = {};  // key -> input/select
 const cfgBadges = {};  // key -> env 覆盖徽章
+const cfgRows = {};    // key -> 行元素（权重版本切换时隐藏无关行）
 
 function engSetCfgStatus(base) {
   engEl("cfg-status").textContent = base + " " +
@@ -996,6 +1029,32 @@ function buildCfgForm() {
     h.className = "cfg-group-title";
     h.dataset.i18n = g.title;
     h.textContent = t(g.title);
+    if (g.title === "cfg.grp_weights") {
+      // 版本选择行：切换后只显示该版本相关的权重键（见 applyWeightsVer）
+      const vrow = document.createElement("div");
+      vrow.className = "cfg-row cfg-ver-row";
+      const vlab = document.createElement("label");
+      vlab.htmlFor = "cfg-weights-ver";
+      vlab.textContent = t("cfg.weights_ver");
+      const sel = document.createElement("select");
+      sel.id = "cfg-weights-ver";
+      for (const v of CFG_VER_IDS) {
+        const o = document.createElement("option");
+        o.value = v;
+        o.textContent = t("cfg.ver_" + v);
+        sel.appendChild(o);
+      }
+      sel.value = cfgVer;
+      sel.addEventListener("change", () => {
+        cfgVer = sel.value;
+        applyWeightsVer();
+        markCfgDirty();
+      });
+      vrow.append(vlab, sel);
+      form.append(h, vrow);
+    } else {
+      form.appendChild(h);
+    }
     const rows = document.createElement("div");
     rows.className = "cfg-rows";
     for (const key of g.keys) {
@@ -1019,17 +1078,33 @@ function buildCfgForm() {
         inp.type = "text";
         inp.spellcheck = false;
       }
+      if (CFG_FILE_KEYS.has(key)) inp.placeholder = t("cfg.pick_ph");
       inp.id = "cfg-" + key;
       lab.htmlFor = inp.id;
       lab.append(key, badge);
       inp.addEventListener("input", markCfgDirty);
       inp.addEventListener("change", markCfgDirty);
-      row.append(lab, inp);
+      if (CFG_FILE_KEYS.has(key)) {
+        // 权重路径键：输入框 + "浏览"按钮（弹窗列项目根目录条目，点选填入）
+        const wrap = document.createElement("div");
+        wrap.className = "cfg-file-row";
+        const browse = document.createElement("button");
+        browse.type = "button";
+        browse.className = "btn cfg-browse";
+        browse.textContent = t("cfg.browse");
+        browse.addEventListener("click", () => openFilePicker(key));
+        wrap.append(inp, browse);
+        row.append(lab, wrap);
+      } else {
+        row.append(lab, inp);
+      }
       rows.appendChild(row);
       cfgInputs[key] = inp;
       cfgBadges[key] = badge;
+      cfgRows[key] = row;
     }
-    form.append(h, rows);
+    form.appendChild(rows);
+    if (g.title === "cfg.grp_weights") applyWeightsVer();
   }
   cfgBuilt = true;
 }
@@ -1038,6 +1113,142 @@ function markCfgDirty() {
   cfgDirty = true;
   engEl("cfg-status").textContent = t("cfg.s_dirty");
 }
+
+// 按权重版本显示/隐藏权重键行（TOKENIZER_DIR 各版本通用）。
+function applyWeightsVer() {
+  const vis = new Set([...(CFG_VER_KEYS[cfgVer] || []), "TOKENIZER_DIR"]);
+  for (const key of CFG_FILE_KEYS)
+    if (cfgRows[key]) cfgRows[key].classList.toggle("hidden", !vis.has(key));
+}
+
+// ---------------- 文件选择弹窗 ----------------
+// 数据来自 GET /admin/files?path=...：服务端把 path 限制在 conf 根目录（项目根）
+// 之内（拒绝绝对路径与 ".."，符号链接解析后越界同样 400）。目录可逐层进入；
+// TOKENIZER_DIR 用"选择此目录"按钮选定当前目录，其余权重键点文件即选定。
+
+let fpickKey = null;   // 正在为哪个配置键选文件（null = 弹窗关闭）
+let fpickPath = "";    // 当前浏览的相对路径（"" = 项目根）
+let fpickData = null;  // 当前目录的 /admin/files 响应
+
+const fpickJoin = (base, name) => (base ? base + "/" + name : name);
+
+async function fpickFetch() {
+  fpickData = null;
+  renderFilePicker();
+  try {
+    fpickData = await getJSON("/admin/files" +
+      (fpickPath ? "?path=" + encodeURIComponent(fpickPath) : ""));
+  } catch (e) {
+    if (fpickPath) {
+      // 起始目录不存在（如配置指向 ./models 而服务器上没有）：回根目录重来
+      fpickPath = "";
+      return fpickFetch();
+    }
+    const list = engEl("fpick-list");
+    list.textContent = "";
+    const p = document.createElement("p");
+    p.className = "note form-err fpick-empty";
+    p.textContent = fmtMsg("cfg.e_files", { m: e.message });
+    list.appendChild(p);
+    return;
+  }
+  renderFilePicker();
+}
+
+function renderFilePicker() {
+  const list = engEl("fpick-list");
+  list.textContent = "";
+  const dirMode = fpickKey === "TOKENIZER_DIR";
+  engEl("fpick-here").classList.toggle("hidden", !dirMode);
+  engEl("fpick-here").disabled = !fpickPath;
+  engEl("fpick-foot").textContent =
+    ((fpickData && fpickData.root) || "") + (fpickPath ? "/" + fpickPath : "");
+  const addRow = (label, meta, onClick) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "fpick-item";
+    const name = document.createElement("span");
+    name.className = "fpick-name";
+    name.textContent = label;
+    const m = document.createElement("span");
+    m.className = "fpick-meta";
+    m.textContent = meta;
+    b.append(name, m);
+    b.addEventListener("click", onClick);
+    list.appendChild(b);
+  };
+  if (!fpickData) {
+    const p = document.createElement("p");
+    p.className = "muted small fpick-empty";
+    p.textContent = t("common.loading");
+    list.appendChild(p);
+    return;
+  }
+  if (fpickPath) {
+    addRow("../", t("cfg.up"), () => {
+      fpickPath = fpickPath.slice(0, fpickPath.lastIndexOf("/"));
+      fpickFetch();
+    });
+  }
+  const dirs = fpickData.dirs || [];
+  const files = fpickData.files || [];
+  if (!dirs.length && (dirMode || !files.length)) {
+    const p = document.createElement("p");
+    p.className = "muted small fpick-empty";
+    p.textContent = t("cfg.pick_empty");
+    list.appendChild(p);
+  }
+  for (const e of dirs) {
+    addRow(e.name + "/", t("cfg.dir_tag"), () => {
+      fpickPath = fpickJoin(fpickPath, e.name);
+      fpickFetch();
+    });
+  }
+  if (!dirMode) {
+    for (const e of files) {
+      addRow(e.name, fmtBytes(e.size) + (e.mtime ? " · " + fmtTime(e.mtime * 1000) : ""),
+        () => {
+          cfgInputs[fpickKey].value = fpickJoin(fpickPath, e.name);
+          markCfgDirty();
+          closeFilePicker();
+        });
+    }
+  }
+}
+
+function openFilePicker(key) {
+  fpickKey = key;
+  // 从输入框现有值推断起始目录：规范掉 ./ 与前导/尾随斜杠；
+  // 含 ".." 的值不信任，回根目录；目录不存在时由 fpickFetch 回退根目录。
+  const v = (cfgInputs[key].value || "").trim().replace(/\\/g, "/");
+  let dir = v.includes("/") ? v.slice(0, v.lastIndexOf("/")) : "";
+  dir = dir.replace(/^(\.\/+)+/, "").replace(/^\/+/, "").replace(/\/+$/, "");
+  fpickPath = dir.includes("..") ? "" : dir;
+  engEl("fpick-title").textContent = key;
+  engEl("fpick").classList.remove("hidden");
+  fpickFetch();
+}
+
+function closeFilePicker() {
+  fpickKey = null;
+  engEl("fpick").classList.add("hidden");
+}
+
+engEl("fpick-close").addEventListener("click", closeFilePicker);
+engEl("fpick-refresh").addEventListener("click", fpickFetch);
+engEl("fpick-here").addEventListener("click", () => {
+  if (fpickKey && fpickPath) {
+    cfgInputs[fpickKey].value = fpickPath;
+    markCfgDirty();
+  }
+  closeFilePicker();
+});
+engEl("fpick").addEventListener("click", (e) => {
+  if (e.target.id === "fpick") closeFilePicker();  // 点遮罩空白处关闭
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && fpickKey) closeFilePicker();
+});
 
 async function loadConfig() {
   try {
@@ -1049,6 +1260,9 @@ async function loadConfig() {
       inp.disabled = envOvr;
       cfgBadges[key].classList.toggle("hidden", !envOvr);
     }
+    cfgVer = CFG_VER_KEYS[j.weights_ver] ? j.weights_ver : "v1";
+    engEl("cfg-weights-ver").value = cfgVer;
+    applyWeightsVer();
     engEl("cfg-key").classList.toggle("hidden", !j.admin_key_required);
     cfgDirty = false;
     engHideErr("cfg-err");
@@ -1060,15 +1274,19 @@ async function loadConfig() {
 
 async function postConfig() {
   const values = {};
-  for (const key of Object.keys(cfgInputs))
-    if (!cfgInputs[key].disabled) values[key] = cfgInputs[key].value.trim();
+  const vis = new Set([...(CFG_VER_KEYS[cfgVer] || []), "TOKENIZER_DIR"]);
+  for (const key of Object.keys(cfgInputs)) {
+    if (cfgInputs[key].disabled) continue;
+    if (CFG_FILE_KEYS.has(key) && !vis.has(key)) continue;  // 非当前版本的权重键不发送
+    values[key] = cfgInputs[key].value.trim();
+  }
   const headers = { "Content-Type": "application/json" };
   const key = engEl("cfg-key").value.trim();
   if (key) headers["X-Admin-Key"] = key;
   let r, j = null;
   try {
     r = await fetch("/admin/config", { method: "POST", headers,
-      body: JSON.stringify({ values }) });
+      body: JSON.stringify({ values, weights_ver: cfgVer }) });
     try { j = await r.json(); } catch (e) { /* 非 JSON 按状态码报错 */ }
   } catch (e) {
     engShowErr("cfg-err", fmtMsg("cfg.e_save", { m: e.message }));
@@ -1139,7 +1357,7 @@ function renderEngStatus(st) {
   engEl("eng-stop").disabled = !can || !active || !!st.external;
 }
 
-// 语言切换后重渲染本页的动态文案（徽章/状态 pill）
+// 语言切换后重渲染本页的动态文案（徽章/状态 pill/文件下拉标签）
 function renderEngineAll() {
   if (!cfgBuilt) return;
   for (const key of Object.keys(cfgBadges)) cfgBadges[key].textContent = t("cfg.env_badge");
@@ -1148,6 +1366,12 @@ function renderEngineAll() {
     kv.options[0].textContent = t("ovr.bool_on");
     kv.options[1].textContent = t("ovr.bool_off");
   }
+  for (const key of CFG_FILE_KEYS)
+    if (cfgInputs[key]) cfgInputs[key].placeholder = t("cfg.pick_ph");
+  for (const b of document.querySelectorAll(".cfg-browse")) b.textContent = t("cfg.browse");
+  const wv = engEl("cfg-weights-ver");
+  if (wv) for (const o of wv.options) o.textContent = t("cfg.ver_" + o.value);
+  if (fpickKey) renderFilePicker();
   if (engLastStatus) renderEngStatus(engLastStatus);
 }
 

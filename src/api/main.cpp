@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -1342,6 +1343,14 @@ void handle_overrides_post(const http::Request& q, http::Response* r, http::Stre
 // /admin/config：网页前端读写 service.conf 的受管键（与托盘面板同款，
 // svcconf::kManagedKeys）。写回只改 conf 文件：运行中的引擎与 API 监听端口
 // 不受影响，下次启动生效（响应 applied:"next_start"）。
+//
+// 权重版本（V1 单文件 / V2 主权重+独立 n-gram / GGUF）：与旧托盘面板一致，
+// 版本选择持久化为注释行 "# start_win: weights=v1|v2|gguf"；无标记时按
+// NGRAM_FILE 是否跟随 MODEL_FILE 推断 V1/V2（GGUF 只能来自标记）。
+// 保存语义：V1 强制 NGRAM_FILE=$MODEL_FILE；V2 强制 OVERLAY_FILE 置空；
+// GGUF 只写 GGUF_*（Windows 启停只吃 hgn 键，GGUF 配置供 Linux 脚本用）。
+
+const char* kWeightsMarker = "# start_win: weights=";
 
 std::string eff_engine_host() {
     std::lock_guard<std::mutex> lk(g_svc_conf_mtx);
@@ -1391,18 +1400,39 @@ void handle_config_get(const http::Request&, http::Response* r, http::Stream*) {
     }
     j["values"] = vals;
     j["env_overridden"] = env_ovr;
+    {
+        std::string model, ngram;
+        {
+            std::lock_guard<std::mutex> lk(g_svc_conf_mtx);
+            model = svcconf::cfg(g_svc_conf, "MODEL_FILE", "");
+            ngram = svcconf::cfg(g_svc_conf, "NGRAM_FILE", "");
+        }
+        const std::string marker = svcconf::conf_marker(g_conf_path, kWeightsMarker);
+        if (marker == "v1" || marker == "v2" || marker == "gguf")
+            j["weights_ver"] = marker;
+        else
+            j["weights_ver"] = (ngram.empty() || ngram == model) ? "v1" : "v2";
+    }
     j["engine"] = engine_status_json();
     r->set("Cache-Control", "no-store");
     r->body = json_py::dumps(j, /*spaced=*/false);
 }
 
-// POST /admin/config — {"values": {KEY: "value", ...}}，只接受受管键。
+// POST /admin/config — {"values": {KEY: "value", ...}, "weights_ver": "v1|v2|gguf"}，
+// 只接受受管键。带 weights_ver 时按版本语义过滤权重键（无关键静默丢弃）并写版本标记。
 void handle_config_post(const http::Request& q, http::Response* r, http::Stream*) {
     if (!admin_ok(q))
         http::fail(401, "admin key required (Authorization: Bearer <key> or X-Admin-Key)");
     const json body = parse_body(q);
     const json& vals_j = body.contains("values") ? body["values"] : body;
     if (!vals_j.is_object()) http::fail(400, "expected {\"values\": {KEY: \"value\"}}");
+    std::string weights_ver;
+    if (body.contains("weights_ver") && !body["weights_ver"].is_null()) {
+        if (!body["weights_ver"].is_string()) http::fail(400, "weights_ver must be a string");
+        weights_ver = body["weights_ver"].get<std::string>();
+        if (weights_ver != "v1" && weights_ver != "v2" && weights_ver != "gguf")
+            http::fail(400, "weights_ver must be one of v1, v2, gguf");
+    }
     std::map<std::string, std::string> vals;
     for (auto it = vals_j.begin(); it != vals_j.end(); ++it) {
         if (!svcconf::is_managed_key(it.key()))
@@ -1410,7 +1440,28 @@ void handle_config_post(const http::Request& q, http::Response* r, http::Stream*
         if (!it.value().is_string()) http::fail(400, "value must be a string: " + it.key());
         vals[it.key()] = it.value().get<std::string>();
     }
-    if (vals.empty()) http::fail(400, "no keys to save");
+    if (!weights_ver.empty()) {
+        static const std::unordered_set<std::string> kWeightKeys = {
+            "MODEL_FILE", "NGRAM_FILE", "OVERLAY_FILE", "MTP_FILE", "VISION_FILE",
+            "GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE"};
+        static const std::unordered_set<std::string> kVerKeys[] = {
+            /* v1 */ {"MODEL_FILE", "OVERLAY_FILE", "MTP_FILE", "VISION_FILE"},
+            /* v2 */ {"MODEL_FILE", "NGRAM_FILE", "MTP_FILE", "VISION_FILE"},
+            /* gguf */ {"GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE"},
+        };
+        const auto& allow = kVerKeys[weights_ver == "v2"   ? 1
+                                     : weights_ver == "gguf" ? 2
+                                                             : 0];
+        for (auto it = vals.begin(); it != vals.end();) {
+            if (kWeightKeys.count(it->first) && !allow.count(it->first))
+                it = vals.erase(it);
+            else
+                ++it;
+        }
+        if (weights_ver == "v1") vals["NGRAM_FILE"] = "$MODEL_FILE";
+        if (weights_ver == "v2") vals["OVERLAY_FILE"] = "";
+    }
+    if (vals.empty() && weights_ver.empty()) http::fail(400, "no keys to save");
     std::string err;
     json env_ovr = json::array();
     {
@@ -1419,8 +1470,13 @@ void handle_config_post(const http::Request& q, http::Response* r, http::Stream*
         svcconf::Conf merged = g_svc_conf;
         for (const auto& kv : vals) merged[kv.first] = kv.second;
         if (!svcconf::validate_conf(merged, &err)) http::fail(400, err);
-        if (!svcconf::save_conf(g_conf_path, vals, &err)) http::fail(500, err);
-        g_svc_conf = merged;  // 内存有效值同步（引擎 start 端点用）
+        if (!svcconf::save_conf(g_conf_path, vals, &err,
+                                weights_ver.empty() ? nullptr : kWeightsMarker,
+                                weights_ver))
+            http::fail(500, err);
+        // 从文件重解析作为内存有效值：V1 写入的 "$MODEL_FILE" 等需要展开
+        g_svc_conf.clear();
+        svcconf::load_conf(g_conf_path, &g_svc_conf);
         for (const auto& kv : vals)
             if (getenv(kv.first.c_str())) env_ovr.push_back(kv.first);
     }
@@ -1432,6 +1488,105 @@ void handle_config_post(const http::Request& q, http::Response* r, http::Stream*
     if (!env_ovr.empty())
         j["env_overridden"] = env_ovr;  // 这些键被环境变量覆盖，conf 改动不生效
     j["engine"] = engine_status_json();
+    r->body = json_py::dumps(j, /*spaced=*/false);
+}
+
+std::map<std::string, std::string> parse_query(const std::string& qs);
+
+// p 的逐段前缀是否覆盖 root（两者都应是 canonical 后的路径）。
+// Windows 下路径不区分大小写，逐段比较也不区分。
+bool path_within_root(const std::filesystem::path& root, const std::filesystem::path& p) {
+    auto ri = root.begin();
+    auto pi = p.begin();
+    for (; ri != root.end(); ++ri, ++pi) {
+        if (pi == p.end()) return false;
+#ifdef _WIN32
+        if (_stricmp(ri->u8string().c_str(), pi->u8string().c_str()) != 0) return false;
+#else
+        if (*ri != *pi) return false;
+#endif
+    }
+    return true;
+}
+
+// GET /admin/files[?path=子目录] — 供配置面板的权重路径键浏览选择文件。
+// path 是相对 conf 根目录（项目根）的子路径：绝对路径、".." 段直接 400；
+// canonical 解析（符号链接/junction 展开）后落在根外同样 400，不得越界。
+// 目录与文件分开返回（TOKENIZER_DIR 选目录，其余键选文件）。
+void handle_admin_files(const http::Request& q, http::Response* r, http::Stream*) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path root = fs::weakly_canonical(fs::path(g_conf_root), ec);
+    if (ec) {
+        r->status = 500;
+        r->body = http::error_json("cannot resolve workspace root: " + ec.message(),
+                                   "server_error", "server_error");
+        return;
+    }
+    std::string rel;
+    const auto qp = parse_query(q.query);
+    if (auto it = qp.find("path"); it != qp.end()) rel = it->second;
+    std::replace(rel.begin(), rel.end(), '\\', '/');
+    while (!rel.empty() && rel.front() == '/') rel.erase(rel.begin());
+    while (!rel.empty() && rel.back() == '/') rel.pop_back();
+    std::string rel_out;
+    fs::path target = root;
+    if (!rel.empty() && rel != ".") {
+        const fs::path sub = fs::u8path(rel).lexically_normal();
+        bool bad = sub.is_absolute();
+        for (const auto& part : sub)
+            if (part == "..") bad = true;
+        if (bad) http::fail(400, "path must stay within the workspace root");
+        rel_out = sub.generic_u8string();
+        if (rel_out == ".") rel_out.clear();
+        target = root / sub;
+    }
+    const fs::path canon = fs::canonical(target, ec);
+    if (ec || !path_within_root(root, canon))
+        http::fail(400, "path is outside the workspace root or does not exist");
+    if (!fs::is_directory(canon, ec) || ec)
+        http::fail(400, "path is not a directory");
+    json dirs = json::array();
+    json files = json::array();
+    for (const auto& de : fs::directory_iterator(canon, ec)) {
+        const std::string name = de.path().filename().u8string();
+        if (name.empty() || name[0] == '.') continue;  // 隐藏条目不进列表
+        std::error_code ec2;
+        json e;
+        e["name"] = name;
+        const auto ft = fs::last_write_time(de.path(), ec2);
+        if (!ec2) {
+            // C++17 没有 file_clock -> system_clock 的直接转换
+            const auto st = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                ft - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
+            e["mtime"] = (long long)std::chrono::system_clock::to_time_t(st);
+        }
+        if (de.is_directory(ec2) && !ec2) {
+            dirs.push_back(std::move(e));
+        } else if (de.is_regular_file(ec2) && !ec2) {
+            const auto sz = fs::file_size(de.path(), ec2);
+            if (!ec2) e["size"] = (long long)sz;
+            files.push_back(std::move(e));
+        }
+        // 其它类型（管道等）不提供选择
+    }
+    if (ec) {
+        r->status = 500;
+        r->body = http::error_json("cannot list directory: " + ec.message(),
+                                   "server_error", "server_error");
+        return;
+    }
+    const auto by_name = [](const json& a, const json& b) {
+        return a["name"].get_ref<const std::string&>() < b["name"].get_ref<const std::string&>();
+    };
+    std::sort(dirs.begin(), dirs.end(), by_name);
+    std::sort(files.begin(), files.end(), by_name);
+    json j;
+    j["root"] = root.u8string();
+    j["path"] = rel_out;
+    j["dirs"] = std::move(dirs);
+    j["files"] = std::move(files);
+    r->set("Cache-Control", "no-store");
     r->body = json_py::dumps(j, /*spaced=*/false);
 }
 
@@ -3351,6 +3506,7 @@ int main(int argc, char** argv) {
     srv.on("POST", "/admin/overrides", handle_overrides_post);
     srv.on("GET", "/admin/config", handle_config_get);
     srv.on("POST", "/admin/config", handle_config_post);
+    srv.on("GET", "/admin/files", handle_admin_files);
     srv.on("GET", "/admin/engine/status", handle_engine_status);
     srv.on("POST", "/admin/engine/start", handle_engine_start);
     srv.on("POST", "/admin/engine/stop", handle_engine_stop);

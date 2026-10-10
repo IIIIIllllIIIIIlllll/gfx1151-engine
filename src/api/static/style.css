@@ -439,6 +439,73 @@ input:disabled, select:disabled { opacity: .35; }
 }
 .cfg-actions { margin-top: 18px; }
 #cfg-key { width: 260px; }
+.cfg-ver-row { max-width: 460px; margin-bottom: 6px; }
+.cfg-ver-row select { width: 100%; }
+.cfg-file-row { display: flex; gap: 6px; }
+.cfg-file-row input { flex: 1; min-width: 0; }
+.cfg-browse { flex: none; }
+
+/* ---- 文件选择弹窗（CRT 屏内覆盖层） ---- */
+.fpick-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 30px;
+  background: rgba(3, 10, 6, .72);
+}
+.fpick {
+  display: flex;
+  flex-direction: column;
+  width: min(560px, 100%);
+  max-height: 100%;
+  padding: 14px 16px 10px;
+  border: 1px solid var(--p-mid);
+  background: var(--scr-bg);
+  box-shadow: 0 0 18px rgba(134, 245, 168, .25);
+  color: var(--p);
+  font: 13px/1.5 var(--f-crt);
+  text-shadow: var(--glow);
+}
+.fpick-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.fpick-title {
+  flex: 1;
+  min-width: 0;
+  font-weight: 700;
+  letter-spacing: .05em;
+  overflow-wrap: anywhere;
+}
+.fpick-title::before { content: "> "; color: var(--p-mid); }
+.fpick-list {
+  min-height: 120px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  scrollbar-width: thin;
+  scrollbar-color: var(--p-dim) transparent;
+}
+.fpick-item {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  width: 100%;
+  padding: 6px 10px;
+  border: 0;
+  border-bottom: 1px dashed rgba(134, 245, 168, .13);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-shadow: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.fpick-item:last-child { border-bottom: 0; }
+.fpick-item:hover { background: rgba(134, 245, 168, .1); }
+.fpick-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.fpick-meta { flex: none; color: var(--p-mid); font-size: 12px; white-space: nowrap; }
+.fpick-empty { padding: 18px 10px; }
+.fpick-foot { margin: 8px 0 0; overflow-wrap: anywhere; }
 
 /* ---- 用量页 ---- */
 .totals {

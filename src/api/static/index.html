@@ -182,6 +182,20 @@
     </div>
   </section>
 </main>
+
+<!-- 文件选择弹窗：权重路径键的"浏览"按钮打开，可逐层进入项目根目录内的子目录（/admin/files，服务端限制越界） -->
+<div class="fpick-overlay hidden" id="fpick">
+  <div class="fpick">
+    <div class="fpick-head">
+      <span class="fpick-title" id="fpick-title"></span>
+      <button class="btn hidden" id="fpick-here" data-i18n="cfg.pick_here">选择此目录</button>
+      <button class="btn" id="fpick-refresh" data-i18n="common.refresh">刷新</button>
+      <button class="btn" id="fpick-close" data-i18n="common.close">关闭</button>
+    </div>
+    <div class="fpick-list" id="fpick-list"></div>
+    <p class="note muted fpick-foot" id="fpick-foot"></p>
+  </div>
+</div>
 </div>
 </div>
 
