@@ -25,7 +25,6 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 TR="${THEROCK:-/c/therock-dist-windows-gfx1151-10.1.0}"
 HIPCC="$TR/bin/hipcc.exe"
-[[ -x "$HIPCC" ]] || { echo "找不到 TheRock hipcc: $HIPCC（设 THEROCK=...）" >&2; exit 1; }
 # hipcc 会读 HIP_PATH 定位 clang（实测指向坏路径直接编译失败；指向 HIP SDK 7.2
 # 时靠布局差异侥幸回退自定位，不该依赖）。强制 HIP_PATH 指向 TheRock，屏蔽机器
 # 上其他 HIP/ROCm 安装（SDK 6.4/7.1/7.2 会设 HIP_PATH/HIP_PATH_64/HIP_PATH_72）。
@@ -38,17 +37,26 @@ GPU_ARCH="${GPU_ARCH:-gfx1151}"
 TARGET="${1:-all}"
 [[ "$TARGET" == all || "$TARGET" == engine || "$TARGET" == bench || "$TARGET" == api || "$TARGET" == launcher || "$TARGET" == test ]] || { sed -n '2,11p' "$0" >&2; exit 2; }
 
-mkdir -p build build/winlibs
+# HIP 工具链/winlibs/kernel db 只服务 engine/bench/test；api 与 launcher 是纯主机 C++，
+# 在没有本机 gfx 分片 kernel db 的机器上（如只部署 API 的机器）也应能编译。
+NEED_HIP=0
+[[ "$TARGET" == all || "$TARGET" == engine || "$TARGET" == bench || "$TARGET" == test ]] && NEED_HIP=1
+[[ "$NEED_HIP" == 0 || -x "$HIPCC" ]] || { echo "找不到 TheRock hipcc: $HIPCC（设 THEROCK=...）" >&2; exit 1; }
+
+mkdir -p build
+# MSVC 运行时（微软官方可再分发），覆盖没装 VC++ Redistributable 的裸机
+for d in msvcp140.dll vcruntime140.dll vcruntime140_1.dll; do
+  [[ -f "build/$d" ]] || cp "/c/windows/System32/$d" build/
+done
+
+if [[ "$NEED_HIP" == 1 ]]; then
+mkdir -p build/winlibs
 [[ -f build/winlibs/rocblas.lib ]]   || cp "$TR/lib/rocblas.lib" build/winlibs/
 [[ -f build/winlibs/amdhip64.lib ]]  || cp "$TR/lib/amdhip64.lib" build/winlibs/
 [[ -f build/winlibs/hipblaslt.lib ]] || cp "$TR/lib/libhipblaslt.dll.a" build/winlibs/hipblaslt.lib
 
 for d in amdhip64_7.dll rocm_kpack.dll amd_comgr.dll rocblas.dll libhipblaslt.dll origami.dll; do
   [[ -f "build/$d" ]] || cp "$TR/bin/$d" build/
-done
-# MSVC 运行时（微软官方可再分发），覆盖没装 VC++ Redistributable 的裸机
-for d in msvcp140.dll vcruntime140.dll vcruntime140_1.dll; do
-  [[ -f "build/$d" ]] || cp "/c/windows/System32/$d" build/
 done
 
 # kernel db 拷真身而非 junction：rocBLAS 按 <exe目录>/rocblas/library 找 db
@@ -70,6 +78,7 @@ for f in "$TR/bin/rocblas/library/"*"$GPU_ARCH"*; do
   b="$(basename "$f")"
   [[ -f "build/rocblas/library/$b" ]] || cp "$f" build/rocblas/library/
 done
+fi  # NEED_HIP
 
 # _CRT_NONSTDC_NO_DEPRECATE：屏蔽 MSVC 头文件对 strdup 等 POSIX 名的
 # deprecated 标记（_CRT_NONSTDC_DEPRECATE → __declspec(deprecated)）。
