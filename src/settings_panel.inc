@@ -1117,8 +1117,28 @@ bool panel_apply_and_save(std::string* error) {
 
 bool panel_browse(HWND edit) {
     wchar_t buf[MAX_PATH] = L"";
+    std::wstring initdir;
     const std::string cur = get_edit(edit);
-    if (!cur.empty()) wcsncpy_s(buf, to_w(cur).c_str(), MAX_PATH - 1);
+    if (!cur.empty()) {
+        // 编辑框里多是 "./models/x.hgn" 这类相对路径（正斜杠）；整串塞进
+        // lpstrFile 会被对话框当成非法文件名，GetOpenFileNameW 直接失败
+        // （FNERR_INVALIDFILENAME），表现为点了没反应。先规范成绝对路径，
+        // 拆成 初始目录 + 纯文件名；解析不了就只给初始目录。
+        std::wstring w = to_w(cur);
+        for (auto& c : w)
+            if (c == L'/') c = L'\\';
+        wchar_t abs[MAX_PATH];
+        const DWORD n = GetFullPathNameW(w.c_str(), MAX_PATH, abs, nullptr);
+        if (n > 0 && n < MAX_PATH) {
+            const std::wstring a(abs, n);
+            const size_t slash = a.find_last_of(L'\\');
+            if (slash != std::wstring::npos) {
+                initdir = a.substr(0, slash);
+                wcsncpy_s(buf, a.substr(slash + 1).c_str(), _TRUNCATE);
+            }
+        }
+    }
+    if (initdir.empty()) initdir = g_root_w;
     OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = g_panel;
@@ -1127,9 +1147,18 @@ bool panel_browse(HWND edit) {
                            : L"hgn 权重 (*.hgn)\0*.hgn\0GGUF 权重 (*.gguf)\0*.gguf\0所有文件 (*.*)\0*.*\0";
     ofn.lpstrFile = buf;
     ofn.nMaxFile = MAX_PATH;
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    ofn.lpstrInitialDir = initdir.c_str();
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_DONTADDTORECENT;
     ofn.lpstrTitle = TR(L"选择权重文件", L"Select weights file");
-    if (!GetOpenFileNameW(&ofn)) return false;
+    if (!GetOpenFileNameW(&ofn)) {
+        const DWORD err = CommDlgExtendedError();  // 0 = 用户取消，不算失败
+        if (err)
+            msgbox(std::string(TR("无法打开文件选择框，错误码 ",
+                                  "Cannot open the file dialog, error code ")) +
+                   std::to_string(err),
+                   MB_OK | MB_ICONWARNING);
+        return false;
+    }
     set_edit(edit, make_relative(from_w(buf)));
     return true;
 }
