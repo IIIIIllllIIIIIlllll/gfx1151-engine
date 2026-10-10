@@ -1,0 +1,3 @@
+// settings_win.exe file icon (shown in Explorer); compiled by build_win.sh when llvm-rc exists.
+// The window icon does not depend on this: it comes from launch_win_icon.inc.
+1 ICON "launch_win.ico"

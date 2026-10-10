@@ -2,11 +2,12 @@
 # Windows (TheRock) 编译入口：与 Linux build.sh 并列，产物输出到 build/。
 #
 # 用法:
-#   bash build_win.sh            # 全部产物：引擎、benchmark、API、根目录入口
+#   bash build_win.sh            # 全部产物：引擎、benchmark、API、根目录入口、设置工具
 #   bash build_win.sh bench      # 性能测试工具 → build/qwenox-bench.exe
 #   bash build_win.sh api        # OpenAI HTTP 前端 → build/qwenox-win.exe
 #                                #   （GUI 托盘程序：API 服务 + 控制台网页 + 引擎启停）
 #   bash build_win.sh launcher   # 根目录最小入口 → ./start_win.exe（双击拉起 API）
+#   bash build_win.sh settings   # 根目录设置工具 → ./settings_win.exe（双击配置/检查，不启动服务）
 #   bash build_win.sh test       # 编 build/ktest-win.exe 并运行 kernel 单测
 #
 # 前置：TheRock 多架构包（默认 C:\therock-dist-windows-multiarch-10.0.0\...，
@@ -35,7 +36,7 @@ export HIP_PATH="$TR_WIN"
 unset ROCM_PATH HIP_PATH_64 HIP_PATH_71 HIP_PATH_72
 GPU_ARCH="${GPU_ARCH:-gfx1151}"
 TARGET="${1:-all}"
-[[ "$TARGET" == all || "$TARGET" == engine || "$TARGET" == bench || "$TARGET" == api || "$TARGET" == launcher || "$TARGET" == test ]] || { sed -n '2,11p' "$0" >&2; exit 2; }
+[[ "$TARGET" == all || "$TARGET" == engine || "$TARGET" == bench || "$TARGET" == api || "$TARGET" == launcher || "$TARGET" == settings || "$TARGET" == test ]] || { sed -n '2,12p' "$0" >&2; exit 2; }
 
 # HIP 工具链/winlibs/kernel db 只服务 engine/bench/test；api 与 launcher 是纯主机 C++，
 # 在没有本机 gfx 分片 kernel db 的机器上（如只部署 API 的机器）也应能编译。
@@ -143,6 +144,25 @@ build_api() {
       -lws2_32 -lshell32 -luser32 -lgdi32 -ladvapi32 "${GUI_LDFLAGS[@]}" -o build/qwenox-win.exe
 }
 
+# exe 文件图标（可选）：优先 TheRock 的 llvm-rc，没有则退回 Windows SDK 的
+# rc.exe（取最新版本目录）；都没有时 RES 为空，调用方退化为无图标编译
+# （程序内图标不受影响，那是内嵌 ICO）。结果写入 RES 数组。
+mkiconres() {  # $1=rc 源文件  $2=res 输出  $3=exe 名（提示用）
+    RES=()
+    "$CXX" -dumpmachine | grep -q msvc || return 0
+    local RC="$TR/lib/llvm/bin/llvm-rc.exe"
+    local RCFLAGS=(-no-preprocess)
+    if [[ ! -x "$RC" ]]; then
+      RC="$(ls "/c/Program Files (x86)/Windows Kits/10/bin"/*/x64/rc.exe 2>/dev/null | sort -V | tail -1)"
+      RCFLAGS=()
+    fi
+    if [[ -n "$RC" && -x "$RC" ]] && "$RC" "${RCFLAGS[@]}" -fo "$2" "$1"; then
+      RES=("$2")
+    else
+      echo "提示：llvm-rc 不可用，$3 文件不带图标（程序内图标不受影响）" >&2
+    fi
+}
+
 build_launcher() {
     # 根目录最小入口 start_win.exe：只负责以项目根为工作目录拉起
     # build\qwenox-win.exe（托盘程序）。旧启动器（配置面板/双进程看守）
@@ -150,22 +170,7 @@ build_launcher() {
     CXX="$TR/lib/llvm/bin/clang++.exe"
     [[ -x "$CXX" ]] || { echo "找不到 TheRock clang++: $CXX" >&2; exit 1; }
     gui_ldflags
-    RES=()
-    if "$CXX" -dumpmachine | grep -q msvc; then
-      # exe 文件图标（可选）：优先 TheRock 的 llvm-rc，没有则退回 Windows SDK
-      # 的 rc.exe（取最新版本目录）；都没有也不影响 API 的托盘图标。
-      RC="$TR/lib/llvm/bin/llvm-rc.exe"
-      RCFLAGS=(-no-preprocess)
-      if [[ ! -x "$RC" ]]; then
-        RC="$(ls "/c/Program Files (x86)/Windows Kits/10/bin"/*/x64/rc.exe 2>/dev/null | sort -V | tail -1)"
-        RCFLAGS=()
-      fi
-      if [[ -n "$RC" && -x "$RC" ]] && "$RC" "${RCFLAGS[@]}" -fo build/start_stub.res src/start_stub.rc; then
-        RES=(build/start_stub.res)
-      else
-        echo "提示：llvm-rc 不可用，start_win.exe 文件不带图标（托盘图标不受影响）" >&2
-      fi
-    fi
+    mkiconres src/start_stub.rc build/start_stub.res start_win.exe
     echo "[编译] start_win.exe"
     STUB_SRC=(-O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS src/start_stub_win.cpp
               -luser32 -lshell32 "${GUI_LDFLAGS[@]}" -o start_win.exe)
@@ -173,6 +178,25 @@ build_launcher() {
       [[ ${#RES[@]} -gt 0 ]] || exit 1
       echo "提示：带图标资源链接失败，改为不带文件图标重试" >&2
       "$CXX" "${STUB_SRC[@]}"
+    fi
+}
+
+build_settings() {
+    # 根目录设置工具 settings_win.exe：双击打开配置面板（编辑参数 / 环境检查 /
+    # 保存 service.conf），不启动服务。面板代码源自归档的旧启动器
+    # （attic/launcher/），纯主机 C++，GUI 子系统。
+    CXX="$TR/lib/llvm/bin/clang++.exe"
+    [[ -x "$CXX" ]] || { echo "找不到 TheRock clang++: $CXX" >&2; exit 1; }
+    gui_ldflags
+    mkiconres src/settings_win.rc build/settings_win.res settings_win.exe
+    echo "[编译] settings_win.exe"
+    SETTINGS_SRC=(-O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS src/settings_win.cpp
+                  -lws2_32 -luser32 -lshell32 -lgdi32 -lgdiplus -ldwmapi -luxtheme -lcomdlg32
+                  "${GUI_LDFLAGS[@]}" -o settings_win.exe)
+    if ! "$CXX" "${SETTINGS_SRC[@]}" ${RES[@]+"${RES[@]}"}; then
+      [[ ${#RES[@]} -gt 0 ]] || exit 1
+      echo "提示：带图标资源链接失败，改为不带文件图标重试" >&2
+      "$CXX" "${SETTINGS_SRC[@]}"
     fi
 }
 
@@ -190,11 +214,13 @@ case "$TARGET" in
     build_bench
     build_api
     build_launcher
+    build_settings
     ;;
   engine) build_engine ;;
   bench) build_bench ;;
   api) build_api ;;
   launcher) build_launcher ;;
+  settings) build_settings ;;
   test) build_test ;;
 esac
-echo '[完成] 编译输出位于 build/；启动服务用 ./start_win.exe（或 bash start_win.sh）'
+echo '[完成] 编译输出位于 build/；启动服务用 ./start_win.exe（或 bash start_win.sh），改配置用 ./settings_win.exe'

@@ -1,6 +1,6 @@
 @echo off
 rem build_win.bat - double-click wrapper: runs build_win.sh in Git Bash.
-rem Usage: build_win.bat [all|engine|bench|api|launcher|test]   (same args as build_win.sh)
+rem Usage: build_win.bat [all|engine|bench|api|launcher|settings|test]   (same args as build_win.sh)
 chcp 65001 >nul
 setlocal
 set "ROOT=%~dp0"

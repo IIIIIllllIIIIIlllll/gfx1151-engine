@@ -5,6 +5,9 @@ models/
 dev-docs/
 *.tmp.*
 start_win.exe
+settings_win.exe
+dist/
+service.conf.bak
 __pycache__/
 data/kvsnap
 data/ppbench/
